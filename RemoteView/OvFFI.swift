@@ -7,9 +7,9 @@ import Foundation
 
 final class OvSessionBox {
     /// Marshals C callback user pointers back to this object.
-    fileprivate var onDatagramOut: ((Data) -> Void)?
-    fileprivate var onRecord: ((UInt8, Data) -> Void)?
-    fileprivate var onEstablished: (([UInt8]) -> Void)?
+    var onDatagramOut: ((Data) -> Void)?
+    var onRecord: ((UInt8, Data) -> Void)?
+    var onEstablished: (([UInt8]) -> Void)?
 
     enum FfiError: Int32, Error {
         case badArg = -1, wrongState = -2, crypto = -3, transport = -4
@@ -23,13 +23,8 @@ final class OvSessionBox {
         guard let p = pairingCode.withCString({ ov_session_create(isServer ? 1 : 0, $0) }) else {
             throw FfiError.badArg
         }
-        ptr = OpaquePointer(p)
+        ptr = p
         let unmanaged = Unmanaged.passUnretained(self)
-        ov_session_set_datagram_sink(ptr, unmanaged.toOpaque(), { user, data, len in
-            guard let user, let data, len > 0 else { return }
-            let me = Unmanaged<OvSessionBox>.fromOpaque(user).takeUnretainedValue()
-            me.onDatagramOut?(Data(bytes: data, count: len))
-        })
         ov_session_set_record_sink(ptr, unmanaged.toOpaque(), { user, channel, data, len in
             guard let user, let data, len > 0 else { return }
             let me = Unmanaged<OvSessionBox>.fromOpaque(user).takeUnretainedValue()
@@ -166,31 +161,31 @@ final class OvSessionBox {
 // FRAME_END. Pixel reassembly stays in Rust (single source of truth).
 final class OvScreenBox {
     /// Fired with (seq, width, height, stride, formatTag, pixels) on a complete frame.
-    fileprivate var onFrame: ((UInt64, UInt32, UInt32, UInt32, UInt8, Data) -> Void)?
+    var onFrame: ((UInt64, UInt32, UInt32, UInt32, UInt8, Data) -> Void)?
     /// Fired with (x, y) on a CURSOR command (frame pixel space).
-    fileprivate var onCursor: ((Int32, Int32) -> Void)?
+    var onCursor: ((Int32, Int32) -> Void)?
     /// Fired with (hotspotX, hotspotY, w, h, bgra) on a CURSOR_SHAPE command.
-    fileprivate var onCursorShape: ((UInt16, UInt16, UInt16, UInt16, Data) -> Void)?
+    var onCursorShape: ((UInt16, UInt16, UInt16, UInt16, Data) -> Void)?
 
     /// Fired with (alive 1/0, rttMs (-1 before first PONG), fps) on a liveness tick.
-    fileprivate var onLiveness: ((Int32, Int32, Float) -> Void)?
+    var onLiveness: ((Int32, Int32, Float) -> Void)?
     /// Fired on a MONITORS_INFO command with the host's monitor list
     /// (v0.18): each entry is (x, y, w, h, isPrimary).
-    fileprivate var onMonitors: (([(Int32, Int32, UInt32, UInt32, Bool)]) -> Void)?
+    var onMonitors: (([(Int32, Int32, UInt32, UInt32, Bool)]) -> Void)?
     /// Fired on an AUDIO command (v0.21) with one 20 ms tick of s16le
     /// 48 kHz mono PCM (960 samples).
-    fileprivate var onAudio: ((Data) -> Void)?
+    var onAudio: ((Data) -> Void)?
     /// Fired on a CLIPBOARD command (v0.26) with the peer's clipboard
     /// payload: kind (0 = text) and the raw payload bytes.
-    fileprivate var onClipboard: ((UInt8, Data) -> Void)?
+    var onClipboard: ((UInt8, Data) -> Void)?
     /// Fired when a peer-to-phone file transfer completes (v0.27) with the
     /// sanitized file name and the reassembled bytes.
-    fileprivate var onFile: ((String, Data) -> Void)?
+    var onFile: ((String, Data) -> Void)?
 
     private let ptr: OpaquePointer
 
     init() {
-        ptr = OpaquePointer(ov_screen_new())
+        ptr = ov_screen_new()
         let unmanaged = Unmanaged.passUnretained(self)
         ov_screen_set_frame_sink(ptr, unmanaged.toOpaque(), { user, seq, width, height, stride, format, pixels, len in
             guard let user, let pixels else { return }

@@ -334,7 +334,7 @@ struct SessionView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(Self.keyButtons, id: \.vk) { key in
-                        Button(key.label) { sendKey(key.vk) }
+                        Button(key.label) { sendKey(vk: key.vk) }
                             .buttonStyle(.bordered)
                     }
                 }
@@ -463,23 +463,17 @@ struct SessionView: View {
                 break
             }
         }
-        session.onDatagramOut = { [weak session] data in
+        session.onDatagramOut = { data in
             // Direct mode: forward to the UDP bridge (called on the main
             // thread from pump()). Relay mode: the Rust-owned relay carrier
             // sends from inside pumpRelay(), so nothing to do here.
             udpBridge?.send(data)
-            _ = session
         }
-        do {
-            try session.pump()
-            if let fp = session.peerFingerprint() {
-                peerPine = Self.pineString(fp)
-            }
-        } catch {
-            lines.append("error: \(error)")
-        }
-        // Direct/LAN mode: dial the peer over UDP. Inbound datagrams arrive
-        // on the main queue via the bridge and are fed to the session here.
+        // Direct/LAN mode: dial the peer over UDP. The bridge MUST exist
+        // before the first pump() — the client's first HELLO fires
+        // `onDatagramOut` during that pump, and a nil bridge would drop the
+        // packet so the handshake never starts. Inbound datagrams arrive on
+        // the main queue via the bridge and are fed to the session here.
         if case .direct(let host, let port) = (DirectTransport.pending ?? .relay(host: "", port: 0)) {
             DirectTransport.pending = nil
             let bridge = NwUdpBridge(host: host, port: port,
@@ -497,6 +491,14 @@ struct SessionView: View {
                 }
             })
             udpBridge = bridge
+        }
+        do {
+            try session.pump()
+            if let fp = session.peerFingerprint() {
+                peerPine = Self.pineString(fp)
+            }
+        } catch {
+            lines.append("error: \(error)")
         }
         // Poll the Rust core. Relay mode also drives the Rust-owned relay
         // transport; direct mode's inbound arrives via the bridge instead.
@@ -710,14 +712,21 @@ struct SessionView: View {
     static func makeCursorImage(w: UInt16, h: UInt16, bgra: Data) -> CGImage? {
         let width = Int(w), height = Int(h)
         guard width > 0, height > 0, bgra.count >= width * height * 4 else { return nil }
+        // 8-bit premultiplied BGRA: little-endian byte order (B first in
+        // memory) = alpha-first 32-bit words, hence premultipliedFirst +
+        // byteOrder32Little.
         let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
             | CGBitmapInfo.byteOrder32Little.rawValue)
-        guard let provider = CGDataProvider(data: bgra) else { return nil }
+        guard let provider = CGDataProvider(data: bgra as CFData) else { return nil }
         return CGImage(
             width: width, height: height,
             bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
-            provider: provider, info: info,
-            decode: nil, shouldInterpolate: true, intent: .defaultIntent,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: info,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
         )
     }
 
@@ -730,7 +739,7 @@ struct SessionView: View {
     static func makeImage(width: UInt32, height: UInt32, format: UInt8, pixels: Data) -> CGImage? {
         let w = Int(width), h = Int(height)
         guard w > 0, h > 0 else { return nil }
-        let buf = [UInt8](repeating: 0, count: w * h * 4)
+        var buf = [UInt8](repeating: 0, count: w * h * 4)
         switch format {
         case 0: // BGRA, 4 bytes/px. The 4th byte is GDI's unused high byte (0 for
             // real screen capture), not an alpha channel — force it opaque so the
@@ -753,14 +762,19 @@ struct SessionView: View {
         default:
             return nil
         }
+        // Same 8-bit premultiplied BGRA layout as `makeCursorImage`.
         let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
             | CGBitmapInfo.byteOrder32Little.rawValue)
-        guard let provider = CGDataProvider(data: Data(buf)) else { return nil }
+        guard let provider = CGDataProvider(data: Data(buf) as CFData) else { return nil }
         return CGImage(
             width: w, height: h,
             bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
-            provider: provider, info: info,
-            decode: nil, shouldInterpolate: true, intent: .defaultIntent,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: info,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
         )
     }
 }

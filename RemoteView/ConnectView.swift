@@ -44,14 +44,14 @@ struct ConnectView: View {
                     .pickerStyle(.segmented)
                     if useLan {
                         TextField("Peer host (IP)", text: $peerHost)
-                            .autocorrectionDisabled(true)
+                            .disableAutocorrection(true)
                             .textInputAutocapitalization(.never)
                             .keyboardType(.decimalPad)
                         TextField("Peer UDP port", text: $peerPort)
                             .keyboardType(.numberPad)
                     } else {
                         TextField("Relay host", text: $relayHost)
-                            .autocorrectionDisabled(true)
+                            .disableAutocorrection(true)
                             .textInputAutocapitalization(.never)
                         TextField("Relay port", text: $relayPort)
                             .keyboardType(.numberPad)
@@ -67,7 +67,10 @@ struct ConnectView: View {
                 }
             }
             .navigationTitle("OpenView")
-            NavigationLink(isActive: Binding(
+            // Hidden NavigationLink lives INSIDE the Form (a second child of
+            // NavigationView breaks the iPad two-column layout), and the
+            // view is forced to a single column.
+            .background(NavigationLink(isActive: Binding(
                 get: { session != nil },
                 set: { if !$0 { session = nil } }
             )) {
@@ -77,8 +80,9 @@ struct ConnectView: View {
             } label: {
                 EmptyView()
             }
-            .hidden()
+            .hidden())
         }
+        .navigationViewStyle(.stack)
     }
 
     private func connect() {
