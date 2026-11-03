@@ -1,0 +1,39 @@
+name: OpenView iOS (mirror)
+
+# Public CI mirror for the OpenView iOS app. The private monorepo (teamview)
+# can't run Actions without billing, so the iOS tree + prebuilt Rust staticlib
+# are mirrored here and built on a macOS runner. See build_ios.sh.
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: Build OpenView iOS (.app)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build simulator .app
+        # libs/libovffi.a (aarch64-apple-ios-sim) is committed to this mirror;
+        # build_ios.sh --sim skips cargo and runs xcodegen + xcodebuild only.
+        run: bash build_ios.sh --sim
+
+      - name: Collect .app for artifact
+        run: |
+          APP="$(find "$HOME/Library/Developer/Xcode/DerivedData" \
+                   -path '*Release-iphonesimulator/OpenView.app' -type d | head -1)"
+          test -n "$APP" || { echo "built .app not found" >&2; exit 1; }
+          cp -R "$APP" "./OpenView.app"
+          echo "Collected: $(du -sh OpenView.app | cut -f1)"
+
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenView-iOS
+          path: OpenView.app

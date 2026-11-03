@@ -1,0 +1,52 @@
+name: OpenView
+options:
+  bundleIdPrefix: com.openview
+  deploymentTarget:
+    iOS: "15.6"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: false
+  generateEmptyDirectories: false
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    # Prebuilt Rust staticlib (libs/libovffi.a) + C shim, exposed to Swift
+    # through the Objective-C bridging header (OvFFI.swift references the C
+    # symbols directly with no `import` — the bridging-header pattern).
+    SWIFT_INCLUDE_PATHS: "$(SRCROOT)/RemoteView/include"
+    SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/RemoteView/include/shim.h"
+    LIBRARY_SEARCH_PATHS: "$(SRCROOT)/libs"
+    OTHER_LDFLAGS: "-lovffi"
+
+targets:
+  OpenView:
+    type: application
+    platform: iOS
+    sources:
+      - path: RemoteView
+    info:
+      path: RemoteView/Info.plist
+      properties:
+        CFBundleDisplayName: OpenView
+        CFBundleShortVersionString: "0.28.0"  # keep in sync with the workspace crate version (openview/Cargo.toml)
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: OpenView connects to peers on your local network or to your relay server.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities:
+          - arm64
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.openview.remoteview
+        INFOPLIST_FILE: RemoteView/Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: "15.6"
+        GENERATE_INFOPLIST_FILE: NO
