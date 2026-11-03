@@ -20,6 +20,11 @@ settings:
     SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/RemoteView/include/shim.h"
     LIBRARY_SEARCH_PATHS: "$(SRCROOT)/libs"
     OTHER_LDFLAGS: "-lovffi"
+    # libs/libovffi.a is aarch64-apple-ios-sim only — building the x86_64
+    # simulator slice makes the linker ignore the whole archive
+    # ("ignoring file ... found architecture 'arm64', required 'x86_64'").
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
 
 targets:
   OpenView:
