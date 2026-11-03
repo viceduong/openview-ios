@@ -67,14 +67,17 @@ struct ConnectView: View {
                 }
             }
             .navigationTitle("OpenView")
-            .navigationLink(isActive: Binding(
+            NavigationLink(isActive: Binding(
                 get: { session != nil },
                 set: { if !$0 { session = nil } }
             )) {
                 if let session {
                     SessionView(session: session)
                 }
+            } label: {
+                EmptyView()
             }
+            .hidden()
         }
     }
 
@@ -97,15 +100,18 @@ struct ConnectView: View {
                 } else {
                     mode = .relay(host: relayHost, port: UInt16(relayPort) ?? 4569)
                 }
-                try s.setDatagramSink { [weak s] _ in }
                 switch mode {
                 case .relay(let host, let port):
                     // Relay session id = the host device id's low 32 bits,
-                    // matching ovhost --unattended / ovview --connect.
+                    // matching ovhost --unattended / ovview --connect. The relay
+                    // carrier is Rust-owned, so no datagram sink is needed.
                     try s.relayConnect(host: host, port: port,
                                        sessionID: UInt32(truncatingIfNeeded: devId))
                 case .direct:
-                    break
+                    // Create the Datagram carrier. The real outbound sink
+                    // (NwUdpBridge) is installed by SessionView.start() before
+                    // pumping, so a placeholder closure is enough here.
+                    try s.setDatagramSink { _ in }
                 }
                 try s.beginPin(pin)
                 session = s
@@ -124,15 +130,15 @@ struct ConnectView: View {
             } else {
                 mode = .relay(host: relayHost, port: UInt16(relayPort) ?? 4569)
             }
-            try s.setDatagramSink { [weak s] data in
-                _ = s // datagram send path: NwUdpBridge or relay pump delivers it
-            }
             switch mode {
             case .relay(let host, let port):
+                // Rust-owned relay carrier — no datagram sink needed.
                 try s.relayConnect(host: host, port: port,
                                    sessionID: OvSessionBox.relaySessionID(code: peerCode))
             case .direct:
-                break // NwUdpBridge is created by SessionView once pumping starts
+                // Create the Datagram carrier; SessionView.start() installs the
+                // real outbound sink (NwUdpBridge) before pumping.
+                try s.setDatagramSink { _ in }
             }
             try s.begin()
             session = s
@@ -150,14 +156,17 @@ enum PairingState {
 }
 
 final class PairingStateBox {
-    let identity: OpaquePointer
+    let identity: OpaquePointer?
     let code: String
     let pine: String
 
     init() {
-        identity = ov_identity_create()!
-        code = OvSessionBox.pairingCode(of: identity)
-        pine = OvSessionBox.fingerprintPine(of: identity)
+        let p = ov_identity_create()
+        identity = p
+        // A failed identity allocation (returns null) degrades to empty
+        // strings rather than crashing the app at launch.
+        code = p.map { OvSessionBox.pairingCode(of: $0) } ?? ""
+        pine = p.map { OvSessionBox.fingerprintPine(of: $0) } ?? ""
     }
 }
 

@@ -290,8 +290,10 @@ struct SessionView: View {
                                 .interpolation(.none)
                                 .frame(width: cursorSize.width * scale,
                                        height: cursorSize.height * scale)
-                                .position(x: content.origin.x + (pos.x - cursorHotspot.width) * scale,
-                                          y: content.origin.y + (pos.y - cursorHotspot.height) * scale)
+                                // `position` centers the view at (x,y); offset by half the
+                                // (scaled) image so the cursor HOTSPOT sits on the remote point.
+                                .position(x: content.origin.x + (pos.x - cursorHotspot.width + cursorSize.width / 2) * scale,
+                                          y: content.origin.y + (pos.y - cursorHotspot.height + cursorSize.height / 2) * scale)
                                 .allowsHitTesting(false)
                         }
                     }

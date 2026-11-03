@@ -51,9 +51,16 @@ final class OvSessionBox {
     }
 
     /// Wire the datagram transport (outbound path). Call before `begin`.
+    /// Re-installs the C trampoline so it routes outbound datagrams to
+    /// `onDatagramOut` (set here; the app later points it at the NwUdpBridge).
     func setDatagramSink(_ sink: @escaping (Data) -> Void) throws {
         onDatagramOut = sink
-        try check(ov_session_set_datagram_sink(ptr, Unmanaged.passUnretained(self).toOpaque(), { _, _, _ in }))
+        let unmanaged = Unmanaged.passUnretained(self)
+        try check(ov_session_set_datagram_sink(ptr, unmanaged.toOpaque(), { user, data, len in
+            guard let user, let data, len > 0 else { return }
+            let me = Unmanaged<OvSessionBox>.fromOpaque(user).takeUnretainedValue()
+            me.onDatagramOut?(Data(bytes: data, count: len))
+        }))
     }
 
     /// Queue one inbound datagram; processed on the next `pump()`.

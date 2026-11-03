@@ -18,6 +18,8 @@ typedef void (*ov_cursor_shape_sink)(void *user, uint16_t hotspot_x, uint16_t ho
 typedef void (*ov_liveness_sink)(void *user, int32_t alive, int32_t rtt_ms, float fps);
 typedef void (*ov_monitors_sink)(void *user, const uint8_t *mons, size_t count);
 typedef void (*ov_audio_sink)(void *user, const uint8_t *samples, size_t len);
+typedef void (*ov_clipboard_sink)(void *user, uint8_t kind, const uint8_t *text, size_t len);
+typedef void (*ov_file_sink)(void *user, const char *name, const uint8_t *data, size_t len);
 
 // identity
 void *ov_identity_create(void);
@@ -45,6 +47,9 @@ int32_t ov_session_relay_connect(void *s, const char *relay_host, uint16_t relay
 int32_t ov_session_pump_relay(void *s);
 int32_t ov_relay_session_id(const char *code, uint8_t *out /*4*/);
 
+// file transfer (v0.27): send a named file to the peer in 16 KiB chunks.
+int32_t ov_file_send(void *s, const char *name, const uint8_t *data, size_t data_len);
+
 // screen frames (terminal-channel reassembly, kept in Rust)
 void *ov_screen_new(void);
 void ov_screen_free(void *screen);
@@ -53,6 +58,8 @@ int32_t ov_screen_set_cursor_sink(void *screen, void *user, ov_cursor_sink sink)
 int32_t ov_screen_set_cursor_shape_sink(void *screen, void *user, ov_cursor_shape_sink sink);
 int32_t ov_screen_set_monitors_sink(void *screen, void *user, ov_monitors_sink sink);
 int32_t ov_screen_set_audio_sink(void *screen, void *user, ov_audio_sink sink);
+int32_t ov_screen_set_clipboard_sink(void *screen, void *user, ov_clipboard_sink sink);
+int32_t ov_screen_set_file_sink(void *screen, void *user, ov_file_sink sink);
 int32_t ov_screen_feed(void *screen, const uint8_t *data, size_t len);
 
 // liveness (v0.16): keepalive pacing + RTT + dead-peer detection
