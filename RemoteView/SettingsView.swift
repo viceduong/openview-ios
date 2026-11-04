@@ -11,6 +11,9 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.defaultQuality) private var defaultQuality = 0
     @AppStorage(SettingsKey.autoReconnect) private var autoReconnect = true
     @AppStorage(SettingsKey.confirmDisconnect) private var confirmDisconnect = true
+    @AppStorage(SettingsKey.directConnection) private var directConnection = true
+    // Display
+    @AppStorage(SettingsKey.sharpen) private var sharpen = true
     // Input
     @AppStorage(RemoteInputController.modeDefaultsKey) private var inputMode = InputMode.mouse.rawValue
     @AppStorage(RemoteInputController.cmdAsCtrlDefaultsKey) private var cmdAsCtrl = true
@@ -43,7 +46,9 @@ struct SettingsView: View {
         NavigationView {
             Form {
                 connection
+                directSection
                 input
+                display
                 session
                 security
                 appearanceSection
@@ -93,6 +98,38 @@ struct SettingsView: View {
             }
             Toggle("Reconnect automatically", isOn: $autoReconnect)
             Toggle("Confirm before disconnecting", isOn: $confirmDisconnect)
+        }
+    }
+
+    /// Section 5: direct UDP path next to relay sessions.
+    private var directSection: some View {
+        Section(header: Text("Direct Connection"),
+                footer: Text(Self.directHelp)) {
+            Toggle(isOn: $directConnection) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Direct connection")
+                    Text("Relay sessions switch to a direct UDP path when the host is reachable.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    static let directHelp = """
+        Applies to new connections; the relay stays as the fallback. \
+        With Shadowrocket (or another VPN app) on this iPhone, add DIRECT rules so \
+        the direct path bypasses the tunnel:
+        IP-CIDR,113.178.65.187/32,DIRECT
+        IP-CIDR,192.168.1.0/24,DIRECT
+        IP-CIDR,100.64.0.0/10,DIRECT
+        """
+
+    /// Section 4: renderer look.
+    private var display: some View {
+        Section(header: Text("Display"),
+                footer: Text("Sharpens the remote screen after scaling, like TeamViewer.")) {
+            Toggle("Sharpen", isOn: $sharpen)
         }
     }
 

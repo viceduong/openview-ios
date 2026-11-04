@@ -272,6 +272,7 @@ private struct RemoteScreenView: View {
     var body: some View {
         if let img = model.image {
             RemoteScreenSurface(image: img,
+                                pixels: model.pixels,
                                 frameSize: model.frameSize,
                                 video: model.video,
                                 cursorPos: model.cursorPos,
@@ -474,6 +475,18 @@ private struct StatsChip: View {
         liveness.rttMs >= 0 ? "\(liveness.rttMs) ms" : "— ms"
     }
 
+    private var accessibilityText: String {
+        guard let path = liveness.path else { return "Connection quality \(rttText)" }
+        return "Connection quality \(rttText), \(path)"
+    }
+
+    /// Section 5: "Direct" / "Relay" / "Probing…" next to the RTT.
+    private var shortPath: String? {
+        guard let path = liveness.path else { return nil }
+        if path.hasPrefix("Direct") { return "Direct" }
+        return path
+    }
+
     var body: some View {
         Button {
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -487,11 +500,19 @@ private struct StatsChip: View {
                         .frame(width: 8, height: 8)
                     Text(rttText)
                         .font(.caption.monospacedDigit().weight(.semibold))
+                    if let p = shortPath {
+                        Text("· \(p)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(p == "Direct" ? .green : Color.white.opacity(0.75))
+                    }
                 }
                 if expanded {
                     detailRow("RTT", rttText)
                     detailRow("FPS", String(format: "%.1f", Double(liveness.fps)))
                     detailRow("Link", transport)
+                    if let path = liveness.path {
+                        detailRow("Path", path)
+                    }
                     detailRow("Host", fingerprint.isEmpty ? "—" : fingerprint)
                 }
             }
@@ -501,7 +522,7 @@ private struct StatsChip: View {
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Connection quality \(rttText)")
+        .accessibilityLabel(accessibilityText)
     }
 
     private func detailRow(_ key: String, _ value: String) -> some View {

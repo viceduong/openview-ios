@@ -175,6 +175,47 @@ final class OvSessionBox {
         try check(rc)
     }
 
+    // ---- Section 5: direct (UDP) path over a relay session ----
+
+    /// The engine wants `data` sent on direct path `pathID` (fires on the
+    /// pump / send caller thread under the session lock: never call back
+    /// into this session from it).
+    var onDirectSend: ((UInt32, Data) -> Void)?
+    /// The host offered candidate `addr` ("ip:port" / "[v6]:port"): open a
+    /// UDP path `pathID` to it (same threading rules as `onDirectSend`).
+    var onDirectOpen: ((UInt32, String) -> Void)?
+
+    /// Install the direct-path sinks (makes the session direct-capable;
+    /// pair with `OvScreenBox.setDirectCapable`). Relay transports only.
+    func setDirectSinks() throws {
+        let unmanaged = Unmanaged.passUnretained(self)
+        try check(ov_session_set_direct_sinks(ptr, unmanaged.toOpaque(), { user, pathID, data, len in
+            guard let user, let data, len > 0 else { return }
+            let me = Unmanaged<OvSessionBox>.fromOpaque(user).takeUnretainedValue()
+            me.onDirectSend?(pathID, Data(bytes: data, count: len))
+        }, { user, pathID, addr in
+            guard let user, let addr else { return }
+            let me = Unmanaged<OvSessionBox>.fromOpaque(user).takeUnretainedValue()
+            me.onDirectOpen?(pathID, String(cString: addr))
+        }))
+    }
+
+    /// Queue one datagram received on direct path `pathID`; processed by
+    /// the next `pumpRelay()`. -2 (no engine yet) is ignored.
+    func onDirectDatagram(pathID: UInt32, _ data: Data) {
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            _ = ov_session_on_direct_datagram(ptr, pathID, base, raw.count)
+        }
+    }
+
+    /// 0 relay, 1 probing, 2 direct (-1 never for a live box).
+    var directState: Int32 { ov_session_direct_state(ptr) }
+    /// Milliseconds until the direct engine needs a pump (-1 = none).
+    var directDeadlineMs: Int64 { ov_session_direct_deadline_ms(ptr) }
+    /// The active direct path id, or -1.
+    var directPath: Int64 { ov_session_direct_path(ptr) }
+
     /// Drop every Swift-side callback (session teardown). The C sinks stay
     /// installed but become no-ops, and the closures — which capture the
     /// session's owner — are released so nothing keeps this box alive.
@@ -183,6 +224,17 @@ final class OvSessionBox {
         onRecord = nil
         onEstablished = nil
         onRelayBytesOut = nil
+        onDirectSend = nil
+        onDirectOpen = nil
+    }
+
+    /// Section 4: one SESSION_OPTION payload (channel 0). `key` 1 = hide
+    /// the host wallpaper, 2 = disable host animations.
+    static func optionRecord(key: UInt8, on: Bool) -> Data? {
+        var out = [UInt8](repeating: 0, count: 8)
+        let n = ov_session_option_record(key, on ? 1 : 0, &out, out.count)
+        guard n > 0, Int(n) <= out.count else { return nil }
+        return Data(out[0..<Int(n)])
     }
 
     private func check(_ rc: Int32) throws {
@@ -218,8 +270,16 @@ final class OvSessionBox {
 // `OvScreen` is NOT internally locked: call every method (feed, ticks,
 // takePongReply) from `OvQueues.session` only.
 final class OvScreenBox {
-    /// Fired with (seq, width, height, stride, formatTag, pixels) on a complete frame.
-    var onFrame: ((UInt64, UInt32, UInt32, UInt32, UInt8, Data) -> Void)?
+    /// Fired with (seq, width, height, stride, formatTag, pixels, dirty) on
+    /// a complete frame, right after the `feed` that completed it. `dirty`
+    /// = the rects (frame pixels) the frame changed, nil = treat as full.
+    var onFrame: ((UInt64, UInt32, UInt32, UInt32, UInt8, Data, [CGRect]?) -> Void)?
+    /// A frame the sink delivered during the current `feed` (handed to
+    /// `onFrame` once `ov_screen_feed` returned, so the dirty rects can be
+    /// read without re-entering the assembler from inside its sink).
+    private var deliveredFrame: (UInt64, UInt32, UInt32, UInt32, UInt8, Data)?
+    /// Above this many dirty rects a frame counts as a full update.
+    private static let maxDirtyRects = 256
     /// Fired with (x, y) on a CURSOR command (frame pixel space).
     var onCursor: ((Int32, Int32) -> Void)?
     /// Fired with (hotspotX, hotspotY, w, h, bgra) on a CURSOR_SHAPE command.
@@ -257,8 +317,9 @@ final class OvScreenBox {
         ov_screen_set_frame_sink(ptr, unmanaged.toOpaque(), { user, seq, width, height, stride, format, pixels, len in
             guard let user, let pixels else { return }
             let me = Unmanaged<OvScreenBox>.fromOpaque(user).takeUnretainedValue()
+            guard me.onFrame != nil else { return }
             let data = Data(bytes: pixels, count: Int(len))
-            me.onFrame?(seq, width, height, stride, format, data)
+            me.deliveredFrame = (seq, width, height, stride, format, data)
         })
         ov_screen_set_cursor_sink(ptr, unmanaged.toOpaque(), { user, x, y in
             guard let user else { return }
@@ -353,7 +414,11 @@ final class OvScreenBox {
                 screenSize: CGSize(width: CGFloat(p.screen_w), height: CGFloat(p.screen_h)),
                 sps: RemoteVideoPacket.copy(p.sps, p.sps_len),
                 pps: RemoteVideoPacket.copy(p.pps, p.pps_len),
-                avcc: RemoteVideoPacket.copy(p.data, p.data_len))
+                avcc: RemoteVideoPacket.copy(p.data, p.data_len),
+                colour: RemoteVideoPacket.Colour(primaries: p.colour_primaries,
+                                                 transfer: p.transfer,
+                                                 matrix: p.matrix,
+                                                 fullRange: p.full_range != 0))
             me.onVideo?(pkt)
         })
     }
@@ -413,5 +478,31 @@ final class OvScreenBox {
             guard let base = raw.baseAddress else { return }
             ov_screen_feed(ptr, base.assumingMemoryBound(to: UInt8.self), raw.count)
         }
+        if let f = deliveredFrame {
+            deliveredFrame = nil
+            onFrame?(f.0, f.1, f.2, f.3, f.4, f.5, dirtyRects())
+        }
+    }
+
+    /// Section 5: advertise CAP_DIRECT (before the first `feed`).
+    func setDirectCapable(_ on: Bool) {
+        ov_screen_set_direct_capable(ptr, on ? 1 : 0)
+    }
+
+    /// The rects the last delivered frame changed (nil = unknown / too
+    /// many: upload the whole frame). Never call from inside a sink.
+    private func dirtyRects() -> [CGRect]? {
+        var buf = [UInt16](repeating: 0, count: Self.maxDirtyRects * 4)
+        let n = ov_screen_last_dirty_rects(ptr, &buf, Self.maxDirtyRects)
+        guard n > 0, Int(n) <= Self.maxDirtyRects else { return nil }
+        var out: [CGRect] = []
+        out.reserveCapacity(Int(n))
+        for i in 0..<Int(n) {
+            let w = buf[i * 4 + 2], h = buf[i * 4 + 3]
+            guard w > 0, h > 0 else { continue }
+            out.append(CGRect(x: CGFloat(buf[i * 4]), y: CGFloat(buf[i * 4 + 1]),
+                              width: CGFloat(w), height: CGFloat(h)))
+        }
+        return out
     }
 }

@@ -37,6 +37,8 @@ struct SessionMenuSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.lockLocalZoom) private var lockLocalZoom = false
+    @AppStorage(SettingsKey.hideWallpaper) private var hideWallpaper = true
+    @AppStorage(SettingsKey.disableAnimations) private var disableAnimations = false
 
     var body: some View {
         NavigationView {
@@ -138,6 +140,24 @@ struct SessionMenuSheet: View {
                     Text("All gestures, pinch included, go to the remote computer.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                }
+            }
+            // Section 4: only hosts announcing CAP_DESKTOP_FX can do these.
+            if controller.hostSupportsDesktopFx {
+                Toggle("Hide remote wallpaper", isOn: $hideWallpaper)
+                    .onChange(of: hideWallpaper) { on in
+                        controller.setDesktopOption(key: 1, on: on)
+                    }
+                Toggle(isOn: $disableAnimations) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Disable animations")
+                        Text("Turns off window animations on the host while you are connected.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .onChange(of: disableAnimations) { on in
+                    controller.setDesktopOption(key: 2, on: on)
                 }
             }
         }

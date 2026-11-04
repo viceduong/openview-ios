@@ -136,6 +136,10 @@ final class ScreenModel: ObservableObject {
     @Published var cursorImage: CGImage?
     @Published var cursorHotspot: CGSize = .zero
     @Published var cursorSize: CGSize = .zero
+    // Section 4: the latest frame's BGRA bytes + the rects changed since
+    // the Metal renderer last uploaded (not published: the surface pulls
+    // them whenever `image` changes).
+    let pixels = FramePixelStore()
     // Phase 5: the H.264 overlay for high-motion regions (not published —
     // the frame view hosts its layer; samples are enqueued directly).
     let video = VideoOverlay()
@@ -147,12 +151,15 @@ final class LivenessModel: ObservableObject {
     @Published var peerAlive = true
     @Published var rttMs: Int32 = -1
     @Published var fps: Float = 0
+    /// Section 5: "Relay" / "Probing…" / "Direct (LAN)" / "Direct
+    /// (Internet)" for relay sessions; nil for direct UDP sessions.
+    @Published var path: String?
 }
 
 /// Screen updates accumulated on the session queue and applied to
 /// `ScreenModel` in one main-thread hop (latest wins).
 private struct PendingScreen {
-    var frame: (image: CGImage, size: CGSize)?
+    var frame: (image: CGImage, size: CGSize, pixels: FramePixels)?
     var cursorPos: CGPoint?
     var cursorShape: (image: CGImage?, hotspot: CGSize, size: CGSize)?
     /// Phase 5: this frame is the lossless refresh after VIDEO_END of that
@@ -187,6 +194,9 @@ final class SessionController: ObservableObject {
     @Published var toast: String?
     /// TOFU: set while the host's identity differs from the pinned one.
     @Published var identityMismatch: IdentityMismatch?
+    /// Section 4: the host announced CAP_DESKTOP_FX (wallpaper / animation
+    /// switches in the session menu).
+    @Published private(set) var hostSupportsDesktopFx = false
 
     let screenModel = ScreenModel()
     let livenessModel = LivenessModel()
@@ -269,6 +279,27 @@ final class SessionController: ObservableObject {
     private var pendingHideGen: Int?
     /// Last host CAPS seen (section 2: CAP_INPUT2 picks the input commands).
     private var lastPeerCaps: UInt32 = 0
+    /// Section 4: the desktop-effect wishes went out to this host.
+    private var sentDesktopFx = false
+    static let capDesktopFx: UInt32 = 1 << 8
+    // Section 5: direct UDP path next to a relay session (session queue).
+    /// This attempt runs over a relay (TCP or WebSocket).
+    private var relayMode = false
+    /// The direct sinks are installed (relay mode + setting on).
+    private var p2pEnabled = false
+    /// One UDP NWConnection per host candidate.
+    private var p2pPaths: DirectPathSet?
+    /// One-shot timer driving pumpRelay at the engine deadline (<= 20 ms)
+    /// while probing / direct, and when it is due.
+    private var p2pTimer: DispatchSourceTimer?
+    private var p2pTimerDue: DispatchTime?
+    /// Direct datagrams queued since the last pump / a pump is scheduled.
+    private var p2pQueued = 0
+    private var p2pPumpScheduled = false
+    /// Last direct state / path published (UI + log only on change).
+    private var lastDirectState: Int32 = -1
+    private var lastDirectPath: Int64 = -1
+    private static let p2pMaxIntervalMs: Int64 = 20
 
     // Screen updates coalesced across threads (guarded by `screenLock`).
     private let screenLock = NSLock()
@@ -297,8 +328,12 @@ final class SessionController: ObservableObject {
         let timer = self.pumpTimer
         let ws = self.relaySocket
         let udp = self.udpBridge
+        let p2pTimer = self.p2pTimer
+        let p2pPaths = self.p2pPaths
         queue.async {
             timer?.cancel()
+            p2pTimer?.cancel()
+            p2pPaths?.closeAll()
             ws?.onMessage = nil
             ws?.onClose = nil
             ws?.close()
@@ -398,6 +433,8 @@ final class SessionController: ObservableObject {
         livenessModel.peerAlive = true
         livenessModel.rttMs = -1
         livenessModel.fps = 0
+        livenessModel.path = nil
+        hostSupportsDesktopFx = false
         screenModel.video.hide(generation: screenModel.video.generation)
         let req = request
         log("Connecting to \(req.displayName) via \(req.transport.detail)")
@@ -639,22 +676,45 @@ final class SessionController: ObservableObject {
                 } catch {
                     self.handle(error)
                 }
+                self.afterRelayPump()
             }
             ws.onClose = { [weak self] closeError in
                 guard let self, !self.halted, let session = self.session else { return }
                 session.relayEOF()
                 // Drain whatever arrived before the close; the relay then
-                // reports closed (-5), which ends the session below.
+                // reports closed (-5), which ends the session below —
+                // unless the direct path carries the session (Section 5:
+                // Rust keeps it alive while the path holds, and reports -5
+                // from a later pump once it is gone too).
                 do {
                     try session.pumpRelay()
                 } catch {
                     self.handle(error)
+                }
+                if !self.halted, self.p2pEnabled, session.directState == 2 {
+                    self.relaySocket = nil
+                    self.log("Relay connection closed — continuing on the direct path")
+                    self.afterRelayPump()
+                    return
                 }
                 if !self.halted {
                     let reason = closeError.map { "relay: \($0.localizedDescription)" } ?? "the relay connection closed"
                     self.failOnQueue(.disconnected(reason))
                 }
             }
+        }
+
+        // Section 5: relay sessions may move onto a direct UDP path (the
+        // host offers its candidates once our CAPS say CAP_DIRECT).
+        switch mode {
+        case .relay, .relayWebSocket:
+            relayMode = true
+            if AppSettings.directConnection {
+                enableDirectPath(session)
+            }
+            publishDirectState()
+        case .direct:
+            break
         }
 
         do {
@@ -701,6 +761,14 @@ final class SessionController: ObservableObject {
         videoActive = false
         pendingHideGen = nil
         lastPeerCaps = 0
+        sentDesktopFx = false
+        relayMode = false
+        p2pEnabled = false
+        p2pQueued = 0
+        p2pPumpScheduled = false
+        p2pTimerDue = nil
+        lastDirectState = -1
+        lastDirectPath = -1
     }
 
     /// The secure session is up: publish the host fingerprint once.
@@ -715,17 +783,26 @@ final class SessionController: ObservableObject {
     private func installScreenSinks() {
         // Frames: build the CGImage here, off main, then publish only the
         // finished image (coalesced — if main is behind, the newest wins).
-        screen.onFrame = { [weak self] _, width, height, stride, format, pixels in
+        screen.onFrame = { [weak self] _, width, height, stride, format, pixels, dirty in
             guard let self,
-                  let img = FrameImage.make(width: width, height: height, stride: stride,
-                                            format: format, pixels: pixels) else { return }
+                  let made = FrameImage.make(width: width, height: height, stride: stride,
+                                             format: format, pixels: pixels) else { return }
+            let img = made.image
             let size = CGSize(width: CGFloat(img.width), height: CGFloat(img.height))
             // Phase 5: the first frame after VIDEO_END carries the lossless
             // refresh of the region; the overlay goes away with it.
             let hide = self.pendingHideGen
             self.pendingHideGen = nil
+            var fp = FramePixels(bytes: made.bytes, rowBytes: made.rowBytes,
+                                 width: img.width, height: img.height, dirty: dirty)
             self.postScreen {
-                $0.frame = (image: img, size: size)
+                // Section 4: a frame main has not shown yet is replaced;
+                // its dirty rects carry over so the texture upload covers
+                // both.
+                if let older = $0.frame?.pixels {
+                    fp.dirty = FramePixels.merged(older, fp)
+                }
+                $0.frame = (image: img, size: size, pixels: fp)
                 if let hide { $0.hideVideoGen = hide }
             }
         }
@@ -891,12 +968,185 @@ final class SessionController: ObservableObject {
             if caps != lastPeerCaps {
                 lastPeerCaps = caps
                 let input2 = caps & InputWire.capInput2 != 0
+                let fx = caps & Self.capDesktopFx != 0
+                if fx && !sentDesktopFx {
+                    sentDesktopFx = true
+                    try sendDesktopWishes(session)
+                }
                 DispatchQueue.main.async { [weak self] in
-                    self?.input.input2 = input2
+                    guard let self else { return }
+                    self.input.input2 = input2
+                    if self.hostSupportsDesktopFx != fx {
+                        self.hostSupportsDesktopFx = fx
+                    }
                 }
             }
         } catch {
             handle(error)
+        }
+        afterRelayPump()
+    }
+
+    // MARK: Desktop effects (Section 4)
+
+    /// The host can hide its wallpaper / animations: send the saved wishes
+    /// (only the "on" ones — the host leaves its desktop alone otherwise).
+    private func sendDesktopWishes(_ session: OvSessionBox) throws {
+        let wishes: [(UInt8, Bool)] = [(1, AppSettings.hideWallpaper), (2, AppSettings.disableAnimations)]
+        for (key, on) in wishes where on {
+            if let payload = OvSessionBox.optionRecord(key: key, on: on) {
+                try session.sendRecord(channel: 0, payload: payload)
+            }
+        }
+    }
+
+    /// Session menu: one desktop-effect switch changed (main). `key` 1 =
+    /// hide wallpaper, 2 = disable animations. Ignored for hosts without
+    /// CAP_DESKTOP_FX.
+    func setDesktopOption(key: UInt8, on: Bool) {
+        guard hostSupportsDesktopFx, let payload = OvSessionBox.optionRecord(key: key, on: on) else { return }
+        sendCommand(payload)
+    }
+
+    // MARK: Direct path (Section 5, session queue)
+
+    /// Install the direct-path sinks and advertise CAP_DIRECT. Relay
+    /// sessions only; the host then offers candidates and Rust probes,
+    /// promotes and falls back inside the pump calls.
+    private func enableDirectPath(_ session: OvSessionBox) {
+        let paths = DirectPathSet(queue: queue) { [weak self] pathID, data in
+            self?.directDatagramIn(pathID: pathID, data)
+        }
+        session.onDirectOpen = { [weak self] pathID, address in
+            // Fires inside a pump (session lock held): only open the socket.
+            guard let self, !self.halted, let paths = self.p2pPaths else { return }
+            if paths.open(pathID: pathID, address: address) {
+                self.log("Direct path: probing \(address)")
+            } else {
+                self.log("Direct path: unusable candidate \(address)")
+            }
+        }
+        session.onDirectSend = { [weak self] pathID, data in
+            self?.p2pPaths?.send(pathID: pathID, data)
+        }
+        do {
+            try session.setDirectSinks()
+        } catch {
+            session.onDirectOpen = nil
+            session.onDirectSend = nil
+            paths.closeAll()
+            log("Direct path unavailable: \(error)")
+            return
+        }
+        p2pPaths = paths
+        p2pEnabled = true
+        screen.setDirectCapable(true)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .distantFuture, repeating: .never)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.p2pTimerDue = nil
+            self.p2pPump()
+        }
+        p2pTimer = timer
+        timer.resume()
+    }
+
+    /// One datagram on a direct path: queue it into the engine and pump
+    /// once per burst (~1 ms later, or now when many are waiting).
+    private func directDatagramIn(pathID: UInt32, _ data: Data) {
+        guard !halted, let session else { return }
+        session.onDirectDatagram(pathID: pathID, data)
+        p2pQueued += 1
+        if p2pQueued >= Self.directBatchMax {
+            p2pPump()
+            return
+        }
+        guard !p2pPumpScheduled else { return }
+        p2pPumpScheduled = true
+        queue.asyncAfter(deadline: .now() + .milliseconds(1)) { [weak self] in
+            guard let self else { return }
+            self.p2pPumpScheduled = false
+            if self.p2pQueued > 0 {
+                self.p2pPump()
+            }
+        }
+    }
+
+    /// Pump the relay session (relay frames + queued direct datagrams +
+    /// engine timers), answer a PING at once, and re-arm the timer. Sends
+    /// on the active path go out as one NWConnection batch.
+    private func p2pPump() {
+        p2pQueued = 0
+        guard !halted, let session else { return }
+        var failure: Error?
+        let run = {
+            do {
+                try session.pumpRelay()
+                try self.sendPongIfOwed()
+            } catch {
+                failure = error
+            }
+        }
+        if let paths = p2pPaths {
+            paths.batch(pathID: session.directPath, run)
+        } else {
+            run()
+        }
+        if let failure {
+            handle(failure)
+        }
+        afterRelayPump()
+    }
+
+    /// After any relay pump: publish the path state and keep the engine's
+    /// timer armed (every <= 20 ms, or at its deadline) while probing or
+    /// direct. Idle relay sessions stay on the 50 ms tick.
+    private func afterRelayPump() {
+        guard relayMode, !halted, let session else { return }
+        publishDirectState()
+        guard p2pEnabled, let timer = p2pTimer else { return }
+        let state = session.directState
+        guard state > 0 else { return }
+        let deadline = session.directDeadlineMs
+        var ms = deadline >= 0 ? min(deadline, Self.p2pMaxIntervalMs) : Self.p2pMaxIntervalMs
+        ms = max(ms, 1)
+        let due = DispatchTime.now() + .milliseconds(Int(ms))
+        if let armed = p2pTimerDue, armed <= due {
+            return // an earlier wake-up is already set
+        }
+        p2pTimerDue = due
+        timer.schedule(deadline: due, repeating: .never, leeway: .milliseconds(1))
+    }
+
+    /// Publish "Relay" / "Probing…" / "Direct (LAN|Internet)" on change and
+    /// log promotions / fallbacks.
+    private func publishDirectState() {
+        guard relayMode, let session else { return }
+        let state = p2pEnabled ? session.directState : 0
+        let path = state == 2 ? session.directPath : -1
+        guard state != lastDirectState || path != lastDirectPath else { return }
+        let previous = lastDirectState
+        lastDirectState = state
+        lastDirectPath = path
+        let label: String
+        switch state {
+        case 1:
+            label = "Probing…"
+        case 2:
+            let kind = p2pPaths?.kind(of: path) ?? .internet
+            label = "Direct (\(kind.label))"
+            let addr = p2pPaths?.address(of: path) ?? "?"
+            log("Direct path active (\(kind.label), \(addr))")
+        default:
+            label = "Relay"
+            if previous == 2 {
+                log("Direct path lost — back on the relay")
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let model = self?.livenessModel, model.path != label else { return }
+            model.path = label
         }
     }
 
@@ -997,6 +1247,12 @@ final class SessionController: ObservableObject {
         relaySocket = nil
         udpBridge?.close()
         udpBridge = nil
+        p2pTimer?.cancel()
+        p2pTimer = nil
+        p2pTimerDue = nil
+        p2pPaths?.closeAll()
+        p2pPaths = nil
+        p2pEnabled = false
         audioPlayer.stop()
     }
 
@@ -1220,6 +1476,9 @@ final class SessionController: ObservableObject {
         guard !p.isEmpty else { return }
         let model = screenModel
         if let frame = p.frame {
+            // Pixels first: setting `image` re-renders the surface, which
+            // pulls them for the Metal texture upload.
+            model.pixels.publish(frame.pixels)
             model.image = frame.image
             if model.frameSize != frame.size { model.frameSize = frame.size }
             markLiveIfNeeded()
@@ -1527,7 +1786,7 @@ enum FrameImage {
     /// the source row pitch in bytes (0 / short buffers fall back to tightly
     /// packed rows).
     static func make(width: UInt32, height: UInt32, stride: UInt32,
-                     format: UInt8, pixels: Data) -> CGImage? {
+                     format: UInt8, pixels: Data) -> (image: CGImage, bytes: Data, rowBytes: Int)? {
         let w = Int(width), h = Int(height)
         guard w > 0, h > 0, w <= maxDimension, h <= maxDimension else { return nil }
         let bpp: Int
@@ -1542,10 +1801,12 @@ enum FrameImage {
             | CGBitmapInfo.byteOrder32Little.rawValue)
         let provider: CGDataProvider
         let outRowBytes: Int
+        let bgra: Data
         if bpp == 4 {
             guard let p = CGDataProvider(data: pixels as CFData) else { return nil }
             provider = p
             outRowBytes = rowBytes
+            bgra = pixels
         } else {
             // BGR -> BGRX, one pass over raw pointers (no per-pixel bounds
             // checks; the extents were validated above).
@@ -1569,8 +1830,9 @@ enum FrameImage {
             guard let p = CGDataProvider(data: out as CFData) else { return nil }
             provider = p
             outRowBytes = dstRow
+            bgra = out
         }
-        return CGImage(
+        guard let image = CGImage(
             width: w, height: h,
             bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: outRowBytes,
             space: CGColorSpaceCreateDeviceRGB(),
@@ -1579,7 +1841,8 @@ enum FrameImage {
             decode: nil,
             shouldInterpolate: true,
             intent: .defaultIntent
-        )
+        ) else { return nil }
+        return (image: image, bytes: bgra, rowBytes: outRowBytes)
     }
 
     /// The usable source row pitch, or nil when the buffer cannot hold the

@@ -51,10 +51,26 @@ typedef struct ov_video_packet {
     size_t pps_len;
     const uint8_t *data;
     size_t data_len;
+    // Section 4 (additive): the stream's colour description as H.264 /
+    // ISO 23001-8 code points from the SPS VUI (host default: BT.709
+    // limited range = 1 / 1 / 1 / 0). Four u8s after a size_t: the struct
+    // stays 8-byte aligned (4 bytes of tail padding), same as the Rust
+    // #[repr(C)] OvVideoPacket.
+    uint8_t colour_primaries;
+    uint8_t transfer;
+    uint8_t matrix;
+    uint8_t full_range;
 } ov_video_packet;
 typedef void (*ov_video_sink)(void *user, const ov_video_packet *packet);
 typedef void (*ov_clipboard_sink)(void *user, uint8_t kind, const uint8_t *text, size_t len);
 typedef void (*ov_file_sink)(void *user, const char *name, const uint8_t *data, size_t len);
+// Section 5 direct path: put `data` on the wire of path `path_id` (the UDP
+// NWConnection the shell opened for it). Fires on the pump / send caller
+// thread, under the session lock: never call back into the session.
+typedef void (*OvDirectSendSink)(void *user, uint32_t path_id, const uint8_t *data, size_t len);
+// Section 5: the host offered candidate `addr` ("ip:port" or "[v6]:port",
+// NUL-terminated, valid only during the call); open a UDP path for it.
+typedef void (*OvDirectPathSink)(void *user, uint32_t path_id, const char *addr);
 
 // Opaque handle types: Swift imports `void *` as UnsafeMutableRawPointer
 // but the app stores OpaquePointer, so declare the handles as pointers to
@@ -94,6 +110,21 @@ int32_t ov_session_relay_feed(OvSession *s, const uint8_t *data, size_t len);
 int32_t ov_session_relay_eof(OvSession *s);
 int32_t ov_relay_session_id(const char *code, uint8_t *out /*4*/);
 
+// Section 5: direct (UDP) path next to a relay session. Installing the sinks
+// makes the session direct-capable (pair with ov_screen_set_direct_capable);
+// probing / promotion / fallback run inside the pump calls.
+int32_t ov_session_set_direct_sinks(OvSession *s, void *user, OvDirectSendSink send, OvDirectPathSink open_path);
+// Queue one datagram received on direct path `path_id` (processed by the
+// next pump). 0, -1 bad args, -2 no direct engine (not established yet).
+int32_t ov_session_on_direct_datagram(OvSession *s, uint32_t path_id, const uint8_t *data, size_t len);
+int32_t ov_session_direct_state(OvSession *s);        /* 0 relay, 1 probing, 2 direct, -1 null */
+int64_t ov_session_direct_deadline_ms(OvSession *s);  /* -1 = no timer pending */
+int64_t ov_session_direct_path(OvSession *s);         /* active path_id or -1 */
+// Section 4: SESSION_OPTION payload (key 1 = hide wallpaper, 2 = disable
+// animations; value 0/1) for ov_session_send_record on channel 0. Returns
+// the length (3) or -1.
+int32_t ov_session_option_record(uint8_t key, uint8_t value, uint8_t *out, size_t cap);
+
 // file transfer (v0.27): send a named file to the peer in 16 KiB chunks.
 int32_t ov_file_send(OvSession *s, const char *name, const uint8_t *data, size_t data_len);
 
@@ -124,6 +155,14 @@ int32_t ov_screen_feed(OvScreen *screen, const uint8_t *data, size_t len);
 // never does). CAP_INPUT2 = 0x40 enables POINTER_EX / WHEEL / KEY_EX / TEXT /
 // RELEASE_ALL / SAS. Session queue only (OvScreen is not locked).
 uint32_t ov_screen_peer_caps(const OvScreen *screen);
+// Section 5: advertise CAP_DIRECT (1 << 7) in our CAPS (before the first
+// screen command, alongside ov_session_set_direct_sinks).
+int32_t ov_screen_set_direct_capable(OvScreen *s, int32_t on);
+// Phase 3: the rects the last delivered frame changed, as packed u16
+// quadruples x, y, w, h (frame pixels) in `out` (room for max_rects).
+// Returns the rect count (may exceed max_rects), 0 before any frame, -1 on
+// a null handle. Session queue only, never from inside a sink.
+int32_t ov_screen_last_dirty_rects(OvScreen *s, uint16_t *out, size_t max_rects);
 
 // liveness (v0.16): keepalive pacing + RTT + dead-peer detection
 int32_t ov_screen_set_liveness_sink(OvScreen *screen, void *user, ov_liveness_sink sink);

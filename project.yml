@@ -63,6 +63,9 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         # Per-controller status bar (the session hides it).
         UIViewControllerBasedStatusBarAppearance: true
+        # Section 4: ProMotion iPhones may run the session's display link
+        # (pan / zoom / cursor redraws) above 60 Hz.
+        CADisableMinimumFrameDurationOnPhone: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openview.remoteview

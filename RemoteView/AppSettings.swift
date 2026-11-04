@@ -15,6 +15,14 @@ enum SettingsKey {
     static let defaultQuality = "ov.defaultQuality"
     static let autoReconnect = "ov.autoReconnect"
     static let confirmDisconnect = "ov.confirmDisconnect"
+    /// Section 5: try a direct UDP path next to relay sessions.
+    static let directConnection = "ov.directConnection"
+    // Display (Section 4)
+    /// TeamViewer-style unsharp mask after scaling (Metal renderer).
+    static let sharpen = "ov.sharpen"
+    /// SESSION_OPTION wishes sent to hosts with CAP_DESKTOP_FX.
+    static let hideWallpaper = "ov.hideWallpaper"
+    static let disableAnimations = "ov.disableAnimations"
     // Input (the rest live on RemoteInputController)
     static let cursorAccel = RemoteInputController.cursorAccelDefaultsKey
     static let lockLocalZoom = RemoteInputController.lockLocalZoomDefaultsKey
@@ -55,6 +63,10 @@ enum AppSettings {
 
     static var autoReconnect: Bool { bool(SettingsKey.autoReconnect, default: true) }
     static var confirmDisconnect: Bool { bool(SettingsKey.confirmDisconnect, default: true) }
+    static var directConnection: Bool { bool(SettingsKey.directConnection, default: true) }
+    static var sharpen: Bool { bool(SettingsKey.sharpen, default: true) }
+    static var hideWallpaper: Bool { bool(SettingsKey.hideWallpaper, default: true) }
+    static var disableAnimations: Bool { bool(SettingsKey.disableAnimations, default: false) }
     static var keepAwake: Bool { bool(SettingsKey.keepAwake, default: true) }
     static var toolbarAutoHide: Bool { bool(SettingsKey.toolbarAutoHide, default: true) }
     static var pinBiometric: Bool { bool(SettingsKey.pinBiometric, default: false) }

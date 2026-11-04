@@ -43,6 +43,8 @@ import UIKit
 /// SwiftUI wrapper. The parent observes ScreenModel and passes values in.
 struct RemoteScreenSurface: UIViewRepresentable {
     let image: CGImage
+    /// Section 4: the frame's BGRA bytes + dirty rects for the Metal path.
+    let pixels: FramePixelStore
     let frameSize: CGSize
     let video: VideoOverlay
     let cursorPos: CGPoint?
@@ -59,7 +61,7 @@ struct RemoteScreenSurface: UIViewRepresentable {
 
     func updateUIView(_ uiView: RemoteSurfaceView, context: Context) {
         uiView.attachVideo(video)
-        uiView.setFrame(image, size: frameSize)
+        uiView.setFrame(image, size: frameSize, pixels: pixels)
         uiView.setCursorShape(cursorImage, hotspot: cursorHotspot, size: cursorSize)
         if let p = cursorPos {
             uiView.hostCursorMoved(to: p)
@@ -153,7 +155,18 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// Zoom/pan-transformed container: bounds = frame pixels, transform =
     /// scale (points per pixel), position = view offset of the frame origin.
     private let container = CALayer()
+    /// The CGImage frame (fallback when Metal is unavailable; hidden
+    /// otherwise — the Metal layer below the container draws the frame).
     private let frameLayer = CALayer()
+    /// Section 4: TeamViewer-style scaler (nil = no Metal: CGImage path).
+    private let metal = MetalScreenRenderer()
+    private weak var pixelStore: FramePixelStore?
+    /// A redraw is wanted at the next display refresh.
+    private var needsRender = false
+    private var idleRenderTicks = 0
+    private lazy var renderTicker = FrameTicker { [weak self] _ in
+        self?.renderTick()
+    }
     private weak var video: VideoOverlay?
     private let cursorLayer = CALayer()
     private let dragRing = CAShapeLayer()
@@ -286,6 +299,13 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     // MARK: Setup
 
     private func setupLayers() {
+        if let metal {
+            // Below the zoom container: drawn at device resolution for the
+            // current viewport (the container still carries the H.264
+            // overlay, transformed with the zoom).
+            layer.addSublayer(metal.layer)
+            frameLayer.isHidden = true
+        }
         container.anchorPoint = .zero
         container.actions = Self.noActions
         frameLayer.actions = Self.noActions
@@ -447,6 +467,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// unhook from the controller (only if still the active surface).
     func teardown() {
         animTicker.stop()
+        renderTicker.stop()
         gcMouse.stop()
         releasePointerButtons()
         endLocalGestures()
@@ -464,12 +485,14 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         super.didMoveToWindow()
         if window == nil {
             animTicker.stop()
+            renderTicker.stop()
             gcMouse.stop()
             releasePointerButtons()
             endLocalGestures()
             input.touching = false
         } else {
             installInputHooks()
+            setNeedsRender()
             // Always observe mice: GCMouseBridge delivers only while the
             // scene's pointer is actually locked, and the lock can be
             // toggled during the session (Cmd+Shift+P).
@@ -537,7 +560,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    func setFrame(_ img: CGImage, size: CGSize) {
+    func setFrame(_ img: CGImage, size: CGSize, pixels: FramePixelStore) {
+        pixelStore = pixels
         if size != frameSize && size.width > 0 && size.height > 0 {
             frameSize = size
             CATransaction.begin()
@@ -554,10 +578,54 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             image = img
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            frameLayer.contents = img
+            if metal == nil {
+                frameLayer.contents = img
+            }
             if !loupe.isHidden { loupe.contents = img }
             CATransaction.commit()
+            // Metal: upload what changed, redraw at the next refresh.
+            if let metal, metal.sync(from: pixels) {
+                setNeedsRender()
+            }
+        } else if let metal, !metal.hasFrame, metal.sync(from: pixels) {
+            setNeedsRender()
         }
+    }
+
+    // MARK: Metal rendering (Section 4)
+
+    /// Ask for one redraw at the next display refresh (frame, zoom / pan or
+    /// size changed). The display link runs only while redraws keep coming
+    /// (pan / zoom / fling animation, up to 120 Hz) and stops when idle.
+    private func setNeedsRender() {
+        guard metal != nil else { return }
+        needsRender = true
+        idleRenderTicks = 0
+        if window != nil && !renderTicker.isRunning {
+            renderTicker.start()
+        }
+    }
+
+    private func renderTick() {
+        guard needsRender else {
+            idleRenderTicks += 1
+            if idleRenderTicks >= 2 {
+                renderTicker.stop()
+            }
+            return
+        }
+        needsRender = false
+        idleRenderTicks = 0
+        renderNow()
+    }
+
+    private func renderNow() {
+        guard let metal, window != nil, scale > 0, bounds.width > 0, bounds.height > 0,
+              UIApplication.shared.applicationState != .background else { return }
+        if !metal.hasFrame, let store = pixelStore {
+            metal.sync(from: store)
+        }
+        metal.render(scale: scale, offset: offset, sharpenOn: AppSettings.sharpen)
     }
 
     func setCursorShape(_ img: CGImage?, hotspot: CGSize, size: CGSize) {
@@ -672,6 +740,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         frameLayer.magnificationFilter = scale * displayScale >= 3 ? .nearest : .linear
         CATransaction.commit()
         updateCursorLayer()
+        setNeedsRender()
     }
 
     /// Zoom by `factor` keeping the view point `pivot` fixed.
@@ -770,6 +839,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        if let metal, metal.layout(bounds: bounds, contentsScale: displayScale) {
+            setNeedsRender()
+        }
         if bounds.size != lastBoundsSize {
             lastBoundsSize = bounds.size
             refit()
