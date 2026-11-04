@@ -1,28 +1,47 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import UIKit
 
-// Session engine behind SessionView. Owns the OvSessionBox wiring, the
-// screen assembler, the transports and the pump; publishes only finished,
-// UI-ready state to the main thread.
+// Session engine behind the immersive session (SessionContainer). Owns the
+// OvSessionBox wiring, the screen assembler, the transports and the pump;
+// publishes only finished, UI-ready state to the main thread.
+//
+// Lifecycle (section 3): the controller is built from a `ConnectRequest`
+// and dials it itself, on the session queue, driving `phase`:
+//   dialing(transport) -> authenticating -> waitingForFirstFrame -> live
+//   live --(transport lost)--> reconnecting(n) (up to 3 attempts, the
+//   session rebuilt from the same request) -> live | failed(error)
+//   failed(authFailed / hostUnreachable (15 s) / disconnected / transport)
+// Every attempt has a generation number; late events of an older attempt
+// are ignored on main.
 //
 // Threading: every session / screen / transport call runs on
 // `OvQueues.session` (a background serial queue). Sinks fire there, so all
 // decode work (frame -> CGImage, audio conversion, file writes) happens off
 // main; only the results hop to main. Main-thread-only members are marked.
 //
-// Lifetime: owned by SessionView through @StateObject. Every closure handed
-// to the session, screen, transports and timers captures `self` weakly, and
-// `stop()` / `deinit` clear them all and close the transports, so dropping
-// the view frees the controller, then the OvSessionBox (ov_session_free ->
+// Lifetime: owned by AppModel for the session's duration. Every closure
+// handed to the session, screen, transports and timers captures `self`
+// weakly, and `stop()` / `deinit` clear them all and close the transports,
+// so dropping the controller frees the OvSessionBox (ov_session_free ->
 // the Rust relay socket closes).
 
 // MARK: - Log lines
 
-/// One chat/status line; a stable id so the list diffs cheaply.
+/// One session-log line (status / errors); a stable id so lists diff cheaply.
 struct LogLine: Identifiable {
     let id: Int
     let text: String
+    let date: Date
+}
+
+/// One chat message (channel 1).
+struct ChatMessage: Identifiable {
+    let id: Int
+    let text: String
+    let fromMe: Bool
+    let date: Date
 }
 
 // A file received from the peer (v0.27): already written to the app
@@ -31,17 +50,83 @@ struct ReceivedFile: Identifiable {
     let id = UUID()
     let name: String
     let url: URL
+    let size: Int
+    let date: Date
 }
 
 /// One host monitor from MONITORS_INFO (v0.18).
 typealias MonitorInfo = (x: Int32, y: Int32, w: UInt32, h: UInt32, primary: Bool)
 
+/// TOFU: the host presented a different identity than the pinned one.
+struct IdentityMismatch: Identifiable {
+    let id = UUID()
+    let expected: String
+    let got: String
+}
+
+// MARK: - Session phase
+
+enum SessionError: Equatable {
+    /// PIN / pairing code rejected (handshake crypto failure).
+    case authFailed
+    /// No secure session within the handshake timeout.
+    case hostUnreachable
+    /// An established session ended.
+    case disconnected(String)
+    /// The transport could not be set up / failed.
+    case transport(String)
+
+    var canAutoReconnect: Bool {
+        if case .authFailed = self { return false }
+        return true
+    }
+
+    /// One line for the session log.
+    var logText: String {
+        switch self {
+        case .authFailed: return "Authentication failed"
+        case .hostUnreachable: return "Host not responding"
+        case .disconnected(let reason): return "Disconnected — \(reason)"
+        case .transport(let reason): return "Connection failed — \(reason)"
+        }
+    }
+}
+
+enum SessionPhase: Equatable {
+    case dialing(String)
+    case authenticating
+    case waitingForFirstFrame
+    case live
+    case reconnecting(Int)
+    case failed(SessionError)
+
+    /// The full-screen connecting overlay is shown.
+    var isConnecting: Bool {
+        switch self {
+        case .dialing, .authenticating, .waitingForFirstFrame: return true
+        default: return false
+        }
+    }
+
+    var stepText: String {
+        switch self {
+        case .dialing(let transport): return "Contacting the host via \(transport)…"
+        case .authenticating: return "Verifying identity…"
+        case .waitingForFirstFrame: return "Waiting for the remote screen…"
+        case .live: return "Connected"
+        case .reconnecting(let n): return "Reconnecting… (\(n)/\(SessionController.maxReconnectAttempts))"
+        case .failed(let error): return error.logText
+        }
+    }
+}
+
 // MARK: - Screen + liveness models
 
 /// Remote screen state, observed only by the screen view so frame / cursor
-/// updates never re-evaluate the whole SessionView body. Main thread only.
+/// updates never re-evaluate the whole session body. Main thread only.
 final class ScreenModel: ObservableObject {
-    // Reassembled remote screen (nil until the first frame completes).
+    // Reassembled remote screen (nil until the first frame completes; kept
+    // across reconnects so overlays dim the last frame).
     @Published var image: CGImage?
     // The last frame's geometry — the space pointer coordinates normalize to.
     @Published var frameSize: CGSize = .zero
@@ -56,8 +141,8 @@ final class ScreenModel: ObservableObject {
     let video = VideoOverlay()
 }
 
-/// Liveness HUD state (v0.16), observed only by the HUD row and the
-/// dead-peer banner. Main thread only.
+/// Liveness state (v0.16), observed only by the stats chip and the
+/// reconnecting capsule. Main thread only.
 final class LivenessModel: ObservableObject {
     @Published var peerAlive = true
     @Published var rttMs: Int32 = -1
@@ -80,17 +165,28 @@ private struct PendingScreen {
 // MARK: - Controller
 
 final class SessionController: ObservableObject {
+    static let maxReconnectAttempts = 3
+    /// No secure session after this long = host not responding.
+    static let handshakeTimeout: TimeInterval = 15
+
     // ---- published UI state (main thread only) ----
+    @Published private(set) var phase: SessionPhase
+    /// Session log (status / errors; chat lines live in `chat`).
     @Published private(set) var lines: [LogLine] = []
-    @Published private(set) var peerPine: String = "connecting…"
-    /// Terminal session state ("Authentication failed", "Disconnected …");
-    /// nil while the session is healthy.
-    @Published private(set) var status: String?
+    @Published private(set) var chat: [ChatMessage] = []
+    @Published var unreadChat = 0
+    @Published private(set) var peerPine: String = ""
     @Published private(set) var receivedFiles: [ReceivedFile] = []
     // Monitors (v0.18): the host's monitor list from MONITORS_INFO; the
     // picker sends CAPTURE_REGION for the chosen monitor.
     @Published private(set) var monitors: [MonitorInfo] = []
-    @Published var monitorIndex = 0
+    @Published private(set) var monitorIndex = 0
+    /// Requested capture rate (QUALITY_SET), 0 = Auto.
+    @Published private(set) var targetFps: UInt16
+    /// Short transient message (file received, clipboard sent, ...).
+    @Published var toast: String?
+    /// TOFU: set while the host's identity differs from the pinned one.
+    @Published var identityMismatch: IdentityMismatch?
 
     let screenModel = ScreenModel()
     let livenessModel = LivenessModel()
@@ -98,20 +194,45 @@ final class SessionController: ObservableObject {
     /// Main thread only.
     let input = RemoteInputController()
 
-    /// Chat log cap — older lines are dropped.
-    private static let maxLines = 200
+    /// The request being (re)dialed. Main thread only.
+    private(set) var request: ConnectRequest
+    /// The chat sheet is visible (no unread counting). Main thread only.
+    var chatVisible = false
+    /// Established with an accepted identity (pine string). Main thread.
+    var onEstablished: ((String) -> Void)?
+    /// The PIN / pairing code was rejected. Main thread.
+    var onAuthFailed: (() -> Void)?
+
+    /// Log / chat caps — older lines are dropped.
+    private static let maxLines = 300
+    private static let maxChat = 500
     private var nextLineID = 0 // main thread only
 
+    // ---- main-thread attempt state ----
+    private var generation = 0
+    private var reconnectAttempts = 0
+    private var everLive = false
+    private var attemptEstablished = false
+    /// Monitor to restore when the host announces its monitors.
+    private var pendingMonitor: Int?
+    private var started = false
+    private var stopped = false
+    private var observers: [NSObjectProtocol] = []
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    // Clipboard sync (v0.26): echo-guarded pasteboard bridge, polled on main.
+    private let clipboard = ClipboardBridge()
+    private var clipboardTimer: DispatchSourceTimer?
+
     // ---- session-queue state ----
-    private let session: OvSessionBox
+    private var session: OvSessionBox?
     private let queue = OvQueues.session
-    // The Rust frame assembler lives for the controller's lifetime.
-    private let screen = OvScreenBox()
+    // The Rust frame assembler (replaced for every attempt).
+    private var screen = OvScreenBox()
     // Audio (v0.21): remote mic playback via AVAudioEngine.
     private let audioPlayer = RemoteAudioPlayer()
     private var pumpTimer: DispatchSourceTimer?
     private var udpBridge: NwUdpBridge?
-    /// WebSocket relay mode: the socket ConnectView opened.
+    /// WebSocket relay mode: the socket the dialer opened.
     private var relaySocket: RelayWebSocket?
     /// Direct (UDP) mode: inbound arrives via the bridge, no relay pump.
     private var isDirect = false
@@ -126,9 +247,13 @@ final class SessionController: ObservableObject {
     private static let directBatchMax = 64
     /// Set once the handshake completes (picks the -3 error wording).
     private var established = false
-    /// Set on teardown or a fatal error: the pump is stopped and inbound
-    /// traffic is ignored from then on.
+    /// Set on a fatal error / teardown: the pump is stopped and inbound
+    /// traffic is ignored until the next attempt.
     private var halted = false
+    /// Set by `stop()`: no further attempts.
+    private var tornDown = false
+    /// The generation of the attempt running on the queue.
+    private var queueGeneration = 0
     /// The last error line logged, so a repeating error is shown once.
     private var lastErrorLine: String?
     // Liveness (v0.16): shell monotonic ms epoch for the keepalive ticks.
@@ -150,22 +275,22 @@ final class SessionController: ObservableObject {
     private var pendingScreen = PendingScreen()
     private var screenFlushScheduled = false
 
-    // ---- main-thread state ----
-    // Clipboard sync (v0.26): echo-guarded pasteboard bridge, polled on main.
-    private let clipboard = ClipboardBridge()
-    private var clipboardTimer: DispatchSourceTimer?
-    private var started = false
-    private var stopped = false
-
-    init(session: OvSessionBox) {
-        self.session = session
+    init(request: ConnectRequest) {
+        self.request = request
+        self.phase = .dialing(request.transport.label)
+        self.targetFps = request.defaultFps
+        self.pendingMonitor = request.lastMonitor > 0 ? request.lastMonitor : nil
     }
 
     deinit {
-        // stop() normally ran already (onDisappear); this is the backstop.
-        // Capture the parts, not self, and tear them down on the queue that
-        // owns them. Everything here is idempotent.
+        // stop() normally ran already; this is the backstop. Capture the
+        // parts, not self, and tear them down on the queue that owns them.
+        // Everything here is idempotent.
         clipboardTimer?.cancel()
+        let nc = NotificationCenter.default
+        for o in observers {
+            nc.removeObserver(o)
+        }
         let session = self.session
         let screen = self.screen
         let audio = self.audioPlayer
@@ -178,7 +303,7 @@ final class SessionController: ObservableObject {
             ws?.onClose = nil
             ws?.close()
             udp?.close()
-            session.clearCallbacks()
+            session?.clearCallbacks()
             screen.clearCallbacks()
             audio.stop()
         }
@@ -189,22 +314,15 @@ final class SessionController: ObservableObject {
     func start() {
         guard !started, !stopped else { return }
         started = true
-        // Take the transport hand-off from ConnectView and clear it for
-        // every mode (relay included) so nothing stale leaks into the next
-        // session.
-        let mode = DirectTransport.pending
-        let ws = DirectTransport.webSocket
-        DirectTransport.pending = nil
-        DirectTransport.webSocket = nil
-
         clipboard.send = { [weak self] text in
-            var payload = Data([0x50, 0]) // CLIPBOARD, kind 0 = text
-            payload.append(contentsOf: Array(text.utf8))
-            self?.sendCommand(payload)
+            self?.sendClipboardPayload(text)
         }
         startClipboardPolling()
         input.send = { [weak self] payload in
             self?.sendCommand(payload)
+        }
+        if let mode = request.inputMode {
+            input.setMode(mode)
         }
         // Phase 5: the overlay's decoder failed (main) -> ask the host for an
         // IDR from the session queue.
@@ -214,19 +332,16 @@ final class SessionController: ObservableObject {
                 self.screen.requestVideoIdr()
             }
         }
-
-        queue.async { [weak self] in
-            guard let self else {
-                ws?.close() // controller already gone: do not orphan the socket
-                return
-            }
-            self.startOnQueue(mode: mode, ws: ws)
-        }
+        observeAppLifecycle()
+        beginAttempt()
     }
 
     func stop() {
         guard !stopped else { return }
         stopped = true
+        generation += 1
+        removeLifecycleObservers()
+        endBackgroundTask()
         clipboardTimer?.cancel()
         clipboardTimer = nil
         clipboard.send = nil
@@ -234,25 +349,228 @@ final class SessionController: ObservableObject {
         // records queue ahead of the teardown below), then unhook input.
         input.releaseAll()
         input.shutdown()
-        // Strong capture on purpose: the teardown must run even if the view
-        // releases the controller right after this.
+        // Strong capture on purpose: the teardown must run even if the
+        // owner releases the controller right after this.
         queue.async { self.teardownOnQueue() }
+    }
+
+    /// Try again from scratch (error view Retry, back from background,
+    /// re-entered PIN). `pin` replaces the device PIN; `remember` updates
+    /// whether it is stored once established.
+    func retry(pin: String? = nil, remember: Bool? = nil) {
+        guard started, !stopped else { return }
+        if let pin, case .device(let id, _) = request.target {
+            request.target = .device(id: id, pin: pin)
+            request.pinIsStored = false
+        }
+        if let remember {
+            request.rememberPIN = remember
+        }
+        reconnectAttempts = 0
+        identityMismatch = nil
+        phase = .dialing(request.transport.label)
+        beginAttempt()
+    }
+
+    /// TOFU: the user accepted the host's new identity — re-pin it.
+    func acceptNewIdentity() {
+        guard let mismatch = identityMismatch else { return }
+        identityMismatch = nil
+        request.pinnedFingerprint = mismatch.got
+        log("Host identity accepted and re-pinned: \(mismatch.got)")
+        onEstablished?(mismatch.got)
+    }
+
+    /// Start (or restart) one connection attempt with a new generation.
+    private func beginAttempt() {
+        guard !stopped else { return }
+        generation += 1
+        let gen = generation
+        attemptEstablished = false
+        if case .reconnecting = phase {
+            // keep the capsule
+        } else {
+            phase = .dialing(request.transport.label)
+        }
+        // Nothing stays pressed; the next host's CAPS decide the commands.
+        input.releaseAll()
+        input.input2 = false
+        livenessModel.peerAlive = true
+        livenessModel.rttMs = -1
+        livenessModel.fps = 0
+        screenModel.video.hide(generation: screenModel.video.generation)
+        let req = request
+        log("Connecting to \(req.displayName) via \(req.transport.detail)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
+            self?.handshakeTimedOut(generation: gen)
+        }
+        queue.async { [weak self] in
+            self?.startOnQueue(request: req, generation: gen)
+        }
+    }
+
+    private func handshakeTimedOut(generation gen: Int) {
+        guard gen == generation, !stopped, !attemptEstablished else { return }
+        log("No secure session after \(Int(Self.handshakeTimeout)) s")
+        queue.async { [weak self] in
+            self?.haltOnQueue()
+        }
+        handleFailure(.hostUnreachable, generation: gen)
+    }
+
+    /// An attempt ended with `error`: auto-reconnect (an established
+    /// session that dropped, up to 3 attempts) or show the error.
+    private func handleFailure(_ error: SessionError, generation gen: Int) {
+        guard gen == generation, !stopped else { return }
+        // Invalidate late events of the failed attempt.
+        generation += 1
+        let inBackground = UIApplication.shared.applicationState == .background
+        if error.canAutoReconnect, everLive, !inBackground, AppSettings.autoReconnect,
+           reconnectAttempts < Self.maxReconnectAttempts {
+            reconnectAttempts += 1
+            let attempt = reconnectAttempts
+            phase = .reconnecting(attempt)
+            log("Reconnecting (attempt \(attempt) of \(Self.maxReconnectAttempts))…")
+            let g = generation
+            let delay = Double(attempt)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, !self.stopped, self.generation == g else { return }
+                self.beginAttempt()
+            }
+            return
+        }
+        phase = .failed(error)
+        if !inBackground {
+            Haptics.error()
+        }
+        if case .authFailed = error {
+            onAuthFailed?()
+        }
+    }
+
+    /// Main: the secure session is up (once per attempt).
+    private func didEstablish(pine: String, generation gen: Int) {
+        guard gen == generation, !stopped else { return }
+        attemptEstablished = true
+        peerPine = pine
+        log("Secure session established — host \(pine)")
+        switch phase {
+        case .live, .reconnecting:
+            break // a reconnect keeps its capsule until the first frame
+        default:
+            phase = .waitingForFirstFrame
+        }
+        // Re-apply this session's quality (a reconnected host starts at
+        // its default).
+        if targetFps != 0 {
+            sendQuality(targetFps: targetFps)
+        }
+        if let expected = request.pinnedFingerprint, !expected.isEmpty, expected != pine {
+            log("Host identity changed: expected \(expected), got \(pine)")
+            identityMismatch = IdentityMismatch(expected: expected, got: pine)
+        } else {
+            onEstablished?(pine)
+        }
+    }
+
+    /// Main: a frame arrived — the session is live.
+    private func markLiveIfNeeded() {
+        guard attemptEstablished else { return }
+        switch phase {
+        case .dialing, .authenticating, .waitingForFirstFrame, .reconnecting:
+            phase = .live
+            reconnectAttempts = 0
+            everLive = true
+            Haptics.success()
+        case .live, .failed:
+            break
+        }
+    }
+
+    /// Main: the transport is up and the handshake is running.
+    private func didDial(generation gen: Int) {
+        guard gen == generation, !stopped, !attemptEstablished else { return }
+        if case .dialing = phase {
+            phase = .authenticating
+        }
+    }
+
+    // MARK: App lifecycle (main thread)
+
+    private func observeAppLifecycle() {
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                        object: nil, queue: .main) { [weak self] _ in
+            self?.didEnterBackground()
+        })
+        observers.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification,
+                                        object: nil, queue: .main) { [weak self] _ in
+            self?.willEnterForeground()
+        })
+    }
+
+    private func removeLifecycleObservers() {
+        let nc = NotificationCenter.default
+        for o in observers {
+            nc.removeObserver(o)
+        }
+        observers.removeAll()
+    }
+
+    /// Nothing stays pressed on the host while we are away, and ask iOS
+    /// for a little time so a short app switch keeps the session.
+    private func didEnterBackground() {
+        input.releaseAll()
+        guard backgroundTask == .invalid else { return }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "OpenView session") { [weak self] in
+            self?.endBackgroundTask()
+        }
+    }
+
+    /// Back in the foreground: a session that dropped meanwhile reconnects.
+    private func willEnterForeground() {
+        endBackgroundTask()
+        guard started, !stopped else { return }
+        if case .failed(let error) = phase, error.canAutoReconnect, everLive {
+            log("Back in the foreground — reconnecting")
+            retry()
+        }
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
     }
 
     // MARK: Session-queue setup
 
-    private func startOnQueue(mode: ConnectMode?, ws: RelayWebSocket?) {
-        guard !halted else {
-            ws?.close() // stopped before we started: do not orphan the socket
-            return
-        }
+    /// Reset the per-attempt state, dial, wire the sinks and start pumping.
+    private func startOnQueue(request req: ConnectRequest, generation gen: Int) {
+        guard !tornDown else { return }
+        resetAttemptOnQueue()
+        queueGeneration = gen
         installScreenSinks()
 
+        let dialed: SessionDialer.Result
+        do {
+            dialed = try SessionDialer.dial(req)
+        } catch {
+            failOnQueue(.transport(SessionDialer.describe(error)))
+            return
+        }
+        guard !tornDown, !halted else {
+            // Stopped / timed out while the (blocking) dial ran.
+            dialed.webSocket?.close()
+            return
+        }
+        let session = dialed.session
+        self.session = session
+        let mode = dialed.mode
+        let ws = dialed.webSocket
+
         session.onEstablished = { [weak self] fp in
-            guard let self else { return }
-            self.established = true
-            let pine = Self.pineString(fp)
-            self.onMain { $0.peerPine = pine }
+            self?.noteEstablished(fp)
         }
         session.onRecord = { [weak self] channel, payload in
             guard let self else { return }
@@ -264,7 +582,7 @@ final class SessionController: ObservableObject {
                 self.screen.feed(payload)
             case 1:
                 if let text = String(data: payload, encoding: .utf8) {
-                    self.log("peer: \(text)")
+                    self.onMain { $0.receiveChat(text) }
                 }
             default:
                 break
@@ -282,13 +600,13 @@ final class SessionController: ObservableObject {
         // `onDatagramOut` during that pump, and a nil bridge would drop the
         // packet so the handshake never starts. Inbound datagrams arrive on
         // this queue via the bridge and are processed right away.
-        if case .direct(let host, let port)? = mode {
+        if case .direct(let host, let port) = mode {
             isDirect = true
             udpBridge = NwUdpBridge(host: host, port: port, queue: queue,
                                     onReceive: { [weak self] data in
-                guard let self, !self.halted else { return }
+                guard let self, !self.halted, let session = self.session else { return }
                 do {
-                    try self.session.onDatagram(data)
+                    try session.onDatagram(data)
                 } catch {
                     self.handle(error)
                     return
@@ -313,28 +631,28 @@ final class SessionController: ObservableObject {
         if let ws {
             relaySocket = ws
             ws.onMessage = { [weak self] data in
-                guard let self, !self.halted else { return }
+                guard let self, !self.halted, let session = self.session else { return }
                 do {
-                    try self.session.relayFeed(data)
-                    try self.session.pumpRelay()
+                    try session.relayFeed(data)
+                    try session.pumpRelay()
                     try self.sendPongIfOwed()
                 } catch {
                     self.handle(error)
                 }
             }
             ws.onClose = { [weak self] closeError in
-                guard let self, !self.halted else { return }
-                self.session.relayEOF()
+                guard let self, !self.halted, let session = self.session else { return }
+                session.relayEOF()
                 // Drain whatever arrived before the close; the relay then
                 // reports closed (-5), which ends the session below.
                 do {
-                    try self.session.pumpRelay()
+                    try session.pumpRelay()
                 } catch {
                     self.handle(error)
                 }
                 if !self.halted {
-                    self.fail(closeError.map { "Disconnected — relay: \($0.localizedDescription)" }
-                              ?? "Disconnected — relay closed")
+                    let reason = closeError.map { "relay: \($0.localizedDescription)" } ?? "the relay connection closed"
+                    self.failOnQueue(.disconnected(reason))
                 }
             }
         }
@@ -342,14 +660,13 @@ final class SessionController: ObservableObject {
         do {
             try session.pump()
             if let fp = session.peerFingerprint() {
-                established = true
-                let pine = Self.pineString(fp)
-                onMain { $0.peerPine = pine }
+                noteEstablished(fp)
             }
         } catch {
             handle(error)
         }
         guard !halted else { return }
+        onMain { $0.didDial(generation: gen) }
 
         // Poll the Rust core every 50 ms on this queue (a DispatchSource is
         // independent of run-loop modes, so scrolling cannot stall it).
@@ -365,6 +682,34 @@ final class SessionController: ObservableObject {
         }
         pumpTimer = timer
         timer.resume()
+    }
+
+    /// Drop the previous attempt (transports, session, assembler) and
+    /// reset the per-attempt flags. Session queue.
+    private func resetAttemptOnQueue() {
+        haltOnQueue()
+        session?.clearCallbacks()
+        session = nil
+        screen.clearCallbacks()
+        screen = OvScreenBox()
+        halted = false
+        established = false
+        isDirect = false
+        directQueued = 0
+        lastErrorLine = nil
+        lastLiveness = (alive: true, rtt: -1, fpsTenths: 0)
+        videoActive = false
+        pendingHideGen = nil
+        lastPeerCaps = 0
+    }
+
+    /// The secure session is up: publish the host fingerprint once.
+    private func noteEstablished(_ fp: [UInt8]) {
+        guard !established else { return }
+        established = true
+        let pine = Self.pineString(fp)
+        let gen = queueGeneration
+        onMain { $0.didEstablish(pine: pine, generation: gen) }
     }
 
     private func installScreenSinks() {
@@ -422,10 +767,7 @@ final class SessionController: ObservableObject {
         }
         screen.onMonitors = { [weak self] list in
             let mons: [MonitorInfo] = list.map { (x: $0.0, y: $0.1, w: $0.2, h: $0.3, primary: $0.4) }
-            self?.onMain {
-                $0.monitors = mons
-                $0.monitorIndex = 0
-            }
+            self?.onMain { $0.applyMonitors(mons) }
         }
         // Remote audio (v0.21): each tick is 960 s16le samples; converted to
         // Float32 and scheduled on the player node, here off main.
@@ -458,12 +800,30 @@ final class SessionController: ObservableObject {
             let url = Self.uniqueURL(in: dir, name: name)
             do {
                 try data.write(to: url, options: .atomic)
-                let file = ReceivedFile(name: name, url: url)
-                self.onMain { $0.receivedFiles.append(file) }
-                self.log("file received: \(url.lastPathComponent) (\(data.count) bytes)")
+                let file = ReceivedFile(name: url.lastPathComponent, url: url,
+                                        size: data.count, date: Date())
+                self.onMain {
+                    $0.receivedFiles.append(file)
+                    $0.toast = "Received \(file.name)"
+                }
+                self.log("File received: \(url.lastPathComponent) (\(data.count) bytes)")
             } catch {
-                self.log("file write failed: \(error)")
+                self.log("File write failed: \(error.localizedDescription)")
             }
+        }
+    }
+
+    /// Main: the host's monitor list arrived (also after a reconnect):
+    /// restore the saved / chosen monitor.
+    private func applyMonitors(_ mons: [MonitorInfo]) {
+        monitors = mons
+        let want = pendingMonitor ?? monitorIndex
+        pendingMonitor = nil
+        if want > 0 && want < mons.count {
+            monitorIndex = want
+            sendCaptureRegion(monitorAt: want)
+        } else {
+            monitorIndex = 0
         }
     }
 
@@ -508,7 +868,7 @@ final class SessionController: ObservableObject {
     // MARK: Pump (session queue)
 
     private func tick() {
-        guard !halted else { return }
+        guard !halted, let session else { return }
         do {
             try session.pump()
             if !isDirect {
@@ -559,11 +919,11 @@ final class SessionController: ObservableObject {
     /// into one NWConnection send batch.
     private func directPump() {
         directQueued = 0
-        guard !halted else { return }
+        guard !halted, let session else { return }
         var failure: Error?
         let run = {
             do {
-                try self.session.pump()
+                try session.pump()
                 try self.sendPongIfOwed()
             } catch {
                 failure = error
@@ -582,27 +942,26 @@ final class SessionController: ObservableObject {
     /// Answer an inbound PING right after the inbound pump that fed it (not
     /// only on the next tick), so the peer's RTT is not inflated by 50 ms.
     private func sendPongIfOwed() throws {
+        guard let session else { return }
         if let pong = screen.takePongReply() {
             try session.sendRecord(channel: 0, payload: pong)
         }
     }
 
     /// Route an FFI error: handshake failure / closed relay / transport
-    /// failure end the session once (pump stopped, one clear status);
+    /// failure end the attempt once (pump stopped, one clear phase);
     /// anything else is logged, deduplicated against the previous error.
     private func handle(_ error: Error, context: String = "error") {
         if let ffi = error as? OvSessionBox.FfiError {
             switch ffi {
             case .crypto:
-                fail(established
-                     ? "Session error — crypto failure"
-                     : "Authentication failed — check the PIN or pairing code")
+                failOnQueue(established ? .disconnected("secure channel error") : .authFailed)
                 return
             case .closed:
-                fail("Disconnected — the relay closed the connection")
+                failOnQueue(.disconnected("the relay closed the connection"))
                 return
             case .transport:
-                fail("Disconnected — transport error")
+                failOnQueue(established ? .disconnected("network error") : .transport("Network error."))
                 return
             case .badArg, .wrongState:
                 break
@@ -614,29 +973,19 @@ final class SessionController: ObservableObject {
         log(line)
     }
 
-    /// Fatal: stop pumping and close the transports exactly once, then show
-    /// a single status instead of an error per tick.
-    private func fail(_ message: String) {
+    /// Fatal for this attempt: stop pumping and close the transports
+    /// exactly once, then let main decide (reconnect or error view).
+    private func failOnQueue(_ error: SessionError) {
         guard !halted else { return }
-        halted = true
-        pumpTimer?.cancel()
-        pumpTimer = nil
-        if let ws = relaySocket {
-            ws.onMessage = nil
-            ws.onClose = nil
-            ws.close()
-        }
-        relaySocket = nil
-        udpBridge?.close()
-        udpBridge = nil
-        audioPlayer.stop()
-        log(message)
-        onMain { $0.status = message }
+        haltOnQueue()
+        log(error.logText)
+        let gen = queueGeneration
+        onMain { $0.handleFailure(error, generation: gen) }
     }
 
-    /// Full teardown (view gone): stop the pump, close the transports and
-    /// release every callback so the session box can deinit.
-    private func teardownOnQueue() {
+    /// Stop the pump and close the transports (the session object stays
+    /// until the next attempt / teardown). Idempotent.
+    private func haltOnQueue() {
         halted = true
         pumpTimer?.cancel()
         pumpTimer = nil
@@ -648,63 +997,65 @@ final class SessionController: ObservableObject {
         relaySocket = nil
         udpBridge?.close()
         udpBridge = nil
-        session.clearCallbacks()
-        screen.clearCallbacks()
         audioPlayer.stop()
+    }
+
+    /// Full teardown (session closed): stop the pump, close the transports
+    /// and release every callback so the session box can deinit.
+    private func teardownOnQueue() {
+        tornDown = true
+        haltOnQueue()
+        session?.clearCallbacks()
+        screen.clearCallbacks()
     }
 
     // MARK: Outbound (any thread -> session queue)
 
-    /// Send one chat line on channel 1.
+    /// Send one chat line on channel 1 (shown right away in the chat).
     func sendChat(_ text: String) {
+        guard !text.isEmpty else { return }
+        appendChat(text, fromMe: true)
         queue.async { [weak self] in
             guard let self else { return }
-            guard !self.halted else { self.log("send failed: not connected"); return }
+            guard !self.halted, let session = self.session else {
+                self.log("Chat message not sent: not connected")
+                return
+            }
             do {
-                try self.session.sendRecord(channel: 1, payload: Data(text.utf8))
-                self.log("me: \(text)")
+                try session.sendRecord(channel: 1, payload: Data(text.utf8))
             } catch {
-                self.handle(error, context: "send failed")
+                self.handle(error, context: "chat send failed")
             }
         }
     }
 
     /// Shared command-channel send: errors (e.g. not yet established) are
-    /// surfaced in the chat log, like `sendChat` does for chat.
+    /// surfaced in the session log.
     func sendCommand(_ payload: Data) {
         queue.async { [weak self] in
-            guard let self, !self.halted else { return }
+            guard let self, !self.halted, let session = self.session else { return }
             do {
-                try self.session.sendRecord(channel: 0, payload: payload)
+                try session.sendRecord(channel: 0, payload: payload)
             } catch {
                 self.handle(error, context: "input failed")
             }
         }
     }
 
-    // MARK: - Remote input (POINTER/KEY on command channel 0)
+    // MARK: - Display / quality (main thread)
 
-    /// Send one POINTER command (normalized 0..=65535 in frame space).
-    func sendPointer(kind: UInt8, x: UInt32, y: UInt32) {
-        var payload = Data([0x30, kind])
-        payload.append(contentsOf: withUnsafeBytes(of: x.bigEndian) { Data($0) })
-        payload.append(contentsOf: withUnsafeBytes(of: y.bigEndian) { Data($0) })
-        sendCommand(payload)
+    /// Switch the captured monitor (session menu).
+    func selectMonitor(_ index: Int) {
+        guard monitors.indices.contains(index), index != monitorIndex else { return }
+        monitorIndex = index
+        sendCaptureRegion(monitorAt: index)
     }
 
-    /// Send one KEY command (Windows virtual-key code, down flag).
-    private func sendKeyCommand(vk: UInt16, down: Bool) {
-        var payload = Data([0x31])
-        payload.append(contentsOf: withUnsafeBytes(of: vk.bigEndian) { Data($0) })
-        payload.append(down ? 1 : 0)
-        sendCommand(payload)
-    }
-
-    /// A key tap: KEY down immediately followed by KEY up (two records).
-    /// (Legacy helper; the session UI now goes through `input`.)
-    func sendKey(vk: UInt16) {
-        sendKeyCommand(vk: vk, down: true)
-        sendKeyCommand(vk: vk, down: false)
+    /// Change the requested frame rate (0 = Auto).
+    func setQuality(_ fps: UInt16) {
+        guard fps != targetFps else { return }
+        targetFps = fps
+        sendQuality(targetFps: fps)
     }
 
     /// Send one CAPTURE_REGION command (v0.18): i32-BE x, i32-BE y,
@@ -728,9 +1079,37 @@ final class SessionController: ObservableObject {
         sendCommand(payload)
     }
 
+    // MARK: - Clipboard / files
+
+    /// Push the local clipboard text to the host now (session menu).
+    func sendClipboardNow() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+            toast = "The clipboard has no text"
+            return
+        }
+        sendClipboardPayload(text)
+        toast = "Clipboard sent to the host"
+    }
+
+    /// Type the local clipboard text into the host (for apps that ignore
+    /// clipboard sync, e.g. password fields).
+    func typeClipboardText() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+            toast = "The clipboard has no text"
+            return
+        }
+        input.typeText(text)
+    }
+
+    private func sendClipboardPayload(_ text: String) {
+        var payload = Data([0x50, 0]) // CLIPBOARD, kind 0 = text
+        payload.append(contentsOf: Array(text.utf8))
+        sendCommand(payload)
+    }
+
     /// Send-file (v0.27): read the picked document (security-scoped) and
     /// ship it through the Rust chunking path, both off main. Errors land
-    /// in the chat log.
+    /// in the session log.
     func sendFile(url: URL) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -740,20 +1119,26 @@ final class SessionController: ObservableObject {
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                 data = try Data(contentsOf: url)
             } catch {
-                self.log("file read failed: \(error)")
+                self.log("File read failed: \(error.localizedDescription)")
+                self.onMain { $0.toast = "Couldn't read \(url.lastPathComponent)" }
                 return
             }
-            guard !self.halted else { self.log("file send failed: not connected"); return }
+            guard !self.halted, let session = self.session else {
+                self.log("File send failed: not connected")
+                self.onMain { $0.toast = "Not connected — file not sent" }
+                return
+            }
             do {
-                try self.session.sendFile(name: url.lastPathComponent, data: data)
-                self.log("file sent: \(url.lastPathComponent) (\(data.count) bytes)")
+                try session.sendFile(name: url.lastPathComponent, data: data)
+                self.log("File sent: \(url.lastPathComponent) (\(data.count) bytes)")
+                self.onMain { $0.toast = "Sent \(url.lastPathComponent)" }
             } catch {
                 self.handle(error, context: "file send failed")
             }
         }
     }
 
-    // MARK: Clipboard (main thread)
+    // MARK: Clipboard polling (main thread)
 
     /// Check the pasteboard twice a second. `pollLocal` compares the cheap
     /// `changeCount` first and only reads the text (which may show the paste
@@ -780,7 +1165,7 @@ final class SessionController: ObservableObject {
         }
     }
 
-    /// Append a chat/status line (callable from any thread).
+    /// Append a session-log line (callable from any thread).
     private func log(_ text: String) {
         onMain { $0.appendLine(text) }
     }
@@ -788,9 +1173,26 @@ final class SessionController: ObservableObject {
     /// Main thread: append and cap the log at `maxLines`.
     private func appendLine(_ text: String) {
         nextLineID += 1
-        lines.append(LogLine(id: nextLineID, text: text))
+        lines.append(LogLine(id: nextLineID, text: text, date: Date()))
         if lines.count > Self.maxLines {
             lines.removeFirst(lines.count - Self.maxLines)
+        }
+    }
+
+    /// Main thread: a chat line from the peer.
+    private func receiveChat(_ text: String) {
+        appendChat(text, fromMe: false)
+        if !chatVisible {
+            unreadChat += 1
+        }
+    }
+
+    /// Main thread: append and cap the chat.
+    private func appendChat(_ text: String, fromMe: Bool) {
+        nextLineID += 1
+        chat.append(ChatMessage(id: nextLineID, text: text, fromMe: fromMe, date: Date()))
+        if chat.count > Self.maxChat {
+            chat.removeFirst(chat.count - Self.maxChat)
         }
     }
 
@@ -820,6 +1222,7 @@ final class SessionController: ObservableObject {
         if let frame = p.frame {
             model.image = frame.image
             if model.frameSize != frame.size { model.frameSize = frame.size }
+            markLiveIfNeeded()
         }
         if let gen = p.hideVideoGen {
             model.video.hide(generation: gen)
@@ -834,8 +1237,8 @@ final class SessionController: ObservableObject {
         }
     }
 
-    /// "A1B2C3D4 E5F60718 293A4B5C D6E7F809"-style display. Lives here, not
-    /// on the View (View members are main-actor-isolated; this runs on the
+    /// "A1B2C3D4 E5F60718 293A4B5C D6E7F809"-style display. Static (not on
+    /// a View: View members are main-actor-isolated; this runs on the
     /// session queue).
     static func pineString(_ fp: [UInt8]) -> String {
         let hex = fp.map { String(format: "%02X", $0) }.joined()

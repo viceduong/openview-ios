@@ -73,6 +73,16 @@ struct KeyStroke: Hashable {
     static let leftShift = KeyStroke(0xA0, 0x2A)
     static let leftAlt = KeyStroke(0xA4, 0x38)
     static let leftWin = KeyStroke(0x5B, 0x5B, ext: true)
+    static let scrollLock = KeyStroke(0x91, 0x46)
+    /// Pause/Break (an E1 sequence on the wire: the host derives the scancode).
+    static let pause = KeyStroke(0x13, 0)
+    // Letters used by the session menu's shortcuts (vk, set-1 make code).
+    static let keyC = KeyStroke(0x43, 0x2E)
+    static let keyD = KeyStroke(0x44, 0x20)
+    static let keyL = KeyStroke(0x4C, 0x26)
+    static let keyR = KeyStroke(0x52, 0x13)
+    static let keyS = KeyStroke(0x53, 0x1F)
+    static let keyV = KeyStroke(0x56, 0x2F)
 
     /// F1...F24 (n is 1-based); nil outside that range.
     static func function(_ n: Int) -> KeyStroke? {
@@ -135,6 +145,16 @@ enum ModifierKey: Int, CaseIterable {
         case .win: return .leftWin
         }
     }
+}
+
+/// Local viewport zoom presets (session menu / pinch snapping).
+enum ZoomPreset {
+    /// The whole remote screen visible (letterboxed).
+    case fit
+    /// The view filled (cropped on one axis).
+    case fill
+    /// One remote pixel = one device pixel.
+    case native
 }
 
 /// Sticky modifier state: latched = one-shot (applies to the next key or
@@ -325,6 +345,10 @@ final class RemoteInputController: ObservableObject {
     static let cmdAsCtrlDefaultsKey = "ov.cmdAsCtrl"
     static let cursorFlingDefaultsKey = "ov.cursorFling"
     static let pointerLockDefaultsKey = "ov.pointerLock"
+    /// Trackpad pointer acceleration curve (default off: linear motion).
+    static let cursorAccelDefaultsKey = "ov.cursorAccel"
+    /// "Lock local zoom": every gesture, pinch included, goes to the host.
+    static let lockLocalZoomDefaultsKey = "ov.lockLocalZoom"
 
     /// Sends one channel-0 command (SessionController.sendCommand).
     var send: ((Data) -> Void)?
@@ -344,6 +368,8 @@ final class RemoteInputController: ObservableObject {
     var onReleaseAll: (() -> Void)?
     /// Called when the cursor was resynced to the host position.
     var onCursorResync: (() -> Void)?
+    /// Applies a local zoom preset (installed by the surface).
+    var zoomPresetHandler: ((ZoomPreset) -> Void)?
     /// The surface that installed the hooks above (a re-hosted surface
     /// takes over; a dismantled one only unhooks if it is still active).
     weak var activeSurface: AnyObject?
@@ -424,6 +450,22 @@ final class RemoteInputController: ObservableObject {
         UserDefaults.standard.bool(forKey: Self.pointerLockDefaultsKey)
     }
 
+    /// Trackpad acceleration curve (default off: linear, scaled by zoom).
+    var cursorAccelEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.cursorAccelDefaultsKey)
+    }
+
+    /// Local zoom locked: pinch becomes Ctrl+wheel on the host and touch
+    /// mode drags go to the host (default off).
+    var lockLocalZoom: Bool {
+        UserDefaults.standard.bool(forKey: Self.lockLocalZoomDefaultsKey)
+    }
+
+    /// Ask the surface to apply a zoom preset (session menu).
+    func applyZoomPreset(_ preset: ZoomPreset) {
+        zoomPresetHandler?(preset)
+    }
+
     /// Switch the touch interpretation: releases everything held first.
     func setMode(_ newMode: InputMode) {
         guard newMode != mode else { return }
@@ -448,6 +490,7 @@ final class RemoteInputController: ObservableObject {
         keyboardPresenter = nil
         onReleaseAll = nil
         onCursorResync = nil
+        zoomPresetHandler = nil
     }
 
     // MARK: Cursor
@@ -694,7 +737,9 @@ final class RemoteInputController: ObservableObject {
         ensureTicking()
     }
 
-    private func flushWheel() {
+    /// Send whole accumulated wheel units now (also used before releasing
+    /// the Ctrl of a pinch-to-Ctrl+wheel gesture, so ordering holds).
+    func flushWheel() {
         guard input2 else {
             wheelAcc = .zero
             return
@@ -801,6 +846,18 @@ final class RemoteInputController: ObservableObject {
             emit(InputWire.key(vk: vk, down: true))
             emit(InputWire.key(vk: vk, down: false))
             if shifted { emit(InputWire.key(vk: 0x10, down: false)) }
+        }
+    }
+
+    /// A key chord (menu shortcuts): every key down in order, then up in
+    /// reverse order. Sticky modifiers are not applied.
+    func sendCombo(_ keys: [KeyStroke]) {
+        guard !keys.isEmpty else { return }
+        for k in keys {
+            sendKey(k, down: true)
+        }
+        for k in keys.reversed() {
+            sendKey(k, down: false)
         }
     }
 

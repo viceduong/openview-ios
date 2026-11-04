@@ -14,9 +14,9 @@ import UIKit
 // - `PointerLockHostingController`: a hosting controller that can request
 //   pointer lock. iPadOS grants the lock only to a full-screen app's
 //   foreground scene, and the request must come from the scene's root /
-//   presented view controller; the current NavigationView layout does not
-//   use it yet (section 3's immersive session should host its content in
-//   it and set `wantsPointerLock`).
+//   presented view controller: the immersive session is presented full
+//   screen in `SessionHostingController` (a subclass), which drives
+//   `wantsPointerLock` from the "ov.pointerLock" setting / Cmd+Shift+P.
 
 /// Hides the system pointer over the view it is installed on.
 final class PointerHider: NSObject, UIPointerInteractionDelegate {
@@ -119,8 +119,8 @@ final class GCMouseBridge {
 }
 
 /// A UIHostingController that asks for pointer lock while
-/// `wantsPointerLock` is set (not wired yet — see the file comment).
-final class PointerLockHostingController<Content: View>: UIHostingController<Content> {
+/// `wantsPointerLock` is set (subclassed by SessionHostingController).
+class PointerLockHostingController<Content: View>: UIHostingController<Content> {
     var wantsPointerLock = false {
         didSet {
             guard wantsPointerLock != oldValue else { return }

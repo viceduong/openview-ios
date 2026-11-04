@@ -8,24 +8,31 @@ import UIKit
 // pointer / keyboard input layer and the viewport. Self-contained so the
 // immersive session (section 3) can re-host it.
 //
-// Gestures (constants from Chrome Remote Desktop iOS):
+// Gestures (CRD structure, timings tuned to TeamViewer iOS 15.81):
 //
 //   MOUSE (trackpad) mode
-//     1-finger pan        relative cursor move (gain 1x -> 2.5x with speed),
-//                         viewport edge-push follows the cursor
+//     1-finger pan        relative cursor move, linear and scaled by zoom
+//                         (optional acceleration curve 1x -> 2.5x, setting
+//                         "ov.cursorAccel"); viewport edge-push follows
 //     tap                 left click at the cursor (2nd tap = double click)
 //     tap, then hold/drag left drag (DOWN at 0.15 s, UP on lift) + ring
-//     long-press 0.45 s   right click
-//     2-finger tap        right click; 3-finger tap: middle click
+//     long-press 0.30 s   right click (10 pt cancel radius)
+//     2-finger tap        right click (instant: no double tap to wait for);
+//                         3-finger tap: middle click
 //     2-finger pan        wheel (natural direction) + inertia (T = 250 ms)
-//     pinch               zoom around the cursor
-//     2-finger double-tap fit <-> 1:1 around the cursor
+//     pinch               zoom around the cursor; snaps to fit / fill / 1:1
+//                         within +-20% on release
 //   TOUCH (direct) mode
 //     tap                 left click at the finger (+ ripple)
 //     long-press          loupe; lift = right click, drag = left drag
 //     1-finger pan        pan the zoomed view
 //     2-finger pan        wheel at the fingers (scaled by zoom)
 //     pinch               zoom at the fingers (and pan with them)
+//   LOCK LOCAL ZOOM (setting "ov.lockLocalZoom"): pinch becomes Ctrl+wheel
+//   on the host and the touch-mode 1-finger pan becomes a left drag.
+//   After a multi-finger gesture the remaining finger is ignored until
+//   every finger lifted + 0.1 s (no stray cursor moves / clicks).
+//   Fit / fill / 1:1 are menu commands (RemoteInputController.applyZoomPreset).
 //   iPad pointer: hover = absolute move, clicks / right clicks via indirect
 //   pointer touches, trackpad / wheel scroll = WHEEL, optional raw GCMouse
 //   deltas while the pointer is locked.
@@ -167,15 +174,15 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var scale: CGFloat = 0
     /// View position of the frame's top-left corner.
     private var offset: CGPoint = .zero
-    /// Stay at fit when the view / frame size changes.
-    private var followFit = true
+    /// The preset the viewport follows when the view / frame size changes
+    /// (nil = free zoom, kept as is).
+    private var followPreset: ZoomPreset? = .fit
     private var lastBoundsSize: CGSize = .zero
 
     // ---- gestures ----
     private let tap1 = UITapGestureRecognizer(target: nil, action: nil)
     private let tap2 = UITapGestureRecognizer(target: nil, action: nil)
     private let tap3 = UITapGestureRecognizer(target: nil, action: nil)
-    private let tap2Double = UITapGestureRecognizer(target: nil, action: nil)
     private let pan1 = UIPanGestureRecognizer(target: nil, action: nil)
     private let pan2 = UIPanGestureRecognizer(target: nil, action: nil)
     private let pinch = UIPinchGestureRecognizer(target: nil, action: nil)
@@ -205,6 +212,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var lastPinchCentroid: CGPoint?
     /// Indirect pointer touch -> the button it pressed.
     private var pointerButtons: [ObjectIdentifier: MouseButton] = [:]
+    /// Multi-finger lift debounce: a multi-finger touch sequence is in
+    /// progress (until every finger lifted), and when the last one ended.
+    private var multiTouchSequence = false
+    private var multiTouchEnd: CFTimeInterval = 0
+    /// The current one-finger pan started inside a multi-finger sequence.
+    private var pan1Suppressed = false
+    /// Lock local zoom: touch-mode one-finger drag holding the left button.
+    private var touchDragActive = false
+    /// Lock local zoom: Ctrl held on the host for a pinch (Ctrl+wheel).
+    private var pinchCtrlHeld = false
 
     // ---- animation ----
     private var cursorFling = FlingTracker(timeConstant: 180)
@@ -221,8 +238,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// Wheel units (1/120 notch) per point of two-finger travel: one
     /// notch per 36 pt.
     private static let wheelUnitsPerPoint: CGFloat = 120.0 / 36.0
-    /// Max zoom: one remote pixel = 6 device pixels.
-    private static let maxDevicePixelsPerRemotePixel: CGFloat = 6
+    /// Max zoom: one remote pixel = 3 device pixels (3x native).
+    private static let maxDevicePixelsPerRemotePixel: CGFloat = 3
+    /// Pinch release snaps to fit / fill / 1:1 within this ratio.
+    private static let snapTolerance: CGFloat = 0.2
+    /// Tap windows (double click at the same pixel, drag-end tap swallow).
+    private static let tapWindow: CFTimeInterval = 0.3
+    /// Ignore the remaining finger this long after a multi-finger gesture.
+    private static let multiFingerLiftDebounce: CFTimeInterval = 0.1
+    /// Lock local zoom: pinch scale change per wheel notch (10%).
+    private static let pinchNotchScale: Double = 1.1
     private static let loupeDiameter: CGFloat = 100
     private static let loupeMagnification: CGFloat = 2
     private static let loupeOffset: CGFloat = 80
@@ -320,9 +345,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         tap2.numberOfTouchesRequired = 2
         tap3.addTarget(self, action: #selector(handleTap3(_:)))
         tap3.numberOfTouchesRequired = 3
-        tap2Double.addTarget(self, action: #selector(handleTap2Double(_:)))
-        tap2Double.numberOfTouchesRequired = 2
-        tap2Double.numberOfTapsRequired = 2
         pan1.addTarget(self, action: #selector(handlePan1(_:)))
         pan1.minimumNumberOfTouches = 1
         pan1.maximumNumberOfTouches = 1
@@ -331,7 +353,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         pan2.maximumNumberOfTouches = 2
         pinch.addTarget(self, action: #selector(handlePinch(_:)))
         longPress.addTarget(self, action: #selector(handleLongPress(_:)))
-        longPress.minimumPressDuration = 0.45
+        longPress.minimumPressDuration = 0.30
         longPress.allowableMovement = 10
         // Tap, then touch again and hold 0.15 s (moving or not) = drag.
         holdDrag.addTarget(self, action: #selector(handleHoldDrag(_:)))
@@ -340,7 +362,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         holdDrag.allowableMovement = 10_000
 
         let touchRecognizers: [UIGestureRecognizer] = [
-            tap1, tap2, tap3, tap2Double, pan1, pan2, pinch, longPress, holdDrag,
+            tap1, tap2, tap3, pan1, pan2, pinch, longPress, holdDrag,
         ]
         for g in touchRecognizers {
             g.delegate = self
@@ -350,13 +372,13 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
 
         // Recognizer wiring (CRD): single tap waits for the two-finger tap
-        // to fail, two-finger tap for the three-finger tap (and for the
-        // two-finger double tap); pinch and the one-finger pan wait for the
-        // single tap (a tap fails as soon as the finger moves, so pans are
-        // not delayed noticeably).
+        // to fail, two-finger tap for the three-finger tap; pinch and the
+        // one-finger pan wait for the single tap (a tap fails as soon as the
+        // finger moves, so pans are not delayed noticeably). There is no
+        // two-finger double tap any more, so a two-finger tap right-clicks
+        // without waiting for a second tap.
         tap1.require(toFail: tap2)
         tap2.require(toFail: tap3)
-        tap2.require(toFail: tap2Double)
         pinch.require(toFail: tap1)
         pan1.require(toFail: tap1)
 
@@ -415,6 +437,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         input.onCursorResync = { [weak self] in
             self?.updateCursorLayer()
         }
+        input.zoomPresetHandler = { [weak self] preset in
+            self?.applyPreset(preset)
+        }
         input.activeSurface = self
     }
 
@@ -430,6 +455,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             input.keyboardPresenter = nil
             input.onReleaseAll = nil
             input.onCursorResync = nil
+            input.zoomPresetHandler = nil
             input.activeSurface = nil
         }
     }
@@ -444,9 +470,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             input.touching = false
         } else {
             installInputHooks()
-            if input.pointerLockEnabled {
-                gcMouse.start()
-            }
+            // Always observe mice: GCMouseBridge delivers only while the
+            // scene's pointer is actually locked, and the lock can be
+            // toggled during the session (Cmd+Shift+P).
+            gcMouse.start()
             // Hardware keyboard input without showing any keyboard.
             DispatchQueue.main.async { [weak self] in
                 self?.claimKeyboardFocus()
@@ -475,6 +502,15 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             if lpDragging { input.buttonUp(.left) }
             lpDragging = false
             hideLoupe()
+        }
+        if touchDragActive {
+            touchDragActive = false
+            input.buttonUp(.left)
+        }
+        if pinchCtrlHeld {
+            pinchCtrlHeld = false
+            input.flushWheel()
+            input.sendKey(.leftCtrl, down: false)
         }
     }
 
@@ -511,7 +547,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             CATransaction.commit()
             video?.layout(in: container.bounds)
             input.frameSize = size
-            followFit = true
+            if followPreset == nil { followPreset = .fit }
             refit()
         }
         if img !== image {
@@ -549,15 +585,28 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return s > 0 ? s : UIScreen.main.scale
     }
 
-    /// Scale that fits the whole frame (letterboxed).
+    /// Scale that fits the whole frame (letterboxed): min of the ratios.
     private var fitScale: CGFloat {
         guard frameSize.width > 0, frameSize.height > 0,
               bounds.width > 0, bounds.height > 0 else { return 0 }
         return min(bounds.width / frameSize.width, bounds.height / frameSize.height)
     }
 
+    /// Scale that fills the view (cropped on one axis): max of the ratios.
+    private var fillScale: CGFloat {
+        guard frameSize.width > 0, frameSize.height > 0,
+              bounds.width > 0, bounds.height > 0 else { return 0 }
+        return max(bounds.width / frameSize.width, bounds.height / frameSize.height)
+    }
+
+    /// One remote pixel = one device pixel.
+    private var nativeScale: CGFloat {
+        1 / displayScale
+    }
+
+    /// Up to 3x native, and never below fill.
     private var maxScale: CGFloat {
-        max(fitScale, Self.maxDevicePixelsPerRemotePixel / displayScale)
+        max(fitScale, fillScale, Self.maxDevicePixelsPerRemotePixel / displayScale)
     }
 
     /// Zoom relative to fit (1 = fit).
@@ -569,6 +618,14 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private func clampScale(_ s: CGFloat) -> CGFloat {
         guard s.isFinite else { return fitScale }
         return min(max(s, fitScale), maxScale)
+    }
+
+    private func scaleFor(_ preset: ZoomPreset) -> CGFloat {
+        switch preset {
+        case .fit: return fitScale
+        case .fill: return clampScale(fillScale)
+        case .native: return clampScale(nativeScale)
+        }
     }
 
     /// Keep the content inside the view (centered on axes where it is
@@ -588,13 +645,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// View or frame size changed.
+    /// View or frame size changed (rotation, keyboard, monitor switch):
+    /// re-apply the followed preset, else keep the zoom (clamped).
     private func refit() {
         let f = fitScale
         guard f > 0 else { return }
-        if followFit || scale <= 0 {
-            scale = f
-            followFit = true
+        if scale <= 0 {
+            followPreset = .fit
+        }
+        if let preset = followPreset {
+            scale = scaleFor(preset)
         } else {
             scale = clampScale(scale)
         }
@@ -622,7 +682,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         let fy = (pivot.y - offset.y) / scale
         scale = newScale
         offset = CGPoint(x: pivot.x - fx * newScale, y: pivot.y - fy * newScale)
-        followFit = abs(newScale - fitScale) < 0.0001
+        followPreset = abs(newScale - fitScale) < 0.0001 ? .fit : nil
         clampOffset()
         applyViewport()
     }
@@ -635,24 +695,42 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         applyViewport()
     }
 
-    /// Two-finger double tap: fit <-> 1:1 (one remote pixel = one device
-    /// pixel; 2x fit when 1:1 would not be bigger than fit), centered on
-    /// the frame point `fp`.
-    private func toggleZoom(around fp: CGPoint) {
-        let f = fitScale
-        guard f > 0 else { return }
-        let target: CGFloat
-        if scale > f * 1.05 {
-            target = f
-        } else {
-            let oneToOne = 1 / displayScale
-            target = oneToOne > f * 1.05 ? oneToOne : f * 2
-        }
-        scale = clampScale(target)
-        followFit = abs(scale - f) < 0.0001
-        offset = CGPoint(x: bounds.width / 2 - fp.x * scale, y: bounds.height / 2 - fp.y * scale)
+    /// Menu command: fit / fill / 1:1, centered on the cursor (mouse mode)
+    /// or on what is in the middle of the view (touch mode).
+    func applyPreset(_ preset: ZoomPreset) {
+        guard scale > 0, fitScale > 0 else { return }
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let fp = input.mode == .mouse && input.hasCursor ? input.cursor : viewToFrame(center)
+        scale = scaleFor(preset)
+        followPreset = preset
+        offset = CGPoint(x: center.x - fp.x * scale, y: center.y - fp.y * scale)
         clampOffset()
         applyViewport()
+        if input.mode == .mouse {
+            edgePush()
+        }
+    }
+
+    /// Pinch released: snap to fit / fill / 1:1 when within +-20%.
+    private func snapZoom(pivot: CGPoint) {
+        guard scale > 0 else { return }
+        let presets: [ZoomPreset] = [.fit, .fill, .native]
+        var bestPreset: ZoomPreset?
+        var bestScale: CGFloat = 0
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for preset in presets {
+            let target = scaleFor(preset)
+            guard target > 0 else { continue }
+            let distance = abs(scale / target - 1)
+            if distance <= Self.snapTolerance && distance < bestDistance {
+                bestDistance = distance
+                bestPreset = preset
+                bestScale = target
+            }
+        }
+        guard let preset = bestPreset, bestScale > 0 else { return }
+        zoom(by: bestScale / scale, pivot: pivot)
+        followPreset = preset
     }
 
     /// Mouse mode: pan the zoomed view so the cursor stays out of the
@@ -695,6 +773,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         if bounds.size != lastBoundsSize {
             lastBoundsSize = bounds.size
             refit()
+            // The view shrank (soft keyboard / key bar) or rotated: keep
+            // the cursor in sight.
+            if input.mode == .mouse {
+                edgePush()
+            }
         }
     }
 
@@ -952,6 +1035,18 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             $0.type != .indirectPointer && $0.phase != .ended && $0.phase != .cancelled
         }
         input.touching = !active.isEmpty
+        // Multi-finger lift debounce bookkeeping.
+        if active.count >= 2 {
+            multiTouchSequence = true
+        } else if active.isEmpty && multiTouchSequence {
+            multiTouchSequence = false
+            multiTouchEnd = CACurrentMediaTime()
+        }
+    }
+
+    /// A finger left over from (or just after) a multi-finger gesture.
+    private var inMultiFingerAftermath: Bool {
+        multiTouchSequence || CACurrentMediaTime() - multiTouchEnd < Self.multiFingerLiftDebounce
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1030,15 +1125,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     @objc private func handleTap1(_ g: UITapGestureRecognizer) {
         guard g.state == .ended else { return }
         let now = CACurrentMediaTime()
+        if now - multiTouchEnd < Self.multiFingerLiftDebounce { return }
         switch input.mode {
         case .mouse:
             // The tap that ends a tap-hold drag is not a click.
-            if dragActive || now - lastDragEnd < 0.25 { return }
+            if dragActive || now - lastDragEnd < Self.tapWindow { return }
             input.click(.left)
         case .touch:
             let loc = g.location(in: self)
             var p = viewToFrame(loc)
-            if let last = lastTouchTap, now - last.time < 0.35,
+            if let last = lastTouchTap, now - last.time < Self.tapWindow,
                hypot(loc.x - last.view.x, loc.y - last.view.y) < 24 {
                 p = last.frame
             }
@@ -1073,40 +1169,73 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         updateCursorLayer()
     }
 
-    @objc private func handleTap2Double(_ g: UITapGestureRecognizer) {
-        guard g.state == .ended else { return }
-        switch input.mode {
-        case .mouse:
-            toggleZoom(around: input.cursor)
-            edgePush()
-        case .touch:
-            toggleZoom(around: viewToFrame(g.location(in: self)))
-        }
-    }
-
     @objc private func handlePan1(_ g: UIPanGestureRecognizer) {
+        if input.mode == .touch && (input.lockLocalZoom || touchDragActive) {
+            handleTouchDrag(g)
+            return
+        }
         switch g.state {
         case .began:
             cursorFling.stop()
+            pan1Suppressed = inMultiFingerAftermath
         case .changed:
             let t = g.translation(in: self)
             g.setTranslation(.zero, in: self)
-            if isPinching { return }
+            if isPinching || pan1Suppressed || multiTouchSequence { return }
             switch input.mode {
             case .mouse:
-                let v = g.velocity(in: self)
-                let gain = Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
+                let gain = cursorGain(g)
                 moveCursor(byViewPoints: CGPoint(x: t.x * gain, y: t.y * gain))
             case .touch:
                 if lpActive { return }
                 panViewport(by: t)
             }
         case .ended:
-            guard input.mode == .mouse, input.cursorFlingEnabled, !dragActive else { return }
+            let suppressed = pan1Suppressed
+            pan1Suppressed = false
+            guard input.mode == .mouse, input.cursorFlingEnabled, !dragActive, !suppressed else { return }
             let v = g.velocity(in: self)
-            let gain = Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
+            let gain = cursorGain(g)
             cursorFling.start(velocity: CGPoint(x: v.x * gain, y: v.y * gain), now: CACurrentMediaTime())
             if cursorFling.isActive { animTicker.start() }
+        default:
+            pan1Suppressed = false
+        }
+    }
+
+    /// Trackpad gain: 1 (linear) unless the acceleration setting is on.
+    private func cursorGain(_ g: UIPanGestureRecognizer) -> CGFloat {
+        guard input.cursorAccelEnabled else { return 1 }
+        let v = g.velocity(in: self)
+        return Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
+    }
+
+    /// Lock local zoom, touch mode: a one-finger drag is a left-button drag
+    /// on the host (pressed where the finger first touched).
+    private func handleTouchDrag(_ g: UIPanGestureRecognizer) {
+        let loc = g.location(in: self)
+        switch g.state {
+        case .began:
+            guard !lpActive, !inMultiFingerAftermath else { return }
+            let t = g.translation(in: self)
+            let start = CGPoint(x: loc.x - t.x, y: loc.y - t.y)
+            touchDragActive = true
+            input.buttonDown(.left, at: viewToFrame(start))
+            input.moveCursorAbsolute(to: viewToFrame(loc))
+            updateCursorLayer()
+        case .changed:
+            guard touchDragActive, !multiTouchSequence else { return }
+            input.moveCursorAbsolute(to: viewToFrame(loc))
+            updateCursorLayer()
+        case .ended:
+            guard touchDragActive else { return }
+            touchDragActive = false
+            input.buttonUp(.left, at: viewToFrame(loc))
+            updateCursorLayer()
+        case .cancelled, .failed:
+            guard touchDragActive else { return }
+            touchDragActive = false
+            input.buttonUp(.left)
         default:
             break
         }
@@ -1153,6 +1282,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     }
 
     @objc private func handlePinch(_ g: UIPinchGestureRecognizer) {
+        if input.lockLocalZoom || pinchCtrlHeld {
+            handleRemotePinch(g)
+            return
+        }
         switch g.state {
         case .began:
             stopFlings()
@@ -1177,8 +1310,42 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
                 }
                 zoom(by: s, pivot: loc)
             }
+        case .ended:
+            lastPinchCentroid = nil
+            let pivot = input.mode == .mouse ? frameToView(input.cursor) : g.location(in: self)
+            snapZoom(pivot: pivot)
+            if input.mode == .mouse {
+                edgePush()
+            }
         default:
             lastPinchCentroid = nil
+        }
+    }
+
+    /// Lock local zoom: pinch = Ctrl+wheel on the host (one notch per 10%
+    /// scale change), at the cursor (mouse) or the fingers (touch).
+    private func handleRemotePinch(_ g: UIPinchGestureRecognizer) {
+        switch g.state {
+        case .began:
+            stopFlings()
+            guard input.input2 else { return } // no wheel on legacy hosts
+            if input.mode == .touch && g.numberOfTouches >= 2 {
+                input.moveCursorAbsolute(to: viewToFrame(g.location(in: self)))
+                updateCursorLayer()
+            }
+            pinchCtrlHeld = true
+            input.sendKey(.leftCtrl, down: true)
+        case .changed:
+            let s = g.scale
+            g.scale = 1
+            guard pinchCtrlHeld, s.isFinite, s > 0 else { return }
+            let notches = log(Double(s)) / log(Self.pinchNotchScale)
+            input.wheel(dx: 0, dy: notches * 120)
+        default:
+            guard pinchCtrlHeld else { return }
+            pinchCtrlHeld = false
+            input.flushWheel()
+            input.sendKey(.leftCtrl, down: false)
         }
     }
 

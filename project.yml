@@ -50,8 +50,19 @@ targets:
         UIApplicationSupportsIndirectInputEvents: true
         UIRequiredDeviceCapabilities:
           - arm64
+        NSFaceIDUsageDescription: OpenView uses Face ID to unlock the app and your saved access PINs.
+        # Section 3: landscape sessions (iPhone: no upside-down; iPad: all).
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Per-controller status bar (the session hides it).
+        UIViewControllerBasedStatusBarAppearance: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openview.remoteview
@@ -61,3 +72,5 @@ targets:
         # Single-size 1024 app icon (RemoteView/Assets.xcassets); Xcode
         # generates every device size from it.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Blue accent (#0A6CFF light / #3D8BFF dark), RemoteView/Assets.xcassets.
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

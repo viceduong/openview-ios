@@ -175,6 +175,21 @@ final class HardwareKeyRouter {
         usage == HIDKeyMap.leftGUI || usage == HIDKeyMap.rightGUI
     }
 
+    /// HID usages of P and Space (the local Cmd+Shift shortcuts).
+    private static func isLocalShortcut(_ usage: Int) -> Bool {
+        usage == 0x13 || usage == 0x2C
+    }
+
+    /// A Cmd key is held (swallowed for Cmd->Ctrl, or forwarded as Win).
+    private var cmdIsDown: Bool {
+        !cmdHeld.isEmpty || down[HIDKeyMap.leftGUI] != nil || down[HIDKeyMap.rightGUI] != nil
+    }
+
+    /// A Shift key is held (HID LeftShift 0xE1 / RightShift 0xE5).
+    private var shiftIsDown: Bool {
+        down[0xE1] != nil || down[0xE5] != nil
+    }
+
     /// Handle presses going down; returns the ones we did not handle (pass
     /// them to super).
     func pressesBegan(_ presses: Set<UIPress>) -> Set<UIPress> {
@@ -221,6 +236,15 @@ final class HardwareKeyRouter {
                 cmdUsed = false
             }
             cmdHeld.insert(usage)
+            return
+        }
+
+        // Cmd+Shift+P (pointer lock) and Cmd+Shift+Space (toolbar) are
+        // local shortcuts handled by the session's key commands: never
+        // forwarded to the host.
+        if Self.isLocalShortcut(usage) && cmdIsDown && shiftIsDown {
+            cmdUsed = true
+            swallowed.insert(usage)
             return
         }
 

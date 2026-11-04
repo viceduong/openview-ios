@@ -2,14 +2,19 @@ import Combine
 import UIKit
 
 /// The special-keys bar (UIKit; used as the key input view's
-/// `inputAccessoryView`, re-hostable anywhere). Two pages in a horizontal
-/// scroll view:
-///   1: esc tab ctrl alt ⊞ shift | ← ↑ ↓ → | ›
-///   2: ‹ F1–F12 | Home End PgUp PgDn Ins Del PrtSc | Ctrl+Alt+Del
-/// plus a fixed "hide keyboard" button. Modifier buttons are sticky (see
-/// `RemoteInputController.tapModifier`): latched = tinted, locked = filled.
+/// `inputAccessoryView`, re-hostable anywhere). One horizontally scrolling
+/// ribbon in TeamViewer's order:
+///   ⊞ Shift Ctrl Alt | ScrLk Fn | Esc Tab PrtScn Pause Ins Del Home End
+///   PgUp PgDn | ← ↑ → ↓ | Ctrl+Alt+Del
+/// "Fn" swaps the ribbon for F1–F12 (‹ goes back). A fixed "hide keyboard"
+/// button sits on the trailing edge. Modifier buttons are sticky (see
+/// `RemoteInputController.tapModifier`): tap = one-shot (tinted), double
+/// tap = locked (filled). The first time the bar appears, a hint says the
+/// ribbon scrolls.
 final class KeyAccessoryBar: UIView {
     static let barHeight: CGFloat = 46
+    /// UserDefaults flag: the "swipe for more keys" hint was shown.
+    static let hintShownDefaultsKey = "ov.keyBarHintShown"
 
     private weak var input: RemoteInputController?
     /// Hide button tapped.
@@ -17,10 +22,11 @@ final class KeyAccessoryBar: UIView {
 
     private let scroll = UIScrollView()
     private let content = UIStackView()
-    private var page1: [UIView] = []
-    private var page2: [UIView] = []
+    private var mainKeys: [UIView] = []
+    private var functionKeys: [UIView] = []
     private var modifierButtons: [(key: ModifierKey, button: UIButton)] = []
     private var cancellable: AnyCancellable?
+    private var hintLabel: UILabel?
 
     init(input: RemoteInputController) {
         self.input = input
@@ -28,8 +34,8 @@ final class KeyAccessoryBar: UIView {
         autoresizingMask = [.flexibleWidth]
         backgroundColor = .secondarySystemBackground
         buildLayout()
-        buildPages()
-        showPage(1)
+        buildKeys()
+        showFunctionKeys(false)
         cancellable = input.$modifierStates.sink { [weak self] states in
             self?.applyModifierStates(states)
         }
@@ -42,6 +48,13 @@ final class KeyAccessoryBar: UIView {
 
     override var intrinsicContentSize: CGSize {
         CGSize(width: UIView.noIntrinsicMetric, height: Self.barHeight)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            showHintIfNeeded()
+        }
     }
 
     // MARK: Layout
@@ -89,60 +102,104 @@ final class KeyAccessoryBar: UIView {
         ])
     }
 
-    private func buildPages() {
-        // Page 1.
-        page1.append(keyButton("esc", .escape))
-        page1.append(keyButton("tab", .tab))
-        let modifiers: [(ModifierKey, String)] = [(.ctrl, "ctrl"), (.alt, "alt"), (.win, "⊞"), (.shift, "shift")]
-        for (m, title) in modifiers {
-            let b = makeButton(title: title, symbol: nil, label: title == "⊞" ? "Windows" : title) { [weak self] in
+    private func buildKeys() {
+        // Sticky modifiers: ⊞ Win, Shift, Ctrl, Alt.
+        let modifiers: [(ModifierKey, String, String)] = [
+            (.win, "⊞", "Windows"), (.shift, "Shift", "Shift"), (.ctrl, "Ctrl", "Control"), (.alt, "Alt", "Alt"),
+        ]
+        for (m, title, label) in modifiers {
+            let b = makeButton(title: title, symbol: nil, label: label) { [weak self] in
                 self?.input?.tapModifier(m)
             }
             modifierButtons.append((key: m, button: b))
-            page1.append(b)
+            mainKeys.append(b)
         }
-        page1.append(separator())
-        page1.append(keyButton("←", .left, label: "Left arrow"))
-        page1.append(keyButton("↑", .up, label: "Up arrow"))
-        page1.append(keyButton("↓", .down, label: "Down arrow"))
-        page1.append(keyButton("→", .right, label: "Right arrow"))
-        page1.append(separator())
-        page1.append(makeButton(title: "›", symbol: nil, label: "More keys") { [weak self] in
-            self?.showPage(2)
+        mainKeys.append(separator())
+        mainKeys.append(keyButton("ScrLk", .scrollLock, label: "Scroll Lock"))
+        mainKeys.append(makeButton(title: "Fn", symbol: nil, label: "Function keys") { [weak self] in
+            self?.showFunctionKeys(true)
+        })
+        mainKeys.append(separator())
+        mainKeys.append(keyButton("Esc", .escape, label: "Escape"))
+        mainKeys.append(keyButton("Tab", .tab))
+        mainKeys.append(keyButton("PrtScn", .printScreen, label: "Print Screen"))
+        mainKeys.append(keyButton("Pause", .pause))
+        mainKeys.append(keyButton("Ins", .insert, label: "Insert"))
+        mainKeys.append(keyButton("Del", .delete, label: "Delete"))
+        mainKeys.append(keyButton("Home", .home))
+        mainKeys.append(keyButton("End", .end))
+        mainKeys.append(keyButton("PgUp", .pageUp, label: "Page Up"))
+        mainKeys.append(keyButton("PgDn", .pageDown, label: "Page Down"))
+        mainKeys.append(separator())
+        mainKeys.append(keyButton("←", .left, label: "Left arrow"))
+        mainKeys.append(keyButton("↑", .up, label: "Up arrow"))
+        mainKeys.append(keyButton("→", .right, label: "Right arrow"))
+        mainKeys.append(keyButton("↓", .down, label: "Down arrow"))
+        mainKeys.append(separator())
+        mainKeys.append(makeButton(title: "Ctrl+Alt+Del", symbol: nil, label: "Control Alt Delete") { [weak self] in
+            self?.input?.sendSAS()
         })
 
-        // Page 2.
-        page2.append(makeButton(title: "‹", symbol: nil, label: "Back") { [weak self] in
-            self?.showPage(1)
+        // Function-key page.
+        functionKeys.append(makeButton(title: "‹", symbol: nil, label: "Back") { [weak self] in
+            self?.showFunctionKeys(false)
         })
         for n in 1...12 {
             if let k = KeyStroke.function(n) {
-                page2.append(keyButton("F\(n)", k))
+                functionKeys.append(keyButton("F\(n)", k))
             }
         }
-        page2.append(separator())
-        page2.append(keyButton("Home", .home))
-        page2.append(keyButton("End", .end))
-        page2.append(keyButton("PgUp", .pageUp))
-        page2.append(keyButton("PgDn", .pageDown))
-        page2.append(keyButton("Ins", .insert))
-        page2.append(keyButton("Del", .delete))
-        page2.append(keyButton("PrtSc", .printScreen))
-        page2.append(separator())
-        page2.append(makeButton(title: "Ctrl+Alt+Del", symbol: nil, label: "Control Alt Delete") { [weak self] in
-            self?.input?.sendSAS()
-        })
     }
 
-    private func showPage(_ n: Int) {
+    private func showFunctionKeys(_ on: Bool) {
         for v in content.arrangedSubviews {
             content.removeArrangedSubview(v)
             v.removeFromSuperview()
         }
-        for v in (n == 1 ? page1 : page2) {
+        for v in (on ? functionKeys : mainKeys) {
             content.addArrangedSubview(v)
         }
         scroll.setContentOffset(.zero, animated: false)
+    }
+
+    // MARK: First-use hint
+
+    private func showHintIfNeeded() {
+        guard hintLabel == nil,
+              !UserDefaults.standard.bool(forKey: Self.hintShownDefaultsKey) else { return }
+        UserDefaults.standard.set(true, forKey: Self.hintShownDefaultsKey)
+        let label = UILabel()
+        label.text = "  Swipe to access all keys ›  "
+        label.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        label.textColor = .white
+        label.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.92)
+        label.layer.cornerRadius = 12
+        label.layer.masksToBounds = true
+        label.isUserInteractionEnabled = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.heightAnchor.constraint(equalToConstant: 26),
+        ])
+        hintLabel = label
+        UIView.animate(withDuration: 0.4, delay: 3.0, options: [.curveEaseInOut], animations: {
+            label.alpha = 0
+        }, completion: { [weak self] _ in
+            label.removeFromSuperview()
+            self?.hintLabel = nil
+        })
+        // Nudge the ribbon so the scrollability is visible.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self else { return }
+            let maxX = self.scroll.contentSize.width - self.scroll.bounds.width
+            guard maxX > 20 else { return }
+            self.scroll.setContentOffset(CGPoint(x: min(60, maxX), y: 0), animated: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.scroll.setContentOffset(.zero, animated: true)
+            }
+        }
     }
 
     // MARK: Buttons
