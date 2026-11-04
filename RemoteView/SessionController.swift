@@ -51,6 +51,9 @@ final class ScreenModel: ObservableObject {
     @Published var cursorImage: CGImage?
     @Published var cursorHotspot: CGSize = .zero
     @Published var cursorSize: CGSize = .zero
+    // Phase 5: the H.264 overlay for high-motion regions (not published —
+    // the frame view hosts its layer; samples are enqueued directly).
+    let video = VideoOverlay()
 }
 
 /// Liveness HUD state (v0.16), observed only by the HUD row and the
@@ -67,8 +70,11 @@ private struct PendingScreen {
     var frame: (image: CGImage, size: CGSize)?
     var cursorPos: CGPoint?
     var cursorShape: (image: CGImage?, hotspot: CGSize, size: CGSize)?
+    /// Phase 5: this frame is the lossless refresh after VIDEO_END of that
+    /// video generation — hide the overlay together with showing it.
+    var hideVideoGen: Int?
 
-    var isEmpty: Bool { frame == nil && cursorPos == nil && cursorShape == nil }
+    var isEmpty: Bool { frame == nil && cursorPos == nil && cursorShape == nil && hideVideoGen == nil }
 }
 
 // MARK: - Controller
@@ -126,6 +132,13 @@ final class SessionController: ObservableObject {
     private let pumpEpochNs = DispatchTime.now().uptimeNanoseconds
     // Last liveness values published, so the HUD only re-renders on change.
     private var lastLiveness: (alive: Bool, rtt: Int32, fpsTenths: Int) = (true, -1, 0)
+    // Phase 5 H.264 overlay state (session queue): CMSampleBuffer builder,
+    // whether a motion period is running, its generation, and the
+    // generation whose END is waiting for the refresh frame.
+    private let videoSamples = H264SampleBuilder()
+    private var videoActive = false
+    private var videoGen = 0
+    private var pendingHideGen: Int?
 
     // Screen updates coalesced across threads (guarded by `screenLock`).
     private let screenLock = NSLock()
@@ -185,6 +198,14 @@ final class SessionController: ObservableObject {
             self?.sendCommand(payload)
         }
         startClipboardPolling()
+        // Phase 5: the overlay's decoder failed (main) -> ask the host for an
+        // IDR from the session queue.
+        screenModel.video.onFailure = { [weak self] in
+            self?.queue.async { [weak self] in
+                guard let self, !self.halted else { return }
+                self.screen.requestVideoIdr()
+            }
+        }
 
         queue.async { [weak self] in
             guard let self else {
@@ -342,7 +363,22 @@ final class SessionController: ObservableObject {
                   let img = FrameImage.make(width: width, height: height, stride: stride,
                                             format: format, pixels: pixels) else { return }
             let size = CGSize(width: CGFloat(img.width), height: CGFloat(img.height))
-            self.postScreen { $0.frame = (image: img, size: size) }
+            // Phase 5: the first frame after VIDEO_END carries the lossless
+            // refresh of the region; the overlay goes away with it.
+            let hide = self.pendingHideGen
+            self.pendingHideGen = nil
+            self.postScreen {
+                $0.frame = (image: img, size: size)
+                if let hide { $0.hideVideoGen = hide }
+            }
+        }
+        // Phase 5: H.264 for high-motion regions, only when VideoToolbox can
+        // decode it here (`enableVideo` advertises CAP_H264).
+        if H264SampleBuilder.available {
+            screen.onVideo = { [weak self] packet in
+                self?.handleVideo(packet)
+            }
+            screen.enableVideo()
         }
         // Remote cursor callbacks (both fire on this queue).
         screen.onCursor = { [weak self] x, y in
@@ -416,6 +452,44 @@ final class SessionController: ObservableObject {
             } catch {
                 self.log("file write failed: \(error)")
             }
+        }
+    }
+
+    // MARK: H.264 overlay (session queue)
+
+    /// One H.264 packet (fires inside `screen.feed`): build the sample here,
+    /// off main, then enqueue it on the overlay layer on main. END only
+    /// marks the generation to hide with the next (refresh) frame.
+    private func handleVideo(_ packet: RemoteVideoPacket) {
+        if packet.isEnd {
+            if videoActive {
+                videoActive = false
+                pendingHideGen = videoGen
+            }
+            return
+        }
+        if !videoActive {
+            videoActive = true
+            videoGen += 1
+            pendingHideGen = nil
+        }
+        let gen = videoGen
+        guard let built = videoSamples.make(packet) else {
+            // Not decodable (no keyframe yet / bad data): ask for an IDR —
+            // deferred, we are still inside ov_screen_feed.
+            queue.async { [weak self] in
+                guard let self, !self.halted else { return }
+                self.screen.requestVideoIdr()
+            }
+            return
+        }
+        let overlay = screenModel.video
+        let sample = built.sample
+        let flush = built.formatChanged
+        let rect = packet.rect
+        let size = packet.screenSize
+        DispatchQueue.main.async {
+            overlay.enqueue(sample, rect: rect, screen: size, generation: gen, flush: flush)
         }
     }
 
@@ -724,6 +798,9 @@ final class SessionController: ObservableObject {
         if let frame = p.frame {
             model.image = frame.image
             if model.frameSize != frame.size { model.frameSize = frame.size }
+        }
+        if let gen = p.hideVideoGen {
+            model.video.hide(generation: gen)
         }
         if let pos = p.cursorPos {
             model.cursorPos = pos

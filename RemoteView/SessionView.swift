@@ -301,7 +301,7 @@ private struct RemoteScreenView: View {
                 ZStack {
                     // Layer-backed frame: setting CALayer.contents is the
                     // cheapest way to show a fresh CGImage each frame.
-                    FrameLayerView(image: img)
+                    FrameLayerView(image: img, video: model.video)
                         .frame(width: content.size.width, height: content.size.height)
                         .position(x: content.origin.x + content.size.width / 2,
                                   y: content.origin.y + content.size.height / 2)
@@ -401,15 +401,20 @@ private struct RemoteScreenView: View {
 }
 
 /// Shows a CGImage through a plain CALayer (`contents`), without implicit
-/// animations. The image is already letterbox-sized by the parent.
+/// animations. The image is already letterbox-sized by the parent. Phase 5:
+/// also hosts the H.264 overlay layer (positioned over the video region).
 private struct FrameLayerView: UIViewRepresentable {
     let image: CGImage
+    let video: VideoOverlay
 
     func makeUIView(context: Context) -> FrameLayerUIView {
-        FrameLayerUIView()
+        let view = FrameLayerUIView()
+        view.attach(video)
+        return view
     }
 
     func updateUIView(_ uiView: FrameLayerUIView, context: Context) {
+        uiView.attach(video)
         uiView.setImage(image)
     }
 }
@@ -418,6 +423,8 @@ private final class FrameLayerUIView: UIView {
     // Strong on purpose (CF types do not support weak references); the
     // layer holds the same image anyway.
     private var current: CGImage?
+    // Phase 5: the H.264 overlay whose layer is our sublayer.
+    private weak var overlay: VideoOverlay?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -430,6 +437,19 @@ private final class FrameLayerUIView: UIView {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
+    }
+
+    /// Host the overlay's layer (above the frame image, below the cursor).
+    func attach(_ video: VideoOverlay) {
+        guard video.layer.superlayer !== layer else { return }
+        layer.addSublayer(video.layer)
+        overlay = video
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        overlay?.layout(in: bounds)
     }
 
     func setImage(_ image: CGImage) {

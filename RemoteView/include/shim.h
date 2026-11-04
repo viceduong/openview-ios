@@ -21,6 +21,38 @@ typedef void (*ov_audio_sink)(void *user, const uint8_t *samples, size_t len);
 // Phase 4: one Opus packet (48 kHz mono, normally 20 ms) passed through
 // undecoded; `samples` = decoded sample count (960 for a 20 ms tick).
 typedef void (*ov_opus_sink)(void *user, const uint8_t *packet, size_t len, uint32_t samples);
+// Phase 5: one H.264 access unit for VideoToolbox (layout = ovffi
+// `OvVideoPacket`, #[repr(C)]). The picture (w x h, even) goes at (x, y) of
+// the screen_w x screen_h framebuffer the frame sink delivers. `data` is
+// AVCC: every NAL unit prefixed by its 4-byte big-endian length, parameter
+// sets / AUDs removed (CMSampleBuffer-ready, nalUnitHeaderLength 4). On a
+// keyframe (flags & OV_VIDEO_KEYFRAME) `sps` / `pps` are the raw parameter
+// set NAL units for CMVideoFormatDescriptionCreateFromH264ParameterSets;
+// otherwise NULL / 0. flags & OV_VIDEO_END: motion over, no picture — the
+// next frame-sink delivery is the lossless refresh; drop the overlay then.
+// pts_us = host capture time (us since the UNIX epoch). Every pointer is
+// valid only during the callback.
+#define OV_VIDEO_KEYFRAME 1u
+#define OV_VIDEO_END 2u
+typedef struct ov_video_packet {
+    uint64_t seq;
+    uint64_t pts_us;
+    uint32_t flags;
+    uint32_t x;
+    uint32_t y;
+    uint32_t w;
+    uint32_t h;
+    uint32_t screen_w;
+    uint32_t screen_h;
+    uint32_t reserved;
+    const uint8_t *sps;
+    size_t sps_len;
+    const uint8_t *pps;
+    size_t pps_len;
+    const uint8_t *data;
+    size_t data_len;
+} ov_video_packet;
+typedef void (*ov_video_sink)(void *user, const ov_video_packet *packet);
 typedef void (*ov_clipboard_sink)(void *user, uint8_t kind, const uint8_t *text, size_t len);
 typedef void (*ov_file_sink)(void *user, const char *name, const uint8_t *data, size_t len);
 
@@ -77,6 +109,14 @@ int32_t ov_screen_set_audio_sink(OvScreen *screen, void *user, ov_audio_sink sin
 // our CAPS advertise CAP_OPUS; the host then sends Opus packets here
 // instead of raw PCM to the audio sink.
 int32_t ov_screen_set_opus_sink(OvScreen *screen, void *user, ov_opus_sink sink);
+// Phase 5: installing a video sink (before the first ov_screen_feed, and
+// only when VideoToolbox can decode H.264) makes our CAPS advertise
+// CAP_H264; the host then streams high-motion regions as H.264 packets.
+int32_t ov_screen_set_video_sink(OvScreen *screen, void *user, ov_video_sink sink);
+// Phase 5: the shell's decoder failed — drop P-frames until the next IDR and
+// queue a VIDEO_IDR_REQUEST (sent via ov_screen_take_pong_reply). Never call
+// it from inside a sink (ov_screen_feed is still running): defer it.
+int32_t ov_screen_request_video_idr(OvScreen *screen);
 int32_t ov_screen_set_clipboard_sink(OvScreen *screen, void *user, ov_clipboard_sink sink);
 int32_t ov_screen_set_file_sink(OvScreen *screen, void *user, ov_file_sink sink);
 int32_t ov_screen_feed(OvScreen *screen, const uint8_t *data, size_t len);

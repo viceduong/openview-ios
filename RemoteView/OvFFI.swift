@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 // Swift RAII wrapper over the ovffi C surface. All protocol logic lives in
 // Rust; this type only marshals callbacks and owns the session lifetime.
@@ -237,6 +238,10 @@ final class OvScreenBox {
     /// packet and its decoded sample count (960 per 20 ms tick). Only
     /// after `enableOpus()` — which advertises CAP_OPUS to the host.
     var onOpus: ((Data, UInt32) -> Void)?
+    /// Fired on an H.264 access unit (Phase 5) — only after `enableVideo()`,
+    /// which advertises CAP_H264 to the host. Fires inside `feed` on the
+    /// session queue: never call back into this box synchronously from it.
+    var onVideo: ((RemoteVideoPacket) -> Void)?
     /// Fired on a CLIPBOARD command (v0.26) with the peer's clipboard
     /// payload: kind (0 = text) and the raw payload bytes.
     var onClipboard: ((UInt8, Data) -> Void)?
@@ -328,9 +333,42 @@ final class OvScreenBox {
         })
     }
 
+    /// Phase 5: install the H.264 video sink so our CAPS advertise CAP_H264
+    /// and a Phase 5 host streams high-motion regions as H.264 instead of
+    /// lossless tiles. Call before the first `feed` (CAPS go out once), and
+    /// only when VideoToolbox can decode H.264 (`H264SampleBuilder.available`).
+    func enableVideo() {
+        let unmanaged = Unmanaged.passUnretained(self)
+        ov_screen_set_video_sink(ptr, unmanaged.toOpaque(), { user, packet in
+            guard let user, let packet else { return }
+            let me = Unmanaged<OvScreenBox>.fromOpaque(user).takeUnretainedValue()
+            let p = packet.pointee
+            let pkt = RemoteVideoPacket(
+                seq: p.seq,
+                ptsUs: p.pts_us,
+                isKeyframe: (p.flags & 1) != 0,
+                isEnd: (p.flags & 2) != 0,
+                rect: CGRect(x: CGFloat(p.x), y: CGFloat(p.y),
+                             width: CGFloat(p.w), height: CGFloat(p.h)),
+                screenSize: CGSize(width: CGFloat(p.screen_w), height: CGFloat(p.screen_h)),
+                sps: RemoteVideoPacket.copy(p.sps, p.sps_len),
+                pps: RemoteVideoPacket.copy(p.pps, p.pps_len),
+                avcc: RemoteVideoPacket.copy(p.data, p.data_len))
+            me.onVideo?(pkt)
+        })
+    }
+
+    /// Phase 5: our decoder failed — skip P-frames until the next IDR and
+    /// queue a VIDEO_IDR_REQUEST (goes out with the next `takePongReply`).
+    /// Session queue only, and never from inside a sink.
+    func requestVideoIdr() {
+        ov_screen_request_video_idr(ptr)
+    }
+
     /// Drop every Swift-side callback (session teardown) so the closures —
     /// and whatever they capture — are released.
     func clearCallbacks() {
+        onVideo = nil
         onFrame = nil
         onCursor = nil
         onCursorShape = nil
