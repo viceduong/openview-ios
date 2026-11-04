@@ -3,18 +3,24 @@ import Network
 
 // Host-owned UDP datagram transport for direct/LAN connections. Outbound
 // datagrams come from the ovffi datagram sink (which fires on the pump
-// thread); inbound datagrams are forwarded to the caller on the main queue
-// so the session is only ever touched from the main thread (the pump timer
-// also runs there), avoiding re-entrancy with ov_session_pump.
+// thread); inbound datagrams are handed to the caller on `queue`. The
+// NWConnection itself runs on `queue` (the session queue, `OvQueues.session`)
+// so its callbacks already arrive there — no hop, and the session is only
+// ever touched from that one serial queue, avoiding re-entrancy with
+// ov_session_pump. All methods must be called on `queue`.
 final class NwUdpBridge {
     private let connection: NWConnection
     private var onReceive: ((Data) -> Void)?
     private var onState: ((NWConnection.State) -> Void)?
-    /// Datagrams queued before the connection reaches `.ready`.
+    /// Datagrams queued before the connection reaches `.ready` (bounded —
+    /// a peer that never answers must not grow this forever).
     private var pending: [Data] = []
-    private let stateLock = NSLock()
+    private static let maxPending = 256
+    private var isReady = false
+    private var closed = false
 
     init(host: String, port: UInt16,
+         queue: DispatchQueue,
          onReceive: @escaping (Data) -> Void,
          onState: @escaping (NWConnection.State) -> Void) {
         self.onReceive = onReceive
@@ -25,38 +31,39 @@ final class NwUdpBridge {
         connection = NWConnection(to: endpoint, using: params)
 
         connection.stateUpdateHandler = { [weak self] state in
-            // NWConnection callbacks arrive on its internal queue; marshal
-            // onto the main queue before touching the session.
-            DispatchQueue.main.async {
-                self?.handleState(state)
-            }
+            // Already on `queue` (the connection's queue).
+            self?.handleState(state)
         }
-        connection.start(queue: DispatchQueue(label: "ov.udp.bridge"))
+        connection.start(queue: queue)
     }
 
     /// Send one datagram to the peer. Buffers until the connection is ready.
     func send(_ data: Data) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if self.isReady {
-                self.sendNow(data)
-            } else {
-                self.pending.append(data)
-            }
+        guard !closed else { return }
+        if isReady {
+            sendNow(data)
+        } else if pending.count < Self.maxPending {
+            pending.append(data)
         }
     }
 
-    /// Cancel the connection; safe to call more than once.
+    /// Cancel the connection and drop the callbacks; safe to call more than
+    /// once.
     func close() {
+        guard !closed else { return }
+        closed = true
+        isReady = false
+        pending.removeAll()
+        onReceive = nil
+        onState = nil
         connection.cancel()
     }
-
-    private var isReady = false
 
     private func handleState(_ state: NWConnection.State) {
         onState?(state)
         switch state {
         case .ready:
+            guard !closed else { return }
             isReady = true
             for data in pending { sendNow(data) }
             pending.removeAll()
@@ -74,14 +81,11 @@ final class NwUdpBridge {
 
     private func receiveLoop() {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65535) { [weak self] content, _, _, error in
-            guard let self, error == nil else { return }
+            guard let self, !self.closed, error == nil else { return }
             if let content, !content.isEmpty {
-                let data = Data(content)
-                DispatchQueue.main.async { self.onReceive?(data) }
+                self.onReceive?(content)
             }
-            if error == nil {
-                self.receiveLoop() // keep receiving on the connection queue
-            }
+            self.receiveLoop() // keep receiving on the connection queue
         }
     }
 }

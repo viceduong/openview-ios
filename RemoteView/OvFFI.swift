@@ -2,8 +2,19 @@ import Foundation
 
 // Swift RAII wrapper over the ovffi C surface. All protocol logic lives in
 // Rust; this type only marshals callbacks and owns the session lifetime.
-// Sinks fire on whatever thread calls pump()/pumpRelay() — the app pumps
-// from a Timer on the main thread, so no extra synchronization is needed.
+// Sinks fire on whatever thread calls pump()/pumpRelay()/sendRecord() —
+// the app drives every session + screen call from `OvQueues.session` (a
+// background serial queue), so sinks fire there and UI work must hop to
+// main. The session sinks fire while Rust holds the session mutex: never
+// call back into the same session from inside a sink.
+
+/// The one serial queue that owns all session / screen / transport work.
+/// `OvScreen` has no lock of its own, so it must only be touched here; the
+/// WebSocket and UDP transports deliver inbound bytes here too, which keeps
+/// feed -> pump -> sink ordering trivially serialized.
+enum OvQueues {
+    static let session = DispatchQueue(label: "ov.session", qos: .userInteractive)
+}
 
 final class OvSessionBox {
     /// Marshals C callback user pointers back to this object.
@@ -13,6 +24,8 @@ final class OvSessionBox {
 
     enum FfiError: Int32, Error {
         case badArg = -1, wrongState = -2, crypto = -3, transport = -4
+        /// The relay connection closed (pumpRelay drained it to EOF).
+        case closed = -5
     }
 
     private let ptr: OpaquePointer
@@ -139,7 +152,9 @@ final class OvSessionBox {
         _ = ov_session_relay_eof(ptr)
     }
 
-    /// Poll the Rust-owned relay transport (use instead of `pump()`).
+    /// Poll the Rust-owned relay transport (use instead of `pump()`). Drains
+    /// every available tunnel frame per call; throws `.closed` once the
+    /// relay connection has reached EOF.
     func pumpRelay() throws {
         try check(ov_session_pump_relay(ptr))
     }
@@ -157,6 +172,16 @@ final class OvSessionBox {
             }
         }
         try check(rc)
+    }
+
+    /// Drop every Swift-side callback (session teardown). The C sinks stay
+    /// installed but become no-ops, and the closures — which capture the
+    /// session's owner — are released so nothing keeps this box alive.
+    func clearCallbacks() {
+        onDatagramOut = nil
+        onRecord = nil
+        onEstablished = nil
+        onRelayBytesOut = nil
     }
 
     private func check(_ rc: Int32) throws {
@@ -189,6 +214,8 @@ final class OvSessionBox {
 // frame sink back to a Swift closure. Feed it terminal-channel (channel 0)
 // record payloads; `onFrame` fires with the reassembled pixel buffer on
 // FRAME_END. Pixel reassembly stays in Rust (single source of truth).
+// `OvScreen` is NOT internally locked: call every method (feed, ticks,
+// takePongReply) from `OvQueues.session` only.
 final class OvScreenBox {
     /// Fired with (seq, width, height, stride, formatTag, pixels) on a complete frame.
     var onFrame: ((UInt64, UInt32, UInt32, UInt32, UInt8, Data) -> Void)?
@@ -203,7 +230,8 @@ final class OvScreenBox {
     /// (v0.18): each entry is (x, y, w, h, isPrimary).
     var onMonitors: (([(Int32, Int32, UInt32, UInt32, Bool)]) -> Void)?
     /// Fired on an AUDIO command (v0.21) with one 20 ms tick of s16le
-    /// 48 kHz mono PCM (960 samples).
+    /// 48 kHz mono PCM (960 samples). Sample bytes only — Rust strips the
+    /// audio frame header before the sink fires.
     var onAudio: ((Data) -> Void)?
     /// Fired on a CLIPBOARD command (v0.26) with the peer's clipboard
     /// payload: kind (0 = text) and the raw payload bytes.
@@ -280,6 +308,19 @@ final class OvScreenBox {
 
     deinit {
         ov_screen_free(ptr)
+    }
+
+    /// Drop every Swift-side callback (session teardown) so the closures —
+    /// and whatever they capture — are released.
+    func clearCallbacks() {
+        onFrame = nil
+        onCursor = nil
+        onCursorShape = nil
+        onLiveness = nil
+        onMonitors = nil
+        onAudio = nil
+        onClipboard = nil
+        onFile = nil
     }
 
     /// Ask the Rust keepalive whether a PING is due (`nowMs` = shell

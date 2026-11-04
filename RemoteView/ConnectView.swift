@@ -96,6 +96,9 @@ struct ConnectView: View {
 
     private func connect() {
         errorText = nil
+        // Drop any transport left over from an earlier attempt that never
+        // reached SessionView, so it cannot leak into this session.
+        DirectTransport.reset()
         do {
             // Unattended path (v0.22): a device ID + PIN connects with PIN
             // auth, no pairing. Otherwise the pairing-code path as before.
@@ -124,7 +127,7 @@ struct ConnectView: View {
                     try connectWebSocket(s, url: url, sessionID: UInt32(truncatingIfNeeded: devId))
                 case .direct:
                     // Create the Datagram carrier. The real outbound sink
-                    // (NwUdpBridge) is installed by SessionView.start() before
+                    // (NwUdpBridge) is installed by SessionController.start() before
                     // pumping, so a placeholder closure is enough here.
                     try s.setDatagramSink { _ in }
                 }
@@ -153,7 +156,7 @@ struct ConnectView: View {
             case .relayWebSocket(let url):
                 try connectWebSocket(s, url: url, sessionID: OvSessionBox.relaySessionID(code: peerCode))
             case .direct:
-                // Create the Datagram carrier; SessionView.start() installs the
+                // Create the Datagram carrier; SessionController.start() installs the
                 // real outbound sink (NwUdpBridge) before pumping.
                 try s.setDatagramSink { _ in }
             }
@@ -162,6 +165,10 @@ struct ConnectView: View {
             // Hand the chosen transport to SessionView (direct mode dials there).
             DirectTransport.pending = mode
         } catch {
+            // begin()/beginPin() (or a later step) failed after the
+            // WebSocket may already have been opened: close it and clear
+            // the hand-off statics so no orphaned socket lingers.
+            DirectTransport.reset()
             errorText = "Connect failed: \(error)"
         }
     }
@@ -187,7 +194,9 @@ extension ConnectView {
     /// out right away (URLSession queues it until the socket is open).
     /// SessionView picks the socket up from `DirectTransport.webSocket`.
     func connectWebSocket(_ s: OvSessionBox, url: URL, sessionID: UInt32) throws {
-        let ws = RelayWebSocket(url: url)
+        // Inbound messages are delivered on the session queue, where
+        // SessionController pumps.
+        let ws = RelayWebSocket(url: url, queue: OvQueues.session)
         do {
             try s.relayConnectStream(sessionID: sessionID) { [weak ws] data in ws?.send(data) }
         } catch {
@@ -220,9 +229,17 @@ final class PairingStateBox {
 }
 
 /// Transport choice handed from ConnectView to SessionView. Set right before
-/// navigation; SessionView consumes it in `start()` and clears it.
+/// navigation; SessionController consumes both in `start()` and clears them
+/// (for every mode, relay included). Main thread only.
 enum DirectTransport {
     static var pending: ConnectMode?
     /// The open WebSocket of a `.relayWebSocket` session.
     static var webSocket: RelayWebSocket?
+
+    /// Close any un-adopted WebSocket and clear the hand-off.
+    static func reset() {
+        webSocket?.close()
+        webSocket = nil
+        pending = nil
+    }
 }
