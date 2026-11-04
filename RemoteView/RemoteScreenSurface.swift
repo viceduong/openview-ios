@@ -1,0 +1,1283 @@
+import Combine
+import QuartzCore
+import SwiftUI
+import UIKit
+
+// The remote screen surface (section 2): frame + H.264 overlay inside one
+// zoom/pan-transformed container layer, a locally drawn cursor, the touch /
+// pointer / keyboard input layer and the viewport. Self-contained so the
+// immersive session (section 3) can re-host it.
+//
+// Gestures (constants from Chrome Remote Desktop iOS):
+//
+//   MOUSE (trackpad) mode
+//     1-finger pan        relative cursor move (gain 1x -> 2.5x with speed),
+//                         viewport edge-push follows the cursor
+//     tap                 left click at the cursor (2nd tap = double click)
+//     tap, then hold/drag left drag (DOWN at 0.15 s, UP on lift) + ring
+//     long-press 0.45 s   right click
+//     2-finger tap        right click; 3-finger tap: middle click
+//     2-finger pan        wheel (natural direction) + inertia (T = 250 ms)
+//     pinch               zoom around the cursor
+//     2-finger double-tap fit <-> 1:1 around the cursor
+//   TOUCH (direct) mode
+//     tap                 left click at the finger (+ ripple)
+//     long-press          loupe; lift = right click, drag = left drag
+//     1-finger pan        pan the zoomed view
+//     2-finger pan        wheel at the fingers (scaled by zoom)
+//     pinch               zoom at the fingers (and pan with them)
+//   iPad pointer: hover = absolute move, clicks / right clicks via indirect
+//   pointer touches, trackpad / wheel scroll = WHEEL, optional raw GCMouse
+//   deltas while the pointer is locked.
+//
+// Every DOWN gets its UP: positions are clamped to the frame (never
+// dropped) and cancelled / failed gestures release what they pressed.
+
+/// SwiftUI wrapper. The parent observes ScreenModel and passes values in.
+struct RemoteScreenSurface: UIViewRepresentable {
+    let image: CGImage
+    let frameSize: CGSize
+    let video: VideoOverlay
+    let cursorPos: CGPoint?
+    let cursorImage: CGImage?
+    let cursorHotspot: CGSize
+    let cursorSize: CGSize
+    let input: RemoteInputController
+
+    func makeUIView(context: Context) -> RemoteSurfaceView {
+        let view = RemoteSurfaceView(input: input)
+        view.attachVideo(video)
+        return view
+    }
+
+    func updateUIView(_ uiView: RemoteSurfaceView, context: Context) {
+        uiView.attachVideo(video)
+        uiView.setFrame(image, size: frameSize)
+        uiView.setCursorShape(cursorImage, hotspot: cursorHotspot, size: cursorSize)
+        if let p = cursorPos {
+            uiView.hostCursorMoved(to: p)
+        }
+    }
+
+    static func dismantleUIView(_ uiView: RemoteSurfaceView, coordinator: ()) {
+        uiView.teardown()
+    }
+}
+
+// MARK: - Fling
+
+/// CRD FlingTracker: exponential decay x(t) = T·v0·(1 − e^(−t/T)), stops
+/// when the speed falls below 0.01 pt/ms (duration = −T·ln(0.01/v0)); no
+/// fling when the total displacement would be under 20 pt.
+struct FlingTracker {
+    /// Time constant, ms.
+    let timeConstant: Double
+    private var speed: Double = 0 // pt/ms
+    private var ratioX: Double = 0
+    private var ratioY: Double = 0
+    private var duration: Double = 0 // ms
+    private var startTime: CFTimeInterval = 0
+    private var prevX: Double = 0
+    private var prevY: Double = 0
+
+    private static let minSpeed = 0.01
+    private static let minDisplacement = 20.0
+
+    init(timeConstant: Double) {
+        self.timeConstant = timeConstant
+    }
+
+    var isActive: Bool { speed > 0 }
+
+    /// Start from a release velocity in points per second.
+    mutating func start(velocity v: CGPoint, now: CFTimeInterval) {
+        let vx = Double(v.x) / 1000
+        let vy = Double(v.y) / 1000
+        let s = (vx * vx + vy * vy).squareRoot()
+        guard s.isFinite, s >= Self.minSpeed else {
+            stop()
+            return
+        }
+        let dur = -timeConstant * log(Self.minSpeed / s)
+        let total = timeConstant * s * -expm1(-dur / timeConstant)
+        guard total >= Self.minDisplacement else {
+            stop()
+            return
+        }
+        speed = s
+        ratioX = vx / s
+        ratioY = vy / s
+        duration = dur
+        startTime = now
+        prevX = 0
+        prevY = 0
+    }
+
+    mutating func stop() {
+        speed = 0
+    }
+
+    /// The displacement (points) since the previous step; nil when done.
+    mutating func step(now: CFTimeInterval) -> CGPoint? {
+        guard speed > 0 else { return nil }
+        let t = max(0, (now - startTime) * 1000)
+        if t > duration {
+            speed = 0
+            return nil
+        }
+        let d = timeConstant * speed * -expm1(-t / timeConstant)
+        let x = d * ratioX
+        let y = d * ratioY
+        let out = CGPoint(x: x - prevX, y: y - prevY)
+        prevX = x
+        prevY = y
+        return out
+    }
+}
+
+// MARK: - Surface view
+
+final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCommandTarget {
+    let input: RemoteInputController
+    let keyRouter: HardwareKeyRouter
+    let keyInput: RemoteKeyInputView
+
+    // ---- layers ----
+    /// Zoom/pan-transformed container: bounds = frame pixels, transform =
+    /// scale (points per pixel), position = view offset of the frame origin.
+    private let container = CALayer()
+    private let frameLayer = CALayer()
+    private weak var video: VideoOverlay?
+    private let cursorLayer = CALayer()
+    private let dragRing = CAShapeLayer()
+    private let loupe = CALayer()
+    private let loupeDot = CALayer()
+
+    // ---- frame / cursor shape ----
+    private var image: CGImage?
+    private var frameSize: CGSize = .zero
+    private var cursorImage: CGImage?
+    private var cursorHotspot: CGSize = .zero
+    private var cursorPixelSize: CGSize = .zero
+    private var shownCursorImage: CGImage?
+    private var lastHostCursor: CGPoint?
+
+    // ---- viewport ----
+    /// Points per remote pixel (0 until laid out with a frame).
+    private var scale: CGFloat = 0
+    /// View position of the frame's top-left corner.
+    private var offset: CGPoint = .zero
+    /// Stay at fit when the view / frame size changes.
+    private var followFit = true
+    private var lastBoundsSize: CGSize = .zero
+
+    // ---- gestures ----
+    private let tap1 = UITapGestureRecognizer(target: nil, action: nil)
+    private let tap2 = UITapGestureRecognizer(target: nil, action: nil)
+    private let tap3 = UITapGestureRecognizer(target: nil, action: nil)
+    private let tap2Double = UITapGestureRecognizer(target: nil, action: nil)
+    private let pan1 = UIPanGestureRecognizer(target: nil, action: nil)
+    private let pan2 = UIPanGestureRecognizer(target: nil, action: nil)
+    private let pinch = UIPinchGestureRecognizer(target: nil, action: nil)
+    private let longPress = UILongPressGestureRecognizer(target: nil, action: nil)
+    private let holdDrag = UILongPressGestureRecognizer(target: nil, action: nil)
+    private let hover = UIHoverGestureRecognizer(target: nil, action: nil)
+    private let scrollContinuous = UIPanGestureRecognizer(target: nil, action: nil)
+    private let scrollDiscrete = UIPanGestureRecognizer(target: nil, action: nil)
+
+    private let haptic = UIImpactFeedbackGenerator(style: .medium)
+    private let pointerHider = PointerHider()
+    private let gcMouse = GCMouseBridge()
+    private var cancellables = Set<AnyCancellable>()
+
+    /// Mouse mode: a tap-then-hold drag holds the left button.
+    private var dragActive = false
+    private var lastDragEnd: CFTimeInterval = 0
+    /// Touch mode long-press state.
+    private var lpActive = false
+    private var lpDragging = false
+    private var lpStartView: CGPoint = .zero
+    private var lpStartFrame: CGPoint = .zero
+    /// Touch mode: the previous tap, so a double tap clicks twice at the
+    /// same remote pixel (Windows' double-click tolerance is tiny).
+    private var lastTouchTap: (time: CFTimeInterval, view: CGPoint, frame: CGPoint)?
+    /// Touch mode pinch: previous centroid (pan with the fingers).
+    private var lastPinchCentroid: CGPoint?
+    /// Indirect pointer touch -> the button it pressed.
+    private var pointerButtons: [ObjectIdentifier: MouseButton] = [:]
+
+    // ---- animation ----
+    private var cursorFling = FlingTracker(timeConstant: 180)
+    private var scrollFling = FlingTracker(timeConstant: 250)
+    private var scrollFlingFactor: CGFloat = 0
+    private lazy var animTicker = FrameTicker { [weak self] now in
+        self?.animate(now)
+    }
+
+    // ---- constants ----
+    private static let cursorMinPoints: CGFloat = 20
+    private static let cursorMaxPoints: CGFloat = 64
+    private static let edgeMargin: CGFloat = 0.13
+    /// Wheel units (1/120 notch) per point of two-finger travel: one
+    /// notch per 36 pt.
+    private static let wheelUnitsPerPoint: CGFloat = 120.0 / 36.0
+    /// Max zoom: one remote pixel = 6 device pixels.
+    private static let maxDevicePixelsPerRemotePixel: CGFloat = 6
+    private static let loupeDiameter: CGFloat = 100
+    private static let loupeMagnification: CGFloat = 2
+    private static let loupeOffset: CGFloat = 80
+    private static let defaultCursorSize = CGSize(width: 12, height: 19)
+
+    private static let noActions: [String: CAAction] = [
+        "position": NSNull(), "bounds": NSNull(), "frame": NSNull(), "transform": NSNull(),
+        "contents": NSNull(), "contentsRect": NSNull(), "hidden": NSNull(), "anchorPoint": NSNull(),
+        "opacity": NSNull(), "sublayers": NSNull(), "path": NSNull(),
+    ]
+
+    init(input: RemoteInputController) {
+        self.input = input
+        let router = HardwareKeyRouter()
+        self.keyRouter = router
+        self.keyInput = RemoteKeyInputView(input: input, router: router)
+        super.init(frame: .zero)
+        backgroundColor = .black
+        clipsToBounds = true
+        isMultipleTouchEnabled = true
+        keyRouter.input = input
+        setupLayers()
+        addSubview(keyInput)
+        setupGestures()
+        addInteraction(UIPointerInteraction(delegate: pointerHider))
+        setupPointerLock()
+        input.$mode
+            .sink { [weak self] mode in self?.applyMode(mode) }
+            .store(in: &cancellables)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    // MARK: Setup
+
+    private func setupLayers() {
+        container.anchorPoint = .zero
+        container.actions = Self.noActions
+        frameLayer.actions = Self.noActions
+        frameLayer.contentsGravity = .resize
+        frameLayer.magnificationFilter = .linear
+        frameLayer.minificationFilter = .trilinear
+        frameLayer.backgroundColor = UIColor.black.cgColor
+        container.addSublayer(frameLayer)
+        layer.addSublayer(container)
+
+        cursorLayer.actions = Self.noActions
+        cursorLayer.contentsGravity = .resize
+        cursorLayer.magnificationFilter = .nearest
+        cursorLayer.isHidden = true
+        layer.addSublayer(cursorLayer)
+
+        let r: CGFloat = 16
+        dragRing.actions = Self.noActions
+        dragRing.path = UIBezierPath(ovalIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)).cgPath
+        dragRing.fillColor = UIColor.systemBlue.withAlphaComponent(0.15).cgColor
+        dragRing.strokeColor = UIColor.systemBlue.cgColor
+        dragRing.lineWidth = 2.5
+        dragRing.isHidden = true
+        layer.addSublayer(dragRing)
+
+        let d = Self.loupeDiameter
+        loupe.actions = Self.noActions
+        loupe.bounds = CGRect(x: 0, y: 0, width: d, height: d)
+        loupe.cornerRadius = d / 2
+        loupe.masksToBounds = true
+        loupe.borderWidth = 2
+        loupe.borderColor = UIColor.white.cgColor
+        loupe.backgroundColor = UIColor.black.cgColor
+        loupe.contentsGravity = .resize
+        loupe.magnificationFilter = .linear
+        loupe.isHidden = true
+        loupeDot.actions = Self.noActions
+        loupeDot.bounds = CGRect(x: 0, y: 0, width: 6, height: 6)
+        loupeDot.cornerRadius = 3
+        loupeDot.backgroundColor = UIColor.systemRed.cgColor
+        loupeDot.position = CGPoint(x: d / 2, y: d / 2)
+        loupe.addSublayer(loupeDot)
+        layer.addSublayer(loupe)
+    }
+
+    private func setupGestures() {
+        // Touch recognizers ignore indirect pointer touches (handled in
+        // touchesBegan with the button mask) and never cancel touches, so
+        // touchesEnded keeps the "finger down" state exact.
+        let touchTypes: [NSNumber] = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.pencil.rawValue),
+        ]
+
+        tap1.addTarget(self, action: #selector(handleTap1(_:)))
+        tap2.addTarget(self, action: #selector(handleTap2(_:)))
+        tap2.numberOfTouchesRequired = 2
+        tap3.addTarget(self, action: #selector(handleTap3(_:)))
+        tap3.numberOfTouchesRequired = 3
+        tap2Double.addTarget(self, action: #selector(handleTap2Double(_:)))
+        tap2Double.numberOfTouchesRequired = 2
+        tap2Double.numberOfTapsRequired = 2
+        pan1.addTarget(self, action: #selector(handlePan1(_:)))
+        pan1.minimumNumberOfTouches = 1
+        pan1.maximumNumberOfTouches = 1
+        pan2.addTarget(self, action: #selector(handleScroll(_:)))
+        pan2.minimumNumberOfTouches = 2
+        pan2.maximumNumberOfTouches = 2
+        pinch.addTarget(self, action: #selector(handlePinch(_:)))
+        longPress.addTarget(self, action: #selector(handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.45
+        longPress.allowableMovement = 10
+        // Tap, then touch again and hold 0.15 s (moving or not) = drag.
+        holdDrag.addTarget(self, action: #selector(handleHoldDrag(_:)))
+        holdDrag.numberOfTapsRequired = 1
+        holdDrag.minimumPressDuration = 0.15
+        holdDrag.allowableMovement = 10_000
+
+        let touchRecognizers: [UIGestureRecognizer] = [
+            tap1, tap2, tap3, tap2Double, pan1, pan2, pinch, longPress, holdDrag,
+        ]
+        for g in touchRecognizers {
+            g.delegate = self
+            g.cancelsTouchesInView = false
+            g.allowedTouchTypes = touchTypes
+            addGestureRecognizer(g)
+        }
+
+        // Recognizer wiring (CRD): single tap waits for the two-finger tap
+        // to fail, two-finger tap for the three-finger tap (and for the
+        // two-finger double tap); pinch and the one-finger pan wait for the
+        // single tap (a tap fails as soon as the finger moves, so pans are
+        // not delayed noticeably).
+        tap1.require(toFail: tap2)
+        tap2.require(toFail: tap3)
+        tap2.require(toFail: tap2Double)
+        pinch.require(toFail: tap1)
+        pan1.require(toFail: tap1)
+
+        // iPad pointer: hover = absolute moves; scroll-only pans (no
+        // touches) = wheel. Trackpads scroll continuously (inertia on
+        // release), mouse wheels in discrete steps (no inertia).
+        hover.addTarget(self, action: #selector(handleHover(_:)))
+        hover.delegate = self
+        addGestureRecognizer(hover)
+        scrollContinuous.addTarget(self, action: #selector(handleScroll(_:)))
+        scrollContinuous.allowedScrollTypesMask = .continuous
+        scrollContinuous.allowedTouchTypes = []
+        scrollContinuous.delegate = self
+        addGestureRecognizer(scrollContinuous)
+        scrollDiscrete.addTarget(self, action: #selector(handleScroll(_:)))
+        scrollDiscrete.allowedScrollTypesMask = .discrete
+        scrollDiscrete.allowedTouchTypes = []
+        scrollDiscrete.delegate = self
+        addGestureRecognizer(scrollDiscrete)
+    }
+
+    private func setupPointerLock() {
+        gcMouse.isLocked = { [weak self] in
+            self?.pointerLocked ?? false
+        }
+        gcMouse.onMove = { [weak self] dx, dy in
+            guard let self else { return }
+            self.input.moveCursorRelative(by: CGPoint(x: dx, y: dy), raw: true)
+            self.updateCursorLayer()
+        }
+        gcMouse.onButton = { [weak self] button, pressed in
+            guard let self else { return }
+            if pressed {
+                self.input.buttonDown(button)
+            } else {
+                self.input.buttonUp(button)
+            }
+        }
+    }
+
+    /// The scene's pointer is locked (pointer-lock setting on, iPad,
+    /// full-screen, and the hosting controller asked for it).
+    private var pointerLocked: Bool {
+        guard input.pointerLockEnabled else { return false }
+        return window?.windowScene?.pointerLockState?.isLocked ?? false
+    }
+
+    /// Hook the controller's view-side callbacks to this surface.
+    private func installInputHooks() {
+        input.keyboardPresenter = { [weak self] soft in
+            self?.presentKeyboard(soft)
+        }
+        input.onReleaseAll = { [weak self] in
+            self?.keyRouter.reset()
+        }
+        input.onCursorResync = { [weak self] in
+            self?.updateCursorLayer()
+        }
+        input.activeSurface = self
+    }
+
+    /// Session view gone: stop timers, release held pointer buttons and
+    /// unhook from the controller (only if still the active surface).
+    func teardown() {
+        animTicker.stop()
+        gcMouse.stop()
+        releasePointerButtons()
+        endLocalGestures()
+        cancellables.removeAll()
+        if input.activeSurface === self {
+            input.keyboardPresenter = nil
+            input.onReleaseAll = nil
+            input.onCursorResync = nil
+            input.activeSurface = nil
+        }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            animTicker.stop()
+            gcMouse.stop()
+            releasePointerButtons()
+            endLocalGestures()
+            input.touching = false
+        } else {
+            installInputHooks()
+            if input.pointerLockEnabled {
+                gcMouse.start()
+            }
+            // Hardware keyboard input without showing any keyboard.
+            DispatchQueue.main.async { [weak self] in
+                self?.claimKeyboardFocus()
+            }
+        }
+    }
+
+    private func applyMode(_ mode: InputMode) {
+        // Disabling an active recognizer cancels it (its handler releases
+        // whatever it pressed).
+        holdDrag.isEnabled = mode == .mouse
+        endLocalGestures()
+        cursorFling.stop()
+        scrollFling.stop()
+    }
+
+    /// Drop transient gesture UI / held buttons (mode switch, teardown).
+    private func endLocalGestures() {
+        if dragActive {
+            dragActive = false
+            input.buttonUp(.left)
+            setDragRingVisible(false)
+        }
+        if lpActive {
+            lpActive = false
+            if lpDragging { input.buttonUp(.left) }
+            lpDragging = false
+            hideLoupe()
+        }
+    }
+
+    private func releasePointerButtons() {
+        for b in pointerButtons.values {
+            input.buttonUp(b)
+        }
+        pointerButtons.removeAll()
+    }
+
+    // MARK: Model updates
+
+    /// Host the H.264 overlay's layer inside the transformed container
+    /// (above the frame image), so it zooms / pans with it.
+    func attachVideo(_ overlay: VideoOverlay) {
+        guard overlay.layer.superlayer !== container else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        container.addSublayer(overlay.layer)
+        CATransaction.commit()
+        video = overlay
+        if frameSize.width > 0 {
+            overlay.layout(in: container.bounds)
+        }
+    }
+
+    func setFrame(_ img: CGImage, size: CGSize) {
+        if size != frameSize && size.width > 0 && size.height > 0 {
+            frameSize = size
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            container.bounds = CGRect(origin: .zero, size: size)
+            frameLayer.frame = container.bounds
+            CATransaction.commit()
+            video?.layout(in: container.bounds)
+            input.frameSize = size
+            followFit = true
+            refit()
+        }
+        if img !== image {
+            image = img
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            frameLayer.contents = img
+            if !loupe.isHidden { loupe.contents = img }
+            CATransaction.commit()
+        }
+    }
+
+    func setCursorShape(_ img: CGImage?, hotspot: CGSize, size: CGSize) {
+        guard img !== cursorImage || hotspot != cursorHotspot || size != cursorPixelSize else { return }
+        cursorImage = img
+        cursorHotspot = hotspot
+        cursorPixelSize = size
+        updateCursorLayer()
+    }
+
+    /// The host's cursor moved (frame pixels). The controller ignores it
+    /// while local input is in flight.
+    func hostCursorMoved(to p: CGPoint) {
+        guard p != lastHostCursor else { return }
+        lastHostCursor = p
+        if input.hostCursorMoved(to: p) {
+            updateCursorLayer()
+        }
+    }
+
+    // MARK: Viewport
+
+    private var displayScale: CGFloat {
+        let s = traitCollection.displayScale
+        return s > 0 ? s : UIScreen.main.scale
+    }
+
+    /// Scale that fits the whole frame (letterboxed).
+    private var fitScale: CGFloat {
+        guard frameSize.width > 0, frameSize.height > 0,
+              bounds.width > 0, bounds.height > 0 else { return 0 }
+        return min(bounds.width / frameSize.width, bounds.height / frameSize.height)
+    }
+
+    private var maxScale: CGFloat {
+        max(fitScale, Self.maxDevicePixelsPerRemotePixel / displayScale)
+    }
+
+    /// Zoom relative to fit (1 = fit).
+    private var zoomFactor: CGFloat {
+        let f = fitScale
+        return f > 0 && scale > 0 ? scale / f : 1
+    }
+
+    private func clampScale(_ s: CGFloat) -> CGFloat {
+        guard s.isFinite else { return fitScale }
+        return min(max(s, fitScale), maxScale)
+    }
+
+    /// Keep the content inside the view (centered on axes where it is
+    /// smaller than the view).
+    private func clampOffset() {
+        let cw = frameSize.width * scale
+        let ch = frameSize.height * scale
+        if cw <= bounds.width {
+            offset.x = (bounds.width - cw) / 2
+        } else {
+            offset.x = min(0, max(bounds.width - cw, offset.x))
+        }
+        if ch <= bounds.height {
+            offset.y = (bounds.height - ch) / 2
+        } else {
+            offset.y = min(0, max(bounds.height - ch, offset.y))
+        }
+    }
+
+    /// View or frame size changed.
+    private func refit() {
+        let f = fitScale
+        guard f > 0 else { return }
+        if followFit || scale <= 0 {
+            scale = f
+            followFit = true
+        } else {
+            scale = clampScale(scale)
+        }
+        clampOffset()
+        applyViewport()
+    }
+
+    private func applyViewport() {
+        guard scale > 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        container.position = offset
+        container.transform = CATransform3DMakeScale(scale, scale, 1)
+        // Crisp pixels when strongly magnified, smooth otherwise.
+        frameLayer.magnificationFilter = scale * displayScale >= 3 ? .nearest : .linear
+        CATransaction.commit()
+        updateCursorLayer()
+    }
+
+    /// Zoom by `factor` keeping the view point `pivot` fixed.
+    private func zoom(by factor: CGFloat, pivot: CGPoint) {
+        guard scale > 0, factor.isFinite, factor > 0 else { return }
+        let newScale = clampScale(scale * factor)
+        let fx = (pivot.x - offset.x) / scale
+        let fy = (pivot.y - offset.y) / scale
+        scale = newScale
+        offset = CGPoint(x: pivot.x - fx * newScale, y: pivot.y - fy * newScale)
+        followFit = abs(newScale - fitScale) < 0.0001
+        clampOffset()
+        applyViewport()
+    }
+
+    private func panViewport(by t: CGPoint) {
+        guard scale > 0 else { return }
+        offset.x += t.x
+        offset.y += t.y
+        clampOffset()
+        applyViewport()
+    }
+
+    /// Two-finger double tap: fit <-> 1:1 (one remote pixel = one device
+    /// pixel; 2x fit when 1:1 would not be bigger than fit), centered on
+    /// the frame point `fp`.
+    private func toggleZoom(around fp: CGPoint) {
+        let f = fitScale
+        guard f > 0 else { return }
+        let target: CGFloat
+        if scale > f * 1.05 {
+            target = f
+        } else {
+            let oneToOne = 1 / displayScale
+            target = oneToOne > f * 1.05 ? oneToOne : f * 2
+        }
+        scale = clampScale(target)
+        followFit = abs(scale - f) < 0.0001
+        offset = CGPoint(x: bounds.width / 2 - fp.x * scale, y: bounds.height / 2 - fp.y * scale)
+        clampOffset()
+        applyViewport()
+    }
+
+    /// Mouse mode: pan the zoomed view so the cursor stays out of the
+    /// outer 13% band.
+    private func edgePush() {
+        guard scale > 0, bounds.width > 0, bounds.height > 0 else { return }
+        let cw = frameSize.width * scale
+        let ch = frameSize.height * scale
+        guard cw > bounds.width + 0.5 || ch > bounds.height + 0.5 else { return }
+        let v = frameToView(input.cursor)
+        let mx = bounds.width * Self.edgeMargin
+        let my = bounds.height * Self.edgeMargin
+        var dx: CGFloat = 0
+        var dy: CGFloat = 0
+        if v.x < mx { dx = mx - v.x } else if v.x > bounds.width - mx { dx = bounds.width - mx - v.x }
+        if v.y < my { dy = my - v.y } else if v.y > bounds.height - my { dy = bounds.height - my - v.y }
+        guard dx != 0 || dy != 0 else { return }
+        offset.x += dx
+        offset.y += dy
+        clampOffset()
+        applyViewport()
+    }
+
+    /// View point -> frame pixel, clamped to the frame.
+    func viewToFrame(_ p: CGPoint) -> CGPoint {
+        guard scale > 0, frameSize.width > 0, frameSize.height > 0 else { return .zero }
+        let x = (p.x - offset.x) / scale
+        let y = (p.y - offset.y) / scale
+        return CGPoint(x: min(max(x, 0), frameSize.width - 1),
+                       y: min(max(y, 0), frameSize.height - 1))
+    }
+
+    /// Frame pixel -> view point.
+    func frameToView(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: offset.x + p.x * scale, y: offset.y + p.y * scale)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if bounds.size != lastBoundsSize {
+            lastBoundsSize = bounds.size
+            refit()
+        }
+    }
+
+    // MARK: Cursor
+
+    private static let defaultCursor: CGImage? = {
+        let size = RemoteSurfaceView.defaultCursorSize
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 3
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        let img = renderer.image { _ in
+            let p = UIBezierPath()
+            p.move(to: CGPoint(x: 0.75, y: 0.75))
+            p.addLine(to: CGPoint(x: 0.75, y: 15.5))
+            p.addLine(to: CGPoint(x: 4.5, y: 12))
+            p.addLine(to: CGPoint(x: 7, y: 18))
+            p.addLine(to: CGPoint(x: 9.25, y: 17))
+            p.addLine(to: CGPoint(x: 6.75, y: 11.25))
+            p.addLine(to: CGPoint(x: 11.25, y: 11.25))
+            p.close()
+            UIColor.white.setFill()
+            p.fill()
+            UIColor.black.setStroke()
+            p.lineWidth = 1
+            p.stroke()
+        }
+        return img.cgImage
+    }()
+
+    /// Draw the cursor at the predicted position: hotspot-anchored, scaled
+    /// with the zoom but at least `cursorMinPoints` (and at most
+    /// `cursorMaxPoints`) for its larger side.
+    private func updateCursorLayer() {
+        guard frameSize.width > 0, scale > 0, input.hasCursor else {
+            if !cursorLayer.isHidden {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                cursorLayer.isHidden = true
+                CATransaction.commit()
+            }
+            return
+        }
+        let img: CGImage?
+        let px: CGSize
+        let hs: CGSize
+        if let c = cursorImage, cursorPixelSize.width > 0, cursorPixelSize.height > 0 {
+            img = c
+            px = cursorPixelSize
+            hs = cursorHotspot
+        } else {
+            img = Self.defaultCursor
+            px = Self.defaultCursorSize
+            hs = .zero
+        }
+        let maxDim = max(px.width, px.height)
+        var s = scale
+        if maxDim * s < Self.cursorMinPoints { s = Self.cursorMinPoints / maxDim }
+        if maxDim * s > Self.cursorMaxPoints { s = Self.cursorMaxPoints / maxDim }
+        let pos = frameToView(input.cursor)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if img !== shownCursorImage {
+            shownCursorImage = img
+            cursorLayer.contents = img
+        }
+        cursorLayer.isHidden = img == nil
+        cursorLayer.bounds = CGRect(x: 0, y: 0, width: px.width * s, height: px.height * s)
+        cursorLayer.anchorPoint = CGPoint(x: min(max(hs.width / px.width, 0), 1),
+                                          y: min(max(hs.height / px.height, 0), 1))
+        cursorLayer.position = pos
+        dragRing.position = pos
+        CATransaction.commit()
+    }
+
+    /// Trackpad motion of `d` view points -> relative cursor move.
+    private func moveCursor(byViewPoints d: CGPoint) {
+        guard scale > 0 else { return }
+        input.moveCursorRelative(by: CGPoint(x: d.x / scale, y: d.y / scale))
+        edgePush()
+        updateCursorLayer()
+    }
+
+    /// Pointer acceleration: 1x below 0.5 pt/ms, smoothstep up to 2.5x at
+    /// 1.5 pt/ms and above.
+    private static func pointerGain(speedPtPerMs speed: CGFloat) -> CGFloat {
+        guard speed.isFinite else { return 1 }
+        let t = min(max(speed - 0.5, 0), 1)
+        return 1 + 1.5 * t * t * (3 - 2 * t)
+    }
+
+    private func setDragRingVisible(_ visible: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dragRing.isHidden = !visible
+        dragRing.position = frameToView(input.cursor)
+        CATransaction.commit()
+    }
+
+    // MARK: Feedback layers
+
+    /// Touch-mode tap feedback: an expanding, fading circle.
+    private func ripple(at p: CGPoint) {
+        let r: CGFloat = 22
+        let ring = CAShapeLayer()
+        ring.path = UIBezierPath(ovalIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)).cgPath
+        ring.fillColor = UIColor.white.withAlphaComponent(0.3).cgColor
+        ring.strokeColor = UIColor.white.withAlphaComponent(0.9).cgColor
+        ring.lineWidth = 2
+        ring.opacity = 0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        ring.position = p
+        layer.insertSublayer(ring, below: cursorLayer)
+        CATransaction.commit()
+
+        let grow = CABasicAnimation(keyPath: "transform.scale")
+        grow.fromValue = 0.4
+        grow.toValue = 1.3
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1.0
+        fade.toValue = 0.0
+        let group = CAAnimationGroup()
+        group.animations = [grow, fade]
+        group.duration = 0.35
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        CATransaction.begin()
+        CATransaction.setCompletionBlock {
+            ring.removeFromSuperlayer()
+        }
+        ring.add(group, forKey: "ripple")
+        CATransaction.commit()
+    }
+
+    /// Touch-mode loupe: ~2x of the frame around the finger, 80 pt above
+    /// it (below when too close to the top). Shows the tile frame (not the
+    /// H.264 overlay).
+    private func showLoupe(at p: CGPoint) {
+        guard let img = image, frameSize.width > 0, frameSize.height > 0, scale > 0 else { return }
+        let fx = (p.x - offset.x) / scale
+        let fy = (p.y - offset.y) / scale
+        let region = Self.loupeDiameter / (scale * Self.loupeMagnification)
+        let rect = CGRect(x: (fx - region / 2) / frameSize.width,
+                          y: (fy - region / 2) / frameSize.height,
+                          width: region / frameSize.width,
+                          height: region / frameSize.height)
+        let half = Self.loupeDiameter / 2
+        var center = CGPoint(x: p.x, y: p.y - Self.loupeOffset)
+        if center.y - half < 0 { center.y = p.y + Self.loupeOffset }
+        center.x = min(max(center.x, half), max(half, bounds.width - half))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if loupe.isHidden || loupe.contents == nil {
+            loupe.contents = img
+        }
+        loupe.contentsRect = rect
+        loupe.position = center
+        loupe.isHidden = false
+        CATransaction.commit()
+    }
+
+    private func hideLoupe() {
+        guard !loupe.isHidden else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        loupe.isHidden = true
+        loupe.contents = nil
+        CATransaction.commit()
+    }
+
+    // MARK: Animation (flings)
+
+    private func stopFlings() {
+        cursorFling.stop()
+        scrollFling.stop()
+    }
+
+    private func animate(_ now: CFTimeInterval) {
+        var running = false
+        if let d = cursorFling.step(now: now) {
+            running = true
+            moveCursor(byViewPoints: d)
+        }
+        if let d = scrollFling.step(now: now) {
+            running = true
+            sendWheel(byViewPoints: d, factor: scrollFlingFactor)
+        }
+        if !running {
+            animTicker.stop()
+        }
+    }
+
+    // MARK: Keyboard
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    /// Become first responder (hardware keys) unless the key input view
+    /// already is.
+    private func claimKeyboardFocus() {
+        guard window != nil, !isFirstResponder, !keyInput.isFirstResponder else { return }
+        _ = becomeFirstResponder()
+    }
+
+    /// soft: true = system keyboard + bar, false = bar alone, nil = hide.
+    /// Asking again for what is already shown hides it (toggle).
+    private func presentKeyboard(_ soft: Bool?) {
+        guard window != nil else { return }
+        guard let soft else {
+            if keyInput.isFirstResponder { _ = keyInput.resignFirstResponder() }
+            claimKeyboardFocus()
+            return
+        }
+        if keyInput.isFirstResponder {
+            if keyInput.showsSoftKeyboard == soft {
+                _ = keyInput.resignFirstResponder()
+                claimKeyboardFocus()
+            } else {
+                keyInput.showsSoftKeyboard = soft
+            }
+        } else {
+            keyInput.showsSoftKeyboard = soft
+            _ = keyInput.becomeFirstResponder()
+        }
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let rest = keyRouter.pressesBegan(presses)
+        if !rest.isEmpty { super.pressesBegan(rest, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let rest = keyRouter.pressesEnded(presses)
+        if !rest.isEmpty { super.pressesEnded(rest, with: event) }
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let rest = keyRouter.pressesEnded(presses)
+        if !rest.isEmpty { super.pressesCancelled(rest, with: event) }
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        keyRouter.keyCommands()
+    }
+
+    @objc func ovKeyCommand(_ sender: UIKeyCommand) {
+        keyRouter.handleKeyCommand(sender)
+    }
+
+    // MARK: Raw touches (finger-down state, iPad pointer buttons)
+
+    /// Fingers (not pointer touches) currently on this view.
+    private func updateTouching(_ event: UIEvent?) {
+        let touches = event?.touches(for: self) ?? []
+        let active = touches.filter {
+            $0.type != .indirectPointer && $0.phase != .ended && $0.phase != .cancelled
+        }
+        input.touching = !active.isEmpty
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        var finger = false
+        for t in touches {
+            if t.type == .indirectPointer {
+                pointerTouchBegan(t, event: event)
+            } else {
+                finger = true
+            }
+        }
+        if finger {
+            stopFlings()
+            haptic.prepare()
+            claimKeyboardFocus()
+        }
+        updateTouching(event)
+        super.touchesBegan(touches, with: event)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches where t.type == .indirectPointer {
+            guard pointerButtons[ObjectIdentifier(t)] != nil else { continue }
+            input.moveCursorAbsolute(to: viewToFrame(t.location(in: self)))
+            updateCursorLayer()
+        }
+        super.touchesMoved(touches, with: event)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches where t.type == .indirectPointer {
+            pointerTouchEnded(t)
+        }
+        updateTouching(event)
+        super.touchesEnded(touches, with: event)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches where t.type == .indirectPointer {
+            pointerTouchEnded(t)
+        }
+        updateTouching(event)
+        super.touchesCancelled(touches, with: event)
+    }
+
+    /// A mouse / trackpad click: the button comes from the event's button
+    /// mask; pressed at the pointer position.
+    private func pointerTouchBegan(_ t: UITouch, event: UIEvent?) {
+        guard !pointerLocked else { return } // GCMouse delivers buttons then
+        var button = MouseButton.left
+        if let mask = event?.buttonMask {
+            if mask.contains(.secondary) {
+                button = .right
+            } else if mask.contains(UIEvent.ButtonMask.button(3)) {
+                button = .middle
+            }
+        }
+        pointerButtons[ObjectIdentifier(t)] = button
+        claimKeyboardFocus()
+        input.buttonDown(button, at: viewToFrame(t.location(in: self)))
+        updateCursorLayer()
+    }
+
+    private func pointerTouchEnded(_ t: UITouch) {
+        guard let button = pointerButtons.removeValue(forKey: ObjectIdentifier(t)) else { return }
+        input.buttonUp(button, at: viewToFrame(t.location(in: self)))
+        updateCursorLayer()
+    }
+
+    // MARK: Gesture handlers
+
+    private var isPinching: Bool {
+        pinch.state == .began || pinch.state == .changed
+    }
+
+    @objc private func handleTap1(_ g: UITapGestureRecognizer) {
+        guard g.state == .ended else { return }
+        let now = CACurrentMediaTime()
+        switch input.mode {
+        case .mouse:
+            // The tap that ends a tap-hold drag is not a click.
+            if dragActive || now - lastDragEnd < 0.25 { return }
+            input.click(.left)
+        case .touch:
+            let loc = g.location(in: self)
+            var p = viewToFrame(loc)
+            if let last = lastTouchTap, now - last.time < 0.35,
+               hypot(loc.x - last.view.x, loc.y - last.view.y) < 24 {
+                p = last.frame
+            }
+            lastTouchTap = (time: now, view: loc, frame: p)
+            input.click(.left, at: p)
+            ripple(at: frameToView(p))
+        }
+        updateCursorLayer()
+    }
+
+    @objc private func handleTap2(_ g: UITapGestureRecognizer) {
+        guard g.state == .ended else { return }
+        clickWithFingers(.right, g)
+    }
+
+    @objc private func handleTap3(_ g: UITapGestureRecognizer) {
+        guard g.state == .ended else { return }
+        clickWithFingers(.middle, g)
+    }
+
+    /// Multi-finger taps: at the cursor (mouse mode) or at the fingers'
+    /// centroid (touch mode).
+    private func clickWithFingers(_ button: MouseButton, _ g: UIGestureRecognizer) {
+        switch input.mode {
+        case .mouse:
+            input.click(button)
+        case .touch:
+            let p = viewToFrame(g.location(in: self))
+            input.click(button, at: p)
+            ripple(at: frameToView(p))
+        }
+        updateCursorLayer()
+    }
+
+    @objc private func handleTap2Double(_ g: UITapGestureRecognizer) {
+        guard g.state == .ended else { return }
+        switch input.mode {
+        case .mouse:
+            toggleZoom(around: input.cursor)
+            edgePush()
+        case .touch:
+            toggleZoom(around: viewToFrame(g.location(in: self)))
+        }
+    }
+
+    @objc private func handlePan1(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began:
+            cursorFling.stop()
+        case .changed:
+            let t = g.translation(in: self)
+            g.setTranslation(.zero, in: self)
+            if isPinching { return }
+            switch input.mode {
+            case .mouse:
+                let v = g.velocity(in: self)
+                let gain = Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
+                moveCursor(byViewPoints: CGPoint(x: t.x * gain, y: t.y * gain))
+            case .touch:
+                if lpActive { return }
+                panViewport(by: t)
+            }
+        case .ended:
+            guard input.mode == .mouse, input.cursorFlingEnabled, !dragActive else { return }
+            let v = g.velocity(in: self)
+            let gain = Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
+            cursorFling.start(velocity: CGPoint(x: v.x * gain, y: v.y * gain), now: CACurrentMediaTime())
+            if cursorFling.isActive { animTicker.start() }
+        default:
+            break
+        }
+    }
+
+    /// Two-finger pan and iPad trackpad / wheel scrolling -> WHEEL.
+    @objc private func handleScroll(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began:
+            scrollFling.stop()
+            if g === pan2 && input.mode == .touch {
+                // Scroll where the fingers are.
+                input.moveCursorAbsolute(to: viewToFrame(g.location(in: self)))
+                updateCursorLayer()
+            }
+        case .changed:
+            let t = g.translation(in: self)
+            g.setTranslation(.zero, in: self)
+            sendWheel(byViewPoints: t, factor: wheelFactor(for: g))
+        case .ended:
+            guard g !== scrollDiscrete, input.input2 else { return }
+            scrollFlingFactor = wheelFactor(for: g)
+            scrollFling.start(velocity: g.velocity(in: self), now: CACurrentMediaTime())
+            if scrollFling.isActive { animTicker.start() }
+        default:
+            break
+        }
+    }
+
+    /// Wheel units per view point; in touch mode the two-finger scroll is
+    /// divided by the zoom so content keeps up with the fingers.
+    private func wheelFactor(for g: UIGestureRecognizer) -> CGFloat {
+        var k = Self.wheelUnitsPerPoint
+        if g === pan2 && input.mode == .touch {
+            k /= max(zoomFactor, 1)
+        }
+        return k
+    }
+
+    /// Natural scrolling: fingers down (t.y > 0) = content down = scroll
+    /// up (dy > 0); fingers right = content right = scroll left (dx < 0).
+    private func sendWheel(byViewPoints t: CGPoint, factor k: CGFloat) {
+        input.wheel(dx: Double(-t.x * k), dy: Double(t.y * k))
+    }
+
+    @objc private func handlePinch(_ g: UIPinchGestureRecognizer) {
+        switch g.state {
+        case .began:
+            stopFlings()
+            lastPinchCentroid = g.numberOfTouches >= 2 ? g.location(in: self) : nil
+        case .changed:
+            let s = g.scale
+            g.scale = 1
+            switch input.mode {
+            case .mouse:
+                zoom(by: s, pivot: frameToView(input.cursor))
+                edgePush()
+            case .touch:
+                let loc = g.location(in: self)
+                if g.numberOfTouches >= 2 {
+                    if let last = lastPinchCentroid {
+                        offset.x += loc.x - last.x
+                        offset.y += loc.y - last.y
+                    }
+                    lastPinchCentroid = loc
+                } else {
+                    lastPinchCentroid = nil
+                }
+                zoom(by: s, pivot: loc)
+            }
+        default:
+            lastPinchCentroid = nil
+        }
+    }
+
+    @objc private func handleLongPress(_ g: UILongPressGestureRecognizer) {
+        let loc = g.location(in: self)
+        if input.mode == .mouse {
+            // Right click at the cursor.
+            if g.state == .began {
+                haptic.impactOccurred()
+                input.click(.right)
+            }
+            return
+        }
+        switch g.state {
+        case .began:
+            lpActive = true
+            lpDragging = false
+            lpStartView = loc
+            lpStartFrame = viewToFrame(loc)
+            haptic.impactOccurred()
+            showLoupe(at: loc)
+        case .changed:
+            guard lpActive else { return }
+            if !lpDragging && hypot(loc.x - lpStartView.x, loc.y - lpStartView.y) > 10 {
+                lpDragging = true
+                input.buttonDown(.left, at: lpStartFrame)
+            }
+            if lpDragging {
+                input.moveCursorAbsolute(to: viewToFrame(loc))
+                updateCursorLayer()
+            }
+            showLoupe(at: loc)
+        case .ended:
+            guard lpActive else { return }
+            lpActive = false
+            hideLoupe()
+            if lpDragging {
+                input.buttonUp(.left, at: viewToFrame(loc))
+            } else {
+                input.click(.right, at: lpStartFrame)
+            }
+            lpDragging = false
+            updateCursorLayer()
+        case .cancelled, .failed:
+            guard lpActive else { return }
+            lpActive = false
+            hideLoupe()
+            if lpDragging { input.buttonUp(.left) }
+            lpDragging = false
+        default:
+            break
+        }
+    }
+
+    /// Mouse mode: tap, then touch-and-hold = left drag (pan1 moves the
+    /// cursor meanwhile).
+    @objc private func handleHoldDrag(_ g: UILongPressGestureRecognizer) {
+        switch g.state {
+        case .began:
+            guard input.mode == .mouse, !dragActive else { return }
+            dragActive = true
+            haptic.impactOccurred()
+            input.buttonDown(.left)
+            setDragRingVisible(true)
+        case .ended, .cancelled, .failed:
+            guard dragActive else { return }
+            dragActive = false
+            input.buttonUp(.left)
+            setDragRingVisible(false)
+            lastDragEnd = CACurrentMediaTime()
+        default:
+            break
+        }
+    }
+
+    @objc private func handleHover(_ g: UIHoverGestureRecognizer) {
+        guard g.state == .began || g.state == .changed, !pointerLocked else { return }
+        input.moveCursorAbsolute(to: viewToFrame(g.location(in: self)))
+        updateCursorLayer()
+    }
+
+    // MARK: UIGestureRecognizerDelegate
+
+    /// CRD pairs: pinch + pan, long-press + pan, two-finger tap +
+    /// long-press; plus tap-hold drag + pan / tap. Pointer recognizers
+    /// (hover, scroll) never block anything.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        let g = gestureRecognizer
+        if g === hover || other === hover { return true }
+        if g === scrollContinuous || other === scrollContinuous { return true }
+        if g === scrollDiscrete || other === scrollDiscrete { return true }
+        func pair(_ a: UIGestureRecognizer, _ b: UIGestureRecognizer) -> Bool {
+            (g === a && other === b) || (g === b && other === a)
+        }
+        return pair(pinch, pan1)
+            || pair(longPress, pan1)
+            || pair(holdDrag, pan1)
+            || pair(holdDrag, tap1)
+            || pair(tap2, longPress)
+    }
+}

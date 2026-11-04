@@ -45,6 +45,9 @@ targets:
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UILaunchScreen: {}
+        # iPad mouse/trackpad: deliver secondary clicks and scroll as events
+        # (RemoteScreenSurface right-click + wheel).
+        UIApplicationSupportsIndirectInputEvents: true
         UIRequiredDeviceCapabilities:
           - arm64
         UISupportedInterfaceOrientations:

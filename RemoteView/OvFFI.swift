@@ -393,6 +393,12 @@ final class OvScreenBox {
         ov_screen_liveness_tick(ptr, nowMs)
     }
 
+    /// The host's CAPS bits (0 until the host answered; old hosts never
+    /// do). Session queue only.
+    func peerCaps() -> UInt32 {
+        ov_screen_peer_caps(ptr)
+    }
+
     /// Take the 9-byte PONG echo reply owed for the last inbound PING, if any.
     func takePongReply() -> Data? {
         var out = [UInt8](repeating: 0, count: 9)

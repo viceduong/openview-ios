@@ -94,6 +94,9 @@ final class SessionController: ObservableObject {
 
     let screenModel = ScreenModel()
     let livenessModel = LivenessModel()
+    /// Remote input (section 2): gestures / keyboard -> channel-0 commands.
+    /// Main thread only.
+    let input = RemoteInputController()
 
     /// Chat log cap — older lines are dropped.
     private static let maxLines = 200
@@ -139,6 +142,8 @@ final class SessionController: ObservableObject {
     private var videoActive = false
     private var videoGen = 0
     private var pendingHideGen: Int?
+    /// Last host CAPS seen (section 2: CAP_INPUT2 picks the input commands).
+    private var lastPeerCaps: UInt32 = 0
 
     // Screen updates coalesced across threads (guarded by `screenLock`).
     private let screenLock = NSLock()
@@ -198,6 +203,9 @@ final class SessionController: ObservableObject {
             self?.sendCommand(payload)
         }
         startClipboardPolling()
+        input.send = { [weak self] payload in
+            self?.sendCommand(payload)
+        }
         // Phase 5: the overlay's decoder failed (main) -> ask the host for an
         // IDR from the session queue.
         screenModel.video.onFailure = { [weak self] in
@@ -222,6 +230,10 @@ final class SessionController: ObservableObject {
         clipboardTimer?.cancel()
         clipboardTimer = nil
         clipboard.send = nil
+        // Release every key / button held on the host before teardown (the
+        // records queue ahead of the teardown below), then unhook input.
+        input.releaseAll()
+        input.shutdown()
         // Strong capture on purpose: the teardown must run even if the view
         // releases the controller right after this.
         queue.async { self.teardownOnQueue() }
@@ -514,6 +526,15 @@ final class SessionController: ObservableObject {
             }
             try sendPongIfOwed()
             screen.livenessTick(nowMs: nowMs)
+            // Section 2: publish CAP_INPUT2 once the host's CAPS arrive.
+            let caps = screen.peerCaps()
+            if caps != lastPeerCaps {
+                lastPeerCaps = caps
+                let input2 = caps & InputWire.capInput2 != 0
+                DispatchQueue.main.async { [weak self] in
+                    self?.input.input2 = input2
+                }
+            }
         } catch {
             handle(error)
         }
@@ -679,7 +700,8 @@ final class SessionController: ObservableObject {
         sendCommand(payload)
     }
 
-    /// A key-row tap: KEY down immediately followed by KEY up (two records).
+    /// A key tap: KEY down immediately followed by KEY up (two records).
+    /// (Legacy helper; the session UI now goes through `input`.)
     func sendKey(vk: UInt16) {
         sendKeyCommand(vk: vk, down: true)
         sendKeyCommand(vk: vk, down: false)

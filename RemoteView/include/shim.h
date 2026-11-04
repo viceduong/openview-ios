@@ -120,6 +120,10 @@ int32_t ov_screen_request_video_idr(OvScreen *screen);
 int32_t ov_screen_set_clipboard_sink(OvScreen *screen, void *user, ov_clipboard_sink sink);
 int32_t ov_screen_set_file_sink(OvScreen *screen, void *user, ov_file_sink sink);
 int32_t ov_screen_feed(OvScreen *screen, const uint8_t *data, size_t len);
+// Section 2: the host's CAPS bits (0 until the host answered; an old host
+// never does). CAP_INPUT2 = 0x40 enables POINTER_EX / WHEEL / KEY_EX / TEXT /
+// RELEASE_ALL / SAS. Session queue only (OvScreen is not locked).
+uint32_t ov_screen_peer_caps(const OvScreen *screen);
 
 // liveness (v0.16): keepalive pacing + RTT + dead-peer detection
 int32_t ov_screen_set_liveness_sink(OvScreen *screen, void *user, ov_liveness_sink sink);

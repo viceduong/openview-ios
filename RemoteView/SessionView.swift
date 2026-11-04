@@ -55,6 +55,10 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
 struct SessionView: View {
     @StateObject private var controller: SessionController
+    // Section 2: Mouse (trackpad) / Touch (direct) input mode, shared with
+    // RemoteInputController through the same UserDefaults key.
+    @AppStorage(RemoteInputController.modeDefaultsKey) private var inputModeRaw: String = InputMode.mouse.rawValue
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var draft = ""
     // File transfer (v0.27): whether the send-file document picker is up.
@@ -153,17 +157,38 @@ struct SessionView: View {
 
             Divider()
 
-            // Remote-control key row: each tap sends KEY down+up on channel 0.
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(Self.keyButtons, id: \.vk) { key in
-                        Button(key.label) { controller.sendKey(vk: key.vk) }
-                            .buttonStyle(.bordered)
-                    }
+            // Remote-control row (section 2): input mode + keyboard buttons.
+            // Special keys live in the keyboard accessory bar.
+            HStack(spacing: 8) {
+                Picker("Input mode", selection: $inputModeRaw) {
+                    Text("Mouse").tag(InputMode.mouse.rawValue)
+                    Text("Touch").tag(InputMode.touch.rawValue)
                 }
-                .padding(.horizontal, 12)
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 180)
+                Spacer()
+                // Soft keyboard + special-keys bar (tap again to hide).
+                Button {
+                    controller.input.showKeyboard(soft: true)
+                } label: {
+                    Image(systemName: "keyboard")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("Keyboard")
+                // Special-keys bar alone, without the soft keyboard.
+                Button {
+                    controller.input.showKeyboard(soft: false)
+                } label: {
+                    Image(systemName: "command")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("Special keys")
             }
+            .padding(.horizontal, 12)
             .padding(.vertical, 4)
+            .onChange(of: inputModeRaw) { raw in
+                controller.input.setMode(InputMode(rawValue: raw) ?? .mouse)
+            }
 
             Divider()
 
@@ -198,8 +223,17 @@ struct SessionView: View {
         }
         .navigationTitle("Session")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { controller.start() }
+        .onAppear {
+            controller.start()
+            controller.input.setMode(InputMode(rawValue: inputModeRaw) ?? .mouse)
+        }
         .onDisappear { controller.stop() }
+        // Section 2: nothing stays pressed on the host while we are away.
+        .onChange(of: scenePhase) { phase in
+            if phase == .background {
+                controller.input.releaseAll()
+            }
+        }
         .sheet(isPresented: $showingFilePicker) {
             DocumentPicker(
                 onPick: { url in
@@ -220,13 +254,6 @@ struct SessionView: View {
         draft = ""
         controller.sendChat(text)
     }
-
-    /// The key row: label + Windows virtual-key code.
-    private static let keyButtons: [(label: String, vk: UInt16)] = [
-        ("⌫", 0x08), ("↵", 0x0D), ("esc", 0x1B), ("tab", 0x09),
-        ("←", 0x25), ("↑", 0x26), ("→", 0x27), ("↓", 0x28),
-        ("ctrl", 0x11), ("alt", 0x12),
-    ]
 
     /// Share sheet wrapper for opening a received file.
     struct ShareSheet: UIViewControllerRepresentable {
@@ -281,184 +308,34 @@ private struct DeadPeerBanner: View {
 
 // MARK: - Remote screen
 
-/// The remote display + cursor overlay + touch-to-pointer input. Rendered
-/// once a frame has reassembled; the GeometryReader letterbox-maps touch
-/// points onto the frame.
+/// The remote display. Until the first frame reassembles it shows a
+/// placeholder; then `RemoteScreenSurface` (RemoteScreenSurface.swift)
+/// renders the frame + H.264 overlay + local cursor inside a zoom/pan
+/// viewport and turns gestures, keyboards and the iPad pointer into input
+/// commands via `controller.input`.
 private struct RemoteScreenView: View {
     @ObservedObject var model: ScreenModel
     let liveness: LivenessModel
     let controller: SessionController
 
-    // Last pointer-move send time (throttle drags to ~30 Hz).
-    @State private var lastMoveSend: Date = .distantPast
-    // Whether the pointer is currently held down (touch began, not yet ended).
-    @State private var pointerDown = false
-
     var body: some View {
         if let img = model.image {
-            GeometryReader { g in
-                let content = letterbox(g.size, model.frameSize)
-                ZStack {
-                    // Layer-backed frame: setting CALayer.contents is the
-                    // cheapest way to show a fresh CGImage each frame.
-                    FrameLayerView(image: img, video: model.video)
-                        .frame(width: content.size.width, height: content.size.height)
-                        .position(x: content.origin.x + content.size.width / 2,
-                                  y: content.origin.y + content.size.height / 2)
-                        .allowsHitTesting(false)
-                    // Remote cursor overlay: anchored at the hotspot so the
-                    // tip of the arrow sits on the logical position, scaled
-                    // with the letterboxed frame. Hidden when no shape has
-                    // been received yet.
-                    if let cimg = model.cursorImage, let pos = model.cursorPos, model.frameSize.width > 0 {
-                        let scale = content.size.width / model.frameSize.width
-                        Image(decorative: cimg, scale: 1)
-                            .resizable()
-                            .interpolation(.none)
-                            .frame(width: model.cursorSize.width * scale,
-                                   height: model.cursorSize.height * scale)
-                            // `position` centers the view at (x,y); offset by half the
-                            // (scaled) image so the cursor HOTSPOT sits on the remote point.
-                            .position(x: content.origin.x + (pos.x - model.cursorHotspot.width + model.cursorSize.width / 2) * scale,
-                                      y: content.origin.y + (pos.y - model.cursorHotspot.height + model.cursorSize.height / 2) * scale)
-                            .allowsHitTesting(false)
-                    }
-                    // Touch surface covering the whole area, so gesture
-                    // locations are in GeometryReader coordinates.
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .gesture(dragGesture(in: g))
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .background(Color.black)
-            .overlay(DeadPeerBanner(model: liveness))
+            RemoteScreenSurface(image: img,
+                                frameSize: model.frameSize,
+                                video: model.video,
+                                cursorPos: model.cursorPos,
+                                cursorImage: model.cursorImage,
+                                cursorHotspot: model.cursorHotspot,
+                                cursorSize: model.cursorSize,
+                                input: controller.input)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .overlay(DeadPeerBanner(model: liveness).allowsHitTesting(false))
         } else {
             Text("Waiting for remote screen…")
                 .font(.caption).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 120)
                 .background(Color.black.opacity(0.05))
         }
-    }
-
-    /// Letterbox geometry for a frame of `frame` aspect inside `bounds`:
-    /// the centered content rect (origin + size in view coordinates).
-    private func letterbox(_ bounds: CGSize, _ frame: CGSize) -> (origin: CGPoint, size: CGSize) {
-        guard frame.width > 0, frame.height > 0 else {
-            return (CGPoint.zero, bounds)
-        }
-        let contentW = min(bounds.width, bounds.height * frame.width / frame.height)
-        let contentH = contentW * frame.height / frame.width
-        return (
-            CGPoint(x: (bounds.width - contentW) / 2, y: (bounds.height - contentH) / 2),
-            CGSize(width: contentW, height: contentH)
-        )
-    }
-
-    /// Map a touch point to normalized frame coordinates (0..=65535), or nil
-    /// when the touch falls outside the letterboxed content rect.
-    private func normalizedPoint(_ p: CGPoint, in g: GeometryProxy) -> CGPoint? {
-        let content = letterbox(g.size, model.frameSize)
-        guard content.size.width > 0, content.size.height > 0 else { return nil }
-        let px = p.x - content.origin.x
-        let py = p.y - content.origin.y
-        guard px >= 0, px <= content.size.width,
-              py >= 0, py <= content.size.height else { return nil }
-        let xn = px / content.size.width * 65_535
-        let yn = py / content.size.height * 65_535
-        return CGPoint(x: min(max(xn, 0), 65_535), y: min(max(yn, 0), 65_535))
-    }
-
-    /// Drag (tap) gesture over the screen image: began = pointer down,
-    /// changed = pointer move (throttled ~30 Hz), ended = pointer up.
-    private func dragGesture(in g: GeometryProxy) -> some Gesture {
-        DragGesture(minimumDistance: 0, coordinateSpace: .local)
-            .onChanged { value in
-                guard model.frameSize.width > 0,
-                      let p = normalizedPoint(value.location, in: g) else { return }
-                if !pointerDown {
-                    // DragGesture has no onBegan; the first onChanged *is*
-                    // the touch-began event — send the button-down there.
-                    pointerDown = true
-                    lastMoveSend = Date()
-                    controller.sendPointer(kind: 1, x: UInt32(p.x.rounded()), y: UInt32(p.y.rounded()))
-                    return
-                }
-                let now = Date()
-                guard now.timeIntervalSince(lastMoveSend) >= 1.0 / 30.0 else { return }
-                lastMoveSend = now
-                controller.sendPointer(kind: 0, x: UInt32(p.x.rounded()), y: UInt32(p.y.rounded()))
-            }
-            .onEnded { value in
-                defer { pointerDown = false }
-                guard pointerDown, model.frameSize.width > 0 else { return }
-                // Up lands where the drag ended (the same point on a tap).
-                if let up = normalizedPoint(value.location, in: g) {
-                    controller.sendPointer(kind: 2, x: UInt32(up.x.rounded()), y: UInt32(up.y.rounded()))
-                }
-            }
-    }
-}
-
-/// Shows a CGImage through a plain CALayer (`contents`), without implicit
-/// animations. The image is already letterbox-sized by the parent. Phase 5:
-/// also hosts the H.264 overlay layer (positioned over the video region).
-private struct FrameLayerView: UIViewRepresentable {
-    let image: CGImage
-    let video: VideoOverlay
-
-    func makeUIView(context: Context) -> FrameLayerUIView {
-        let view = FrameLayerUIView()
-        view.attach(video)
-        return view
-    }
-
-    func updateUIView(_ uiView: FrameLayerUIView, context: Context) {
-        uiView.attach(video)
-        uiView.setImage(image)
-    }
-}
-
-private final class FrameLayerUIView: UIView {
-    // Strong on purpose (CF types do not support weak references); the
-    // layer holds the same image anyway.
-    private var current: CGImage?
-    // Phase 5: the H.264 overlay whose layer is our sublayer.
-    private weak var overlay: VideoOverlay?
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isUserInteractionEnabled = false
-        backgroundColor = .black
-        layer.contentsGravity = .resize
-        layer.magnificationFilter = .linear
-        layer.minificationFilter = .trilinear
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not supported")
-    }
-
-    /// Host the overlay's layer (above the frame image, below the cursor).
-    func attach(_ video: VideoOverlay) {
-        guard video.layer.superlayer !== layer else { return }
-        layer.addSublayer(video.layer)
-        overlay = video
-        setNeedsLayout()
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        overlay?.layout(in: bounds)
-    }
-
-    func setImage(_ image: CGImage) {
-        // Unrelated re-renders hand the same image back: skip those.
-        guard image !== current else { return }
-        current = image
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.contents = image
-        CATransaction.commit()
     }
 }
