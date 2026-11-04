@@ -162,6 +162,8 @@ struct SessionView: View {
     @State private var peerPine: String = "connecting…"
     @State private var pumpTimer: Timer?
     @State private var udpBridge: NwUdpBridge?
+    /// WebSocket relay mode: the socket ConnectView opened.
+    @State private var relaySocket: RelayWebSocket?
     // Clipboard sync (v0.26): echo-guarded pasteboard bridge.
     @State private var clipboard = ClipboardBridge()
     // File transfer (v0.27): files received from the peer, written to the
@@ -492,6 +494,27 @@ struct SessionView: View {
             })
             udpBridge = bridge
         }
+        // WebSocket relay mode: each received message feeds the Rust relay
+        // carrier and is processed right away; outbound bytes already flow
+        // through the sink installed by relayConnectStream.
+        if let ws = DirectTransport.webSocket {
+            DirectTransport.webSocket = nil
+            DirectTransport.pending = nil
+            relaySocket = ws
+            ws.onMessage = { [weak session] data in
+                guard let session else { return }
+                do {
+                    try session.relayFeed(data)
+                    try session.pumpRelay()
+                } catch {
+                    lines.append("error: \(error)")
+                }
+            }
+            ws.onClose = { [weak session] error in
+                session?.relayEOF()
+                lines.append(error.map { "relay: \($0.localizedDescription)" } ?? "relay closed")
+            }
+        }
         do {
             try session.pump()
             if let fp = session.peerFingerprint() {
@@ -537,6 +560,8 @@ struct SessionView: View {
         pumpTimer = nil
         udpBridge?.close()
         udpBridge = nil
+        relaySocket?.close()
+        relaySocket = nil
         audioPlayer.stop()
     }
 

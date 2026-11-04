@@ -109,6 +109,36 @@ final class OvSessionBox {
         }
     }
 
+    /// Outbound relay bytes for a WebSocket relay (see `relayConnectStream`).
+    var onRelayBytesOut: ((Data) -> Void)?
+
+    /// Connect through a relay over a WebSocket the app owns
+    /// (`wss://host/relay`, e.g. behind a Cloudflare tunnel). `send` gets
+    /// every outbound chunk — CONNECT immediately, then tunnel frames from
+    /// inside `pumpRelay()`; push received messages with `relayFeed`.
+    func relayConnectStream(sessionID: UInt32, send: @escaping (Data) -> Void) throws {
+        onRelayBytesOut = send
+        let unmanaged = Unmanaged.passUnretained(self)
+        try check(ov_session_relay_connect_stream(ptr, unmanaged.toOpaque(), { user, data, len in
+            guard let user, let data, len > 0 else { return }
+            let me = Unmanaged<OvSessionBox>.fromOpaque(user).takeUnretainedValue()
+            me.onRelayBytesOut?(Data(bytes: data, count: len))
+        }, sessionID))
+    }
+
+    /// One received WebSocket message; processed by the next `pumpRelay()`.
+    func relayFeed(_ data: Data) throws {
+        let rc = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+            ov_session_relay_feed(ptr, raw.baseAddress?.assumingMemoryBound(to: UInt8.self), raw.count)
+        }
+        try check(rc)
+    }
+
+    /// The WebSocket closed or failed; the relay reports closed once drained.
+    func relayEOF() {
+        _ = ov_session_relay_eof(ptr)
+    }
+
     /// Poll the Rust-owned relay transport (use instead of `pump()`).
     func pumpRelay() throws {
         try check(ov_session_pump_relay(ptr))

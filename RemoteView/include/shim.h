@@ -52,6 +52,11 @@ int32_t ov_session_set_state_sink(OvSession *s, void *user, ov_state_sink sink);
 int32_t ov_session_peer_fingerprint(OvSession *s, uint8_t *out /*16*/);
 int32_t ov_session_relay_connect(OvSession *s, const char *relay_host, uint16_t relay_port, uint32_t session_id);
 int32_t ov_session_pump_relay(OvSession *s);
+// relay over a host-owned byte stream (wss://host/relay): outbound chunks go
+// to `sink` (send each as one binary message); inbound messages via _feed.
+int32_t ov_session_relay_connect_stream(OvSession *s, void *user, ov_datagram_sink sink, uint32_t session_id);
+int32_t ov_session_relay_feed(OvSession *s, const uint8_t *data, size_t len);
+int32_t ov_session_relay_eof(OvSession *s);
 int32_t ov_relay_session_id(const char *code, uint8_t *out /*4*/);
 
 // file transfer (v0.27): send a named file to the peer in 16 KiB chunks.

@@ -6,14 +6,20 @@ import SwiftUI
 /// How the session reaches its peer.
 enum ConnectMode {
     case relay(host: String, port: UInt16)
+    /// Relay over WebSocket (`wss://host/relay`) — reaches ovrelay through
+    /// an HTTP-only front such as a Cloudflare tunnel.
+    case relayWebSocket(url: URL)
     case direct(host: String, port: UInt16)
 }
+
+/// The default relay: ovrelay behind the Cloudflare tunnel.
+let defaultRelayURL = "wss://openview.2031.cloud/relay"
 
 struct ConnectView: View {
     @State private var peerCode = ""
     @State private var peerId = ""
     @State private var pin = ""
-    @State private var relayHost = "127.0.0.1"
+    @State private var relayHost = defaultRelayURL
     @State private var relayPort = "4569"
     @State private var peerHost = "192.168.1.10"
     @State private var peerPort = "4570"
@@ -50,11 +56,14 @@ struct ConnectView: View {
                         TextField("Peer UDP port", text: $peerPort)
                             .keyboardType(.numberPad)
                     } else {
-                        TextField("Relay host", text: $relayHost)
+                        TextField("Relay host or wss:// URL", text: $relayHost)
                             .disableAutocorrection(true)
                             .textInputAutocapitalization(.never)
-                        TextField("Relay port", text: $relayPort)
-                            .keyboardType(.numberPad)
+                            .keyboardType(.URL)
+                        if relayWebSocketURL == nil {
+                            TextField("Relay port", text: $relayPort)
+                                .keyboardType(.numberPad)
+                        }
                     }
                 }
                 Section {
@@ -102,7 +111,7 @@ struct ConnectView: View {
                     }
                     mode = .direct(host: peerHost, port: port)
                 } else {
-                    mode = .relay(host: relayHost, port: UInt16(relayPort) ?? 4569)
+                    mode = relayMode()
                 }
                 switch mode {
                 case .relay(let host, let port):
@@ -111,6 +120,8 @@ struct ConnectView: View {
                     // carrier is Rust-owned, so no datagram sink is needed.
                     try s.relayConnect(host: host, port: port,
                                        sessionID: UInt32(truncatingIfNeeded: devId))
+                case .relayWebSocket(let url):
+                    try connectWebSocket(s, url: url, sessionID: UInt32(truncatingIfNeeded: devId))
                 case .direct:
                     // Create the Datagram carrier. The real outbound sink
                     // (NwUdpBridge) is installed by SessionView.start() before
@@ -132,13 +143,15 @@ struct ConnectView: View {
                 }
                 mode = .direct(host: peerHost, port: port)
             } else {
-                mode = .relay(host: relayHost, port: UInt16(relayPort) ?? 4569)
+                mode = relayMode()
             }
             switch mode {
             case .relay(let host, let port):
                 // Rust-owned relay carrier — no datagram sink needed.
                 try s.relayConnect(host: host, port: port,
                                    sessionID: OvSessionBox.relaySessionID(code: peerCode))
+            case .relayWebSocket(let url):
+                try connectWebSocket(s, url: url, sessionID: OvSessionBox.relaySessionID(code: peerCode))
             case .direct:
                 // Create the Datagram carrier; SessionView.start() installs the
                 // real outbound sink (NwUdpBridge) before pumping.
@@ -151,6 +164,38 @@ struct ConnectView: View {
         } catch {
             errorText = "Connect failed: \(error)"
         }
+    }
+}
+
+extension ConnectView {
+    /// The relay field as a WebSocket URL (`ws://` / `wss://`), else nil.
+    var relayWebSocketURL: URL? {
+        let text = relayHost.trimmingCharacters(in: .whitespaces)
+        let lower = text.lowercased()
+        guard lower.hasPrefix("wss://") || lower.hasPrefix("ws://") else { return nil }
+        return URL(string: text)
+    }
+
+    func relayMode() -> ConnectMode {
+        if let url = relayWebSocketURL {
+            return .relayWebSocket(url: url)
+        }
+        return .relay(host: relayHost, port: UInt16(relayPort) ?? 4569)
+    }
+
+    /// Open the WebSocket and start the relay session over it; CONNECT goes
+    /// out right away (URLSession queues it until the socket is open).
+    /// SessionView picks the socket up from `DirectTransport.webSocket`.
+    func connectWebSocket(_ s: OvSessionBox, url: URL, sessionID: UInt32) throws {
+        let ws = RelayWebSocket(url: url)
+        do {
+            try s.relayConnectStream(sessionID: sessionID) { [weak ws] data in ws?.send(data) }
+        } catch {
+            ws.close()
+            throw error
+        }
+        DirectTransport.webSocket?.close()
+        DirectTransport.webSocket = ws
     }
 }
 
@@ -178,4 +223,6 @@ final class PairingStateBox {
 /// navigation; SessionView consumes it in `start()` and clears it.
 enum DirectTransport {
     static var pending: ConnectMode?
+    /// The open WebSocket of a `.relayWebSocket` session.
+    static var webSocket: RelayWebSocket?
 }
