@@ -24,6 +24,11 @@ jobs:
         # build_ios.sh --sim skips cargo and runs xcodegen + xcodebuild only.
         run: bash build_ios.sh --sim
 
+      - name: Build device .ipa (unsigned)
+        # Links the committed libs/libovffi-device.a (aarch64-apple-ios slice),
+        # no Apple account; users re-sign with Sideloadly/AltStore.
+        run: bash build_ios.sh --device
+
       - name: Collect .app for artifact
         run: |
           APP="$(find "$HOME/Library/Developer/Xcode/DerivedData" \
@@ -37,3 +42,9 @@ jobs:
         with:
           name: OpenView-iOS
           path: OpenView.app
+
+      - name: Upload device .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenView-iOS-device
+          path: dist/OpenView-device.ipa
