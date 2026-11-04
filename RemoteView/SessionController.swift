@@ -106,6 +106,15 @@ final class SessionController: ObservableObject {
     private var relaySocket: RelayWebSocket?
     /// Direct (UDP) mode: inbound arrives via the bridge, no relay pump.
     private var isDirect = false
+    /// Direct mode (Phase 4): datagrams queued into the session since the
+    /// last pump, and whether a pump is already scheduled. With the reliable
+    /// UDP framing a frame arrives as ~1.2 KB fragments, so pumping once per
+    /// datagram would run the Rust pump ~1000x per MB; instead datagrams are
+    /// queued and one pump drains a batch (at most ~1 ms later, or at once
+    /// when `directBatchMax` are waiting).
+    private var directQueued = 0
+    private var directPumpScheduled = false
+    private static let directBatchMax = 64
     /// Set once the handshake completes (picks the -3 error wording).
     private var established = false
     /// Set on teardown or a fatal error: the pump is stopped and inbound
@@ -247,10 +256,15 @@ final class SessionController: ObservableObject {
                 guard let self, !self.halted else { return }
                 do {
                     try self.session.onDatagram(data)
-                    try self.session.pump() // process immediately; sinks fire here
-                    try self.sendPongIfOwed()
                 } catch {
                     self.handle(error)
+                    return
+                }
+                self.directQueued += 1
+                if self.directQueued >= Self.directBatchMax {
+                    self.directPump() // a big burst: drain now
+                } else {
+                    self.scheduleDirectPump()
                 }
             }, onState: { [weak self] state in
                 if case .failed(let error) = state {
@@ -370,6 +384,15 @@ final class SessionController: ObservableObject {
         screen.onAudio = { [weak self] data in
             self?.audioPlayer.playTick(data)
         }
+        // Phase 4: Opus packets (only after we advertise CAP_OPUS, which
+        // `enableOpus` does — and only when AVAudioConverter can decode
+        // Opus here; otherwise the host keeps sending raw PCM above).
+        if RemoteAudioPlayer.opusDecodeAvailable {
+            screen.onOpus = { [weak self] packet, samples in
+                self?.audioPlayer.playOpus(packet, samples: samples)
+            }
+            screen.enableOpus()
+        }
         // Clipboard sync (v0.26): apply peer text to the pasteboard (main)
         // and arm the echo guard so we never re-send what we just applied.
         screen.onClipboard = { [weak self] kind, payload in
@@ -419,6 +442,45 @@ final class SessionController: ObservableObject {
             screen.livenessTick(nowMs: nowMs)
         } catch {
             handle(error)
+        }
+    }
+
+    /// Direct mode: pump once for the batch of datagrams queued so far, ~1 ms
+    /// from now (more datagrams of the same burst arrive meanwhile).
+    private func scheduleDirectPump() {
+        guard !directPumpScheduled else { return }
+        directPumpScheduled = true
+        queue.asyncAfter(deadline: .now() + .milliseconds(1)) { [weak self] in
+            guard let self else { return }
+            self.directPumpScheduled = false
+            if self.directQueued > 0 {
+                self.directPump()
+            }
+        }
+    }
+
+    /// Direct mode: drain the queued datagrams (sinks fire here) and answer
+    /// any PING right away. The bridge batches the ACKs / PONG this emits
+    /// into one NWConnection send batch.
+    private func directPump() {
+        directQueued = 0
+        guard !halted else { return }
+        var failure: Error?
+        let run = {
+            do {
+                try self.session.pump()
+                try self.sendPongIfOwed()
+            } catch {
+                failure = error
+            }
+        }
+        if let bridge = udpBridge {
+            bridge.batch(run)
+        } else {
+            run()
+        }
+        if let failure {
+            handle(failure)
         }
     }
 
@@ -705,10 +767,15 @@ final class SessionController: ObservableObject {
 
 // MARK: - Audio
 
-// Audio (v0.21): remote mic streamed as raw s16le 48 kHz mono ticks;
-// played back through AVAudioEngine + AVAudioPlayerNode. Driven from the
-// session queue; only the queued-buffer counter is shared with the audio
-// render thread (completion handlers), so it is lock-guarded.
+// Audio (v0.21): remote mic streamed as 20 ms 48 kHz mono ticks — raw
+// s16le, or (Phase 4) Opus packets decoded with AVAudioConverter — played
+// back through AVAudioEngine + AVAudioPlayerNode. Driven from the session
+// queue; only the queued-buffer counter is shared with the audio render
+// thread (completion handlers), so it is lock-guarded.
+//
+// Jitter handling mirrors the desktop JitterBuffer: playback starts only
+// once `prefillTicks` (60 ms) are queued, a starved player pauses and
+// re-prefills, and more than `maxQueued` (120 ms) queued drops new ticks.
 final class RemoteAudioPlayer {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -717,12 +784,46 @@ final class RemoteAudioPlayer {
                                        channels: 1,
                                        interleaved: false)
     private var started = false
+    /// The player node is running (false while prefilling).
+    private var playing = false
     /// Buffers scheduled but not yet consumed by the player.
     private var queued = 0
     private let queuedLock = NSLock()
     /// Max ticks (20 ms each) allowed in flight; beyond that new ticks are
     /// dropped so network bursts cannot ratchet the latency up.
     private static let maxQueued = 6
+    /// Ticks queued before playback (re)starts: the jitter cushion.
+    private static let prefillTicks = 3
+    /// Opus decoder state (Phase 4), created on the first packet.
+    private var opusConverter: AVAudioConverter?
+    private var opusFormat: AVAudioFormat?
+    /// Largest Opus packet (RFC 6716).
+    private static let maxOpusPacket = 1275
+
+    /// The Opus stream format: 48 kHz mono, 960-frame (20 ms) packets.
+    private static func makeOpusFormat() -> AVAudioFormat? {
+        var desc = AudioStreamBasicDescription(mSampleRate: 48_000,
+                                               mFormatID: kAudioFormatOpus,
+                                               mFormatFlags: 0,
+                                               mBytesPerPacket: 0,
+                                               mFramesPerPacket: 960,
+                                               mBytesPerFrame: 0,
+                                               mChannelsPerFrame: 1,
+                                               mBitsPerChannel: 0,
+                                               mReserved: 0)
+        return AVAudioFormat(streamDescription: &desc)
+    }
+
+    /// Whether this device can decode Opus (checked once). When false the
+    /// shell never advertises CAP_OPUS and the host sends raw PCM.
+    static let opusDecodeAvailable: Bool = {
+        guard let opus = makeOpusFormat(),
+              let pcm = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: 48_000,
+                                      channels: 1,
+                                      interleaved: false) else { return false }
+        return AVAudioConverter(from: opus, to: pcm) != nil
+    }()
 
     /// Decode one audio tick (bare s16le 48 kHz mono samples — the sink
     /// delivers samples only, no header) and schedule it for playback.
@@ -731,13 +832,6 @@ final class RemoteAudioPlayer {
     func playTick(_ data: Data) {
         guard let format, data.count >= 2 else { return }
         let n = data.count / 2 // a stray odd trailing byte is ignored
-        if !started {
-            guard startEngine(format: format) else { return }
-        }
-        queuedLock.lock()
-        let depth = queued
-        queuedLock.unlock()
-        guard depth < Self.maxQueued else { return }
         guard let buf = AVAudioPCMBuffer(pcmFormat: format,
                                          frameCapacity: AVAudioFrameCount(n)),
               let dst = buf.floatChannelData?[0] else { return }
@@ -750,8 +844,74 @@ final class RemoteAudioPlayer {
                 dst[i] = Float(Int16(bitPattern: lo | (hi << 8))) / 32768.0
             }
         }
+        schedule(buf)
+    }
+
+    /// Decode one Opus packet (Phase 4; passed through by Rust) with
+    /// AVAudioConverter and schedule the PCM. The converter keeps its state
+    /// across packets (`.noDataNow` after each one, never end-of-stream).
+    /// Malformed packets are dropped silently.
+    func playOpus(_ packet: Data, samples: UInt32) {
+        guard let format, !packet.isEmpty, packet.count <= Self.maxOpusPacket else { return }
+        if opusConverter == nil {
+            guard let opus = Self.makeOpusFormat(),
+                  let conv = AVAudioConverter(from: opus, to: format) else { return }
+            opusFormat = opus
+            opusConverter = conv
+        }
+        guard let conv = opusConverter, let opusFormat else { return }
+        let compressed = AVAudioCompressedBuffer(format: opusFormat,
+                                                 packetCapacity: 1,
+                                                 maximumPacketSize: Self.maxOpusPacket)
+        let size = packet.count
+        packet.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let src = raw.baseAddress else { return }
+            compressed.data.copyMemory(from: src, byteCount: size)
+        }
+        compressed.byteLength = UInt32(size)
+        compressed.packetCount = 1
+        if let descs = compressed.packetDescriptions {
+            descs[0] = AudioStreamPacketDescription(mStartOffset: 0,
+                                                    mVariableFramesInPacket: 0,
+                                                    mDataByteSize: UInt32(size))
+        }
+        let frames = AVAudioFrameCount(max(samples, 960))
+        guard let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        var supplied = false
+        var error: NSError?
+        let status = conv.convert(to: pcm, error: &error) { _, inputStatus in
+            if supplied {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            inputStatus.pointee = .haveData
+            return compressed
+        }
+        guard status != .error, error == nil, pcm.frameLength > 0 else { return }
+        schedule(pcm)
+    }
+
+    /// Queue one decoded buffer, applying the prefill / underrun / ceiling
+    /// rules described above.
+    private func schedule(_ buf: AVAudioPCMBuffer) {
+        guard let format else { return }
+        if !started {
+            guard startEngine(format: format) else { return }
+        }
+        queuedLock.lock()
+        let depth = queued
+        queuedLock.unlock()
+        guard depth < Self.maxQueued else { return }
+        if playing && depth == 0 {
+            // Underrun: pause and re-prefill so playback resumes with a
+            // cushion instead of stuttering tick by tick.
+            player.pause()
+            playing = false
+        }
         queuedLock.lock()
         queued += 1
+        let now = queued
         queuedLock.unlock()
         player.scheduleBuffer(buf, completionHandler: { [weak self] in
             guard let self else { return }
@@ -759,6 +919,10 @@ final class RemoteAudioPlayer {
             self.queued = max(0, self.queued - 1)
             self.queuedLock.unlock()
         })
+        if !playing && now >= Self.prefillTicks {
+            player.play()
+            playing = true
+        }
     }
 
     private func startEngine(format: AVAudioFormat) -> Bool {
@@ -773,7 +937,8 @@ final class RemoteAudioPlayer {
                 engine.connect(player, to: engine.mainMixerNode, format: format)
             }
             try engine.start()
-            player.play()
+            // Playback starts once the prefill cushion is queued (schedule()).
+            playing = false
             started = true
             return true
         } catch {
@@ -786,6 +951,8 @@ final class RemoteAudioPlayer {
         player.stop()
         engine.stop()
         started = false
+        playing = false
+        opusConverter?.reset()
         queuedLock.lock()
         queued = 0
         queuedLock.unlock()

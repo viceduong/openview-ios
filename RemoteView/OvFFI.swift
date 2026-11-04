@@ -233,6 +233,10 @@ final class OvScreenBox {
     /// 48 kHz mono PCM (960 samples). Sample bytes only — Rust strips the
     /// audio frame header before the sink fires.
     var onAudio: ((Data) -> Void)?
+    /// Fired on an Opus AUDIO command (Phase 4) with one undecoded Opus
+    /// packet and its decoded sample count (960 per 20 ms tick). Only
+    /// after `enableOpus()` — which advertises CAP_OPUS to the host.
+    var onOpus: ((Data, UInt32) -> Void)?
     /// Fired on a CLIPBOARD command (v0.26) with the peer's clipboard
     /// payload: kind (0 = text) and the raw payload bytes.
     var onClipboard: ((UInt8, Data) -> Void)?
@@ -310,6 +314,20 @@ final class OvScreenBox {
         ov_screen_free(ptr)
     }
 
+    /// Phase 4: install the Opus sink so our CAPS advertise CAP_OPUS and an
+    /// Opus-capable host sends ~48 kbps Opus instead of 768 kbps raw PCM.
+    /// Call before the first `feed` (CAPS go out once), and only when the
+    /// device can actually decode Opus (`RemoteAudioPlayer.opusDecodeAvailable`).
+    func enableOpus() {
+        let unmanaged = Unmanaged.passUnretained(self)
+        ov_screen_set_opus_sink(ptr, unmanaged.toOpaque(), { user, packet, len, samples in
+            guard let user, let packet else { return }
+            let me = Unmanaged<OvScreenBox>.fromOpaque(user).takeUnretainedValue()
+            let data = Data(bytes: packet, count: Int(len))
+            me.onOpus?(data, samples)
+        })
+    }
+
     /// Drop every Swift-side callback (session teardown) so the closures —
     /// and whatever they capture — are released.
     func clearCallbacks() {
@@ -319,6 +337,7 @@ final class OvScreenBox {
         onLiveness = nil
         onMonitors = nil
         onAudio = nil
+        onOpus = nil
         onClipboard = nil
         onFile = nil
     }

@@ -18,6 +18,9 @@ typedef void (*ov_cursor_shape_sink)(void *user, uint16_t hotspot_x, uint16_t ho
 typedef void (*ov_liveness_sink)(void *user, int32_t alive, int32_t rtt_ms, float fps);
 typedef void (*ov_monitors_sink)(void *user, const uint8_t *mons, size_t count);
 typedef void (*ov_audio_sink)(void *user, const uint8_t *samples, size_t len);
+// Phase 4: one Opus packet (48 kHz mono, normally 20 ms) passed through
+// undecoded; `samples` = decoded sample count (960 for a 20 ms tick).
+typedef void (*ov_opus_sink)(void *user, const uint8_t *packet, size_t len, uint32_t samples);
 typedef void (*ov_clipboard_sink)(void *user, uint8_t kind, const uint8_t *text, size_t len);
 typedef void (*ov_file_sink)(void *user, const char *name, const uint8_t *data, size_t len);
 
@@ -70,6 +73,10 @@ int32_t ov_screen_set_cursor_sink(OvScreen *screen, void *user, ov_cursor_sink s
 int32_t ov_screen_set_cursor_shape_sink(OvScreen *screen, void *user, ov_cursor_shape_sink sink);
 int32_t ov_screen_set_monitors_sink(OvScreen *screen, void *user, ov_monitors_sink sink);
 int32_t ov_screen_set_audio_sink(OvScreen *screen, void *user, ov_audio_sink sink);
+// Phase 4: installing an Opus sink (before the first ov_screen_feed) makes
+// our CAPS advertise CAP_OPUS; the host then sends Opus packets here
+// instead of raw PCM to the audio sink.
+int32_t ov_screen_set_opus_sink(OvScreen *screen, void *user, ov_opus_sink sink);
 int32_t ov_screen_set_clipboard_sink(OvScreen *screen, void *user, ov_clipboard_sink sink);
 int32_t ov_screen_set_file_sink(OvScreen *screen, void *user, ov_file_sink sink);
 int32_t ov_screen_feed(OvScreen *screen, const uint8_t *data, size_t len);

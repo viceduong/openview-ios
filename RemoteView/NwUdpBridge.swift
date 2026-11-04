@@ -8,6 +8,12 @@ import Network
 // so its callbacks already arrive there — no hop, and the session is only
 // ever touched from that one serial queue, avoiding re-entrancy with
 // ov_session_pump. All methods must be called on `queue`.
+//
+// Phase 4: the Rust side frames records into <= 1.2 KB reliable-UDP
+// datagrams (ACKs + retransmissions, see ovtransport::rudp) once the host
+// switches; this bridge still just moves opaque datagrams. Each callback
+// re-arms the receive immediately (before the caller's work), and
+// SessionController batches the pumps.
 final class NwUdpBridge {
     private let connection: NWConnection
     private var onReceive: ((Data) -> Void)?
@@ -47,6 +53,17 @@ final class NwUdpBridge {
         }
     }
 
+    /// Run `body` (which may `send` several datagrams, e.g. a pump emitting
+    /// reliable-UDP ACKs and retransmissions) as one NWConnection batch, so
+    /// the sends are coalesced into fewer system calls (iOS 12+).
+    func batch(_ body: () -> Void) {
+        guard isReady, !closed else {
+            body()
+            return
+        }
+        connection.batch(body)
+    }
+
     /// Cancel the connection and drop the callbacks; safe to call more than
     /// once.
     func close() {
@@ -80,12 +97,14 @@ final class NwUdpBridge {
     }
 
     private func receiveLoop() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65535) { [weak self] content, _, _, error in
+        connection.receiveMessage { [weak self] content, _, _, error in
             guard let self, !self.closed, error == nil else { return }
+            // Re-arm first so the next datagram is already being received
+            // while this one is processed (keeps up with bursts).
+            self.receiveLoop()
             if let content, !content.isEmpty {
                 self.onReceive?(content)
             }
-            self.receiveLoop() // keep receiving on the connection queue
         }
     }
 }
