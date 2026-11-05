@@ -134,7 +134,6 @@ struct SessionContainer: View {
                             isLandscape: landscape,
                             onKeyboard: { controller.input.showKeyboard(soft: true) },
                             onMenu: { sheet = .menu },
-                            onSendFile: { sheet = .filePicker },
                             onDisconnect: requestDisconnect)
                 .confirmationDialog("Disconnect from \(controller.request.displayName)?",
                                     isPresented: $confirmDisconnect,

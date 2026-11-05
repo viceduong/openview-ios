@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The session toolbar: a collapsible pill (.ultraThinMaterial capsule,
-/// 44 pt targets) — Keyboard, Menu, Send file, Disconnect, Collapse. Always a vertical pill docked on the
+/// 44 pt targets) — Keyboard, Menu, Disconnect, Collapse. Always a vertical pill docked on the
 /// trailing edge (TeamViewer layout, the remote screen at the top): in
 /// portrait at the bottom-trailing corner when that leaves it below the
 /// fitted remote image, else (and in landscape) vertically centred. When
@@ -24,7 +24,6 @@ struct FloatingToolbar: View {
     let isLandscape: Bool
     let onKeyboard: () -> Void
     let onMenu: () -> Void
-    let onSendFile: () -> Void
     let onDisconnect: () -> Void
 
     @AppStorage(SettingsKey.toolbarHandleEdge) private var handleEdge = "trailing"
@@ -35,14 +34,14 @@ struct FloatingToolbar: View {
 
     private static let target: CGFloat = 44
     private static let handleHeight: CGFloat = 64
-    private static let buttonCount: CGFloat = 5
+    private static let buttonCount: CGFloat = 4
     private static let spacing: CGFloat = 2
     private static let pillInset: CGFloat = 4
     private static let edgeGap: CGFloat = 12
     /// Handle position (fraction of the screen height) while the keyboard
     /// is up: above any keyboard in either orientation.
     private static let keyboardHandleY: CGFloat = 0.22
-    /// Length of the pill along its axis (5 x 44 + spacing + insets).
+    /// Length of the pill along its axis (4 x 44 + spacing + insets).
     private static let pillLength: CGFloat =
         FloatingToolbar.buttonCount * FloatingToolbar.target
             + (FloatingToolbar.buttonCount - 1) * FloatingToolbar.spacing
@@ -159,9 +158,6 @@ struct FloatingToolbar: View {
     private var buttons: some View {
         toolButton("keyboard", label: "Keyboard", action: onKeyboard)
         toolButton("ellipsis.circle", label: "Session menu", action: onMenu)
-        // paperclip exists on iOS 15 (doc.badge.arrow.up is iOS 16+ and
-        // renders blank on 15).
-        toolButton("paperclip", label: "Send file", action: onSendFile)
         toolButton("xmark", label: "Disconnect", tint: Color(red: 1, green: 0.42, blue: 0.4), action: onDisconnect)
         toolButton("chevron.right", label: "Collapse toolbar") {
             setCollapsed(true)

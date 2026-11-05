@@ -43,12 +43,9 @@ struct SessionMenuSheet: View {
     var body: some View {
         NavigationView {
             List {
-                quickActions
-                shortcuts
-                interaction
+                transfer
                 display
                 quality
-                transfer
                 sessionInfo
             }
             .listStyle(.insetGrouped)
@@ -65,57 +62,6 @@ struct SessionMenuSheet: View {
     }
 
     // MARK: Sections
-
-    private var quickActions: some View {
-        Section(header: Text("Quick Actions")) {
-            sendRow("Send Ctrl+Alt+Del", symbol: "command") {
-                input.sendSAS()
-            }
-            sendRow("Lock (Win+L)", symbol: "lock") {
-                input.sendCombo([.leftWin, .keyL])
-            }
-            sendRow("Task Manager (Ctrl+Shift+Esc)", symbol: "list.bullet.rectangle") {
-                input.sendCombo([.leftCtrl, .leftShift, .escape])
-            }
-            sendRow("Send clipboard text", symbol: "doc.on.clipboard") {
-                controller.sendClipboardNow()
-            }
-            sendRow("Type clipboard text", symbol: "keyboard") {
-                controller.typeClipboardText()
-            }
-            Button(role: .destructive) {
-                onAction(.disconnect)
-            } label: {
-                Label("Disconnect", systemImage: "xmark.circle")
-            }
-        }
-    }
-
-    private var shortcuts: some View {
-        Section(header: Text("Keyboard Shortcuts (Windows)")) {
-            shortcutRow("Copy", keys: "Ctrl+C", [.leftCtrl, .keyC])
-            shortcutRow("Paste", keys: "Ctrl+V", [.leftCtrl, .keyV])
-            shortcutRow("Save", keys: "Ctrl+S", [.leftCtrl, .keyS])
-            shortcutRow("Print Screen", keys: "Win+PrtScn", [.leftWin, .printScreen])
-            shortcutRow("Switch apps", keys: "Alt+Tab", [.leftAlt, .tab])
-            shortcutRow("Task view", keys: "Win+Tab", [.leftWin, .tab])
-            shortcutRow("Show desktop", keys: "Win+D", [.leftWin, .keyD])
-            shortcutRow("Run", keys: "Win+R", [.leftWin, .keyR])
-            Button {
-                onAction(.showKeyBar)
-            } label: {
-                Label("Show special keys", systemImage: "keyboard")
-            }
-        }
-    }
-
-    private var interaction: some View {
-        Section(header: Text("Interaction Method")) {
-            ForEach(GestureHelp.items) { item in
-                GestureHelpRow(item: item)
-            }
-        }
-    }
 
     private var display: some View {
         Section(header: Text("Display")) {
@@ -233,32 +179,6 @@ struct SessionMenuSheet: View {
     }
 
     // MARK: Rows
-
-    /// A row that sends something to the host and closes the menu.
-    private func sendRow(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
-        Button {
-            action()
-            dismiss()
-        } label: {
-            Label(title, systemImage: symbol)
-        }
-    }
-
-    private func shortcutRow(_ title: String, keys: String, _ combo: [KeyStroke]) -> some View {
-        Button {
-            input.sendCombo(combo)
-            dismiss()
-        } label: {
-            HStack {
-                Text(title)
-                    .foregroundColor(.primary)
-                Spacer()
-                Text(keys)
-                    .font(.callout.monospacedDigit())
-                    .foregroundColor(.secondary)
-            }
-        }
-    }
 
     private func zoomRow(_ title: String, symbol: String, preset: ZoomPreset) -> some View {
         Button {
