@@ -310,7 +310,13 @@ final class MetalScreenRenderer {
             cb.makeRenderCommandEncoder(descriptor: rp)?.endEncoding()
         }
         if let onPresented {
+            #if targetEnvironment(simulator)
+            // addPresentedHandler is unavailable in the simulator SDK; the
+            // command buffer completing is the closest stand-in there.
+            cb.addCompletedHandler { _ in onPresented() }
+            #else
             drawable.addPresentedHandler { _ in onPresented() }
+            #endif
         }
         cb.present(drawable)
         cb.commit()
