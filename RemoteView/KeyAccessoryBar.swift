@@ -108,8 +108,14 @@ final class KeyAccessoryBar: UIView {
             (.win, "⊞", "Windows"), (.shift, "Shift", "Shift"), (.ctrl, "Ctrl", "Control"), (.alt, "Alt", "Alt"),
         ]
         for (m, title, label) in modifiers {
-            let b = makeButton(title: title, symbol: nil, label: label) { [weak self] in
+            let b = makeButton(title: m == .win ? nil : title, symbol: nil, label: label) { [weak self] in
                 self?.input?.tapModifier(m)
+            }
+            if m == .win {
+                // Drawn Windows logo (no SF Symbol exists for it).
+                var cfg = b.configuration ?? Self.baseConfiguration(.off)
+                cfg.image = Self.windowsLogo
+                b.configuration = cfg
             }
             modifierButtons.append((key: m, button: b))
             mainKeys.append(b)
@@ -221,6 +227,27 @@ final class KeyAccessoryBar: UIView {
         return v
     }
 
+    /// The Windows 11 logo: four equal squares in a 2 x 2 grid, as a
+    /// template image so it takes the button's tint in every state.
+    private static let windowsLogo: UIImage = {
+        let side: CGFloat = 15
+        let gap: CGFloat = 1.6
+        let cell = (side - gap) / 2
+        let image = UIGraphicsImageRenderer(size: CGSize(width: side, height: side)).image { ctx in
+            UIColor.black.setFill()
+            for row in 0..<2 {
+                for col in 0..<2 {
+                    let rect = CGRect(x: CGFloat(col) * (cell + gap),
+                                      y: CGFloat(row) * (cell + gap),
+                                      width: cell, height: cell)
+                    UIBezierPath(roundedRect: rect, cornerRadius: 0.8).fill()
+                }
+            }
+            _ = ctx
+        }
+        return image.withRenderingMode(.alwaysTemplate)
+    }()
+
     private static func baseConfiguration(_ style: ModifierState) -> UIButton.Configuration {
         var cfg: UIButton.Configuration
         switch style {
@@ -257,6 +284,7 @@ final class KeyAccessoryBar: UIView {
             let s = states[m.rawValue]
             var cfg = Self.baseConfiguration(s)
             cfg.title = b.configuration?.title
+            cfg.image = b.configuration?.image
             b.configuration = cfg
             b.accessibilityValue = s == .off ? nil : (s == .locked ? "locked" : "latched")
         }
