@@ -23,6 +23,13 @@ import UIKit.UIGestureRecognizerSubclass
 //                         viewport keeps the cursor centred, but never
 //                         scrolls past the image edges (near an edge the
 //                         cursor moves off-centre towards it).
+//                         Soft keyboard / key bar up (the view keeps its
+//                         size, the keyboard covers its bottom): the zoom
+//                         is unchanged, but the image may scroll up until
+//                         its bottom meets the keyboard's top edge, and the
+//                         viewport scrolls just enough to keep the cursor
+//                         24 pt above the keyboard (centred in the area
+//                         above it when zoomed in); restored when it hides.
 //                         One custom recognizer (TrackpadTouchRecognizer,
 //                         the MouseGestureRecognizer model) moves the cursor
 //                         from the very first touchesMoved (no pan slop, no
@@ -337,6 +344,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// the image is laid out below it (`safeInsets`).
     private var topChromeBottom: CGFloat = 0
     private var topChromeCancellable: AnyCancellable?
+    /// The on-screen keyboard's end frame (screen coordinates, includes the
+    /// key bar input accessory view, also when shown alone); nil = hidden.
+    /// The view ignores the keyboard safe area (it keeps its size), so the
+    /// keyboard covers its bottom part: `keyboardVisibleBottom`.
+    private var keyboardScreenFrame: CGRect?
 
     // ---- gestures ----
     private let tap2 = UITapGestureRecognizer(target: nil, action: nil)
@@ -384,6 +396,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// Zoomed in: the cursor-centred offset the viewport is
     /// easing towards (nil = not animating).
     private var followTarget: CGPoint?
+    /// Easing time constant for the current `followTarget` easing when it
+    /// was started by the keyboard (derived from the keyboard animation's
+    /// duration); nil = `followTimeConstant`. Cleared when the easing ends.
+    private var followTimeConstantOverride: Double?
     /// Timestamp of the previous animation tick (0 = none yet).
     private var lastAnimTime: CFTimeInterval = 0
     private lazy var animTicker = FrameTicker { [weak self] now in
@@ -402,6 +418,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// Smooth centring (viewport catching up after a jump: resync, zoom,
     /// preset), exponential time constant in seconds.
     private static let followTimeConstant: Double = 0.08
+    /// Keyboard up: the cursor is kept at least this far above the
+    /// keyboard's top edge (and below the top of the visible area).
+    private static let keyboardFollowMargin: CGFloat = 24
     /// Pinch release snaps to fit / fill / 1:1 within this ratio.
     private static let snapTolerance: CGFloat = 0.2
     /// Tap windows (double click at the same pixel, drag-end tap swallow).
@@ -442,6 +461,13 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
                 self.topChromeBottom = bottom
                 self.refit()
             }
+        // Soft keyboard / key bar: the viewport keeps the cursor above it
+        // (selector observers are removed automatically on deallocation).
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(keyboardWillChangeFrame(_:)),
+                           name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardWillHide(_:)),
+                           name: UIResponder.keyboardWillHideNotification, object: nil)
     }
 
     required init?(coder: NSCoder) {
@@ -820,6 +846,32 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return r.width >= 1 && r.height >= 1 ? r : bounds
     }
 
+    /// View y of the keyboard's top edge while the docked keyboard (or the
+    /// key bar alone) covers the bottom of this view, capped to the safe
+    /// area's bottom; nil when no keyboard covers the view (hidden, floating
+    /// / undocked iPad keyboard, outside a window) or when it would leave
+    /// less than 1 pt below the top inset (nothing sensible to follow).
+    private var keyboardVisibleBottom: CGFloat? {
+        guard let kb = keyboardScreenFrame, let window,
+              bounds.width > 0, bounds.height > 0 else { return nil }
+        let local = convert(kb, from: window.screen.coordinateSpace)
+        // Docked: reaches the bottom of this view and overlaps it.
+        guard local.maxY >= bounds.maxY - 1, local.minY < bounds.maxY,
+              local.maxX > bounds.minX, local.minX < bounds.maxX else { return nil }
+        let safe = safeRect
+        let bottom = min(safe.maxY, max(local.minY, bounds.minY))
+        guard bottom - safe.minY >= 1 else { return nil }
+        return bottom
+    }
+
+    /// The part of the view the remote image is placed in for viewport
+    /// purposes: the safe rect, minus what the keyboard covers.
+    private var visibleRect: CGRect {
+        let safe = safeRect
+        guard let bottom = keyboardVisibleBottom else { return safe }
+        return CGRect(x: safe.minX, y: safe.minY, width: safe.width, height: bottom - safe.minY)
+    }
+
     /// TeamViewer's minimum zoom: the whole frame inside the safe area,
     /// min((w - l - r) / R.w, (h - t - b) / R.h).
     private var fitScale: CGFloat {
@@ -874,10 +926,15 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// TeamViewer layout); where it is larger than the view, never scrolled
     /// past its edges (the image always covers the view, no black band);
     /// in between, kept inside the view.
+    /// While the keyboard covers the bottom of the view, the image may also
+    /// scroll up until its bottom edge meets the keyboard's top edge (never
+    /// further: no black band above the keyboard); at fit it rests pinned
+    /// to the top unless the cursor follow scrolls it.
     private func clamped(_ p: CGPoint) -> CGPoint {
         let cw = frameSize.width * scale
         let ch = frameSize.height * scale
         let safe = safeRect
+        let kbBottom = keyboardVisibleBottom
         var q = p
         if cw <= safe.width + 0.5 { // tolerance: fit is computed from it
             q.x = safe.minX + (safe.width - cw) / 2
@@ -887,10 +944,18 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             q.x = min(max(p.x, lo), hi)
         }
         if ch <= safe.height + 0.5 {
-            q.y = safe.minY
+            if let kb = kbBottom, ch > kb - safe.minY {
+                // Taller than the area above the keyboard: from pinned to
+                // the top down to its bottom edge at the keyboard's top.
+                q.y = min(max(p.y, kb - ch), safe.minY)
+            } else {
+                q.y = safe.minY
+            }
         } else {
-            let lo = min(0, bounds.height - ch)
-            let hi = max(0, bounds.height - ch)
+            // The bottom limit is the keyboard's top edge while it is up.
+            let limit = kbBottom ?? bounds.height
+            let lo = min(0, limit - ch)
+            let hi = max(0, limit - ch)
             q.y = min(max(p.y, lo), hi)
         }
         return q
@@ -906,29 +971,57 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return f > 0 && scale > f * 1.001
     }
 
-    /// The offset that puts the predicted cursor at the view's centre.
+    /// The offset that puts the predicted cursor at the view's centre
+    /// (vertically: the centre of the area above the keyboard while it is
+    /// up).
     private var cursorCentredOffset: CGPoint {
         let c = input.cursor
-        return CGPoint(x: bounds.midX - c.x * scale, y: bounds.midY - c.y * scale)
+        let midY = keyboardVisibleBottom != nil ? visibleRect.midY : bounds.midY
+        return CGPoint(x: bounds.midX - c.x * scale, y: midY - c.y * scale)
+    }
+
+    /// Keyboard up: `p` moved vertically just enough that the cursor lies
+    /// inside the visible rect (above the keyboard), `keyboardFollowMargin`
+    /// from its top / bottom edges. Unchanged without a keyboard / cursor.
+    private func keyboardFollowed(_ p: CGPoint) -> CGPoint {
+        guard keyboardVisibleBottom != nil, input.hasCursor, scale > 0 else { return p }
+        let vis = visibleRect
+        let m = min(Self.keyboardFollowMargin, vis.height / 4)
+        let y = p.y + input.cursor.y * scale
+        var q = p
+        if y > vis.maxY - m {
+            q.y -= y - (vis.maxY - m)
+        } else if y < vis.minY + m {
+            q.y += (vis.minY + m) - y
+        }
+        return q
     }
 
     /// Where the viewport belongs at the current zoom: zoomed in, the
     /// cursor-centred offset clamped to the image edges (a continuous
     /// function of the cursor, so following never jumps or oscillates);
-    /// else the current offset clamped. On an axis where the image is no
-    /// larger than the safe area the clamp keeps it centred / at the top
-    /// (no jump away from the top on a small zoom).
+    /// else the current offset clamped (keyboard up: scrolled just enough
+    /// to keep the cursor above the keyboard). On an axis where the image
+    /// is no larger than the safe area the clamp keeps it centred / at the
+    /// top (no jump away from the top on a small zoom).
     private func viewportTarget() -> CGPoint {
-        clamped(centresCursor ? cursorCentredOffset : offset)
+        clamped(centresCursor ? cursorCentredOffset : keyboardFollowed(offset))
     }
 
     /// Place the viewport for the current zoom (`viewportTarget`).
     /// Viewport jumps (zoom, resync, leaving / reaching fit) are eased when
     /// `animated` or while an easing is already running, else immediate.
-    private func settleViewport(animated: Bool) {
+    /// `timeConstant` (keyboard transitions) sets the easing speed; a new
+    /// easing started without one uses `followTimeConstant`.
+    private func settleViewport(animated: Bool, timeConstant: Double? = nil) {
         guard scale > 0 else { return }
         let target = viewportTarget()
         if animated || followTarget != nil {
+            if let timeConstant {
+                followTimeConstantOverride = timeConstant
+            } else if followTarget == nil {
+                followTimeConstantOverride = nil
+            }
             followTarget = target
             if !animTicker.isRunning {
                 lastAnimTime = 0
@@ -945,7 +1038,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     /// After the cursor moved locally (trackpad, pointer lock).
     private func followCursorAfterMove() {
-        if centresCursor || followTarget != nil {
+        if centresCursor || followTarget != nil || keyboardVisibleBottom != nil {
             settleViewport(animated: false)
         }
         updateCursorLayer()
@@ -956,14 +1049,19 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// left the middle 80% of the view (no hover feedback loop on iPad) and
     /// the clamped target actually differs (a cursor parked near an image
     /// edge, where the view already stops, starts no easing).
+    /// Keyboard up: the same, vertically within the area above the keyboard
+    /// (also at fit, where the image may scroll up to the keyboard edge).
     private func followHostCursor() {
-        guard scale > 0, centresCursor else { return }
+        let keyboardUp = keyboardVisibleBottom != nil
+        guard scale > 0, input.hasCursor, centresCursor || keyboardUp else { return }
         let v = frameToView(input.cursor)
-        let inner = bounds.insetBy(dx: bounds.width * 0.1, dy: bounds.height * 0.1)
-        // A top-pinned axis never follows: only the horizontal position
-        // counts then.
-        let outX = v.x < inner.minX || v.x > inner.maxX
-        let outY = !pinsToTop && (v.y < inner.minY || v.y > inner.maxY)
+        let vis = keyboardUp ? visibleRect : bounds
+        let innerX = bounds.insetBy(dx: bounds.width * 0.1, dy: 0)
+        let innerY = vis.insetBy(dx: 0, dy: vis.height * 0.1)
+        // A top-pinned axis never follows (unless the keyboard is up): only
+        // the horizontal position counts then.
+        let outX = v.x < innerX.minX || v.x > innerX.maxX
+        let outY = (!pinsToTop || keyboardUp) && (v.y < innerY.minY || v.y > innerY.maxY)
         guard outX || outY else { return }
         let target = viewportTarget()
         if followTarget != nil || abs(target.x - offset.x) > 0.5 || abs(target.y - offset.y) > 0.5 {
@@ -981,12 +1079,14 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
         let target = clamped(rawTarget)
         let dt = lastAnimTime > 0 ? min(max(now - lastAnimTime, 0), 0.1) : 1.0 / 60.0
-        let k = CGFloat(1 - exp(-dt / Self.followTimeConstant))
+        let tc = followTimeConstantOverride ?? Self.followTimeConstant
+        let k = CGFloat(1 - exp(-dt / tc))
         offset.x += (target.x - offset.x) * k
         offset.y += (target.y - offset.y) * k
         if abs(target.x - offset.x) < 0.25 && abs(target.y - offset.y) < 0.25 {
             offset = target
             followTarget = nil
+            followTimeConstantOverride = nil
         }
         applyViewport()
         return followTarget != nil
@@ -1250,6 +1350,45 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     // MARK: Keyboard
 
     override var canBecomeFirstResponder: Bool { true }
+
+    /// The soft keyboard / key bar is moving to a new frame (shown, resized,
+    /// undocked, or going away: the end frame is then off screen).
+    @objc private func keyboardWillChangeFrame(_ note: Notification) {
+        let info = note.userInfo ?? [:]
+        let end = (info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
+        keyboardFrameChanged(end, note)
+    }
+
+    @objc private func keyboardWillHide(_ note: Notification) {
+        keyboardFrameChanged(nil, note)
+    }
+
+    /// Re-place the viewport for the new area above the keyboard, eased
+    /// over the keyboard's animation duration: scrolled just enough to keep
+    /// the cursor above the keyboard when it comes up (never zoomed), back
+    /// to the normal placement (pinned to the top at fit, cursor-centred
+    /// when zoomed in) when it goes away.
+    private func keyboardFrameChanged(_ end: CGRect?, _ note: Notification) {
+        var frame = end
+        if let f = frame, f.isNull || f.isEmpty {
+            frame = nil
+        }
+        guard frame != keyboardScreenFrame else { return }
+        let before = keyboardVisibleBottom
+        keyboardScreenFrame = frame
+        guard window != nil, scale > 0, before != keyboardVisibleBottom else { return }
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?
+            .doubleValue ?? 0.25
+        if duration > 0 {
+            // ~95% of the way after the keyboard's duration (its spring
+            // settles a little later).
+            settleViewport(animated: true, timeConstant: max(duration, 0.1) / 3)
+        } else {
+            followTarget = nil
+            followTimeConstantOverride = nil
+            settleViewport(animated: false)
+        }
+    }
 
     /// Become first responder (hardware keys) unless the key input view
     /// already is.
