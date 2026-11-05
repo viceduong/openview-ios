@@ -179,6 +179,9 @@ struct SettingsView: View {
                         .foregroundColor(.secondary)
                 }
             }
+            Button("Reset controls to TeamViewer defaults") {
+                RemoteInputController.resetToTeamViewerDefaults()
+            }
         }
     }
 

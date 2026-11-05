@@ -504,8 +504,35 @@ final class RemoteInputController: ObservableObject {
 
     /// One-time settings migration (idempotent; called at app start and by
     /// every controller): the old 2.5x default becomes 1.0x (TeamViewer).
+    /// Control settings that define the TeamViewer-parity experience.
+    static let teamViewerParityKeys = [
+        modeDefaultsKey, cursorFlingDefaultsKey, cursorAccelDefaultsKey,
+        cursorSpeedDefaultsKey, viewportFollowDefaultsKey, lockLocalZoomDefaultsKey,
+        immediateClicksDefaultsKey, scrollInertiaDefaultsKey, classicTouchDefaultsKey,
+    ]
+    /// One-time flag: stored control settings were reset to TeamViewer parity.
+    static let parityResetDefaultsKey = "ov.tvParityDefaultsV42"
+
+    /// Reset every control setting to its TeamViewer-parity default (mouse
+    /// mode, 1.0x linear cursor, no inertia, delayed tap clicks, centre
+    /// follow, TeamViewer touch gestures) by removing the stored values.
+    static func resetToTeamViewerDefaults() {
+        let d = UserDefaults.standard
+        for key in teamViewerParityKeys {
+            d.removeObject(forKey: key)
+        }
+    }
+
     static func migrateDefaults() {
         let d = UserDefaults.standard
+        if !d.bool(forKey: parityResetDefaultsKey) {
+            // TeamViewer parity is the default from v0.42 on: drop values
+            // saved by earlier builds or experiments, once.
+            resetToTeamViewerDefaults()
+            d.set(true, forKey: parityResetDefaultsKey)
+            d.set(true, forKey: cursorSpeedMigratedDefaultsKey)
+            return
+        }
         guard !d.bool(forKey: cursorSpeedMigratedDefaultsKey) else { return }
         if let v = d.object(forKey: cursorSpeedDefaultsKey) as? Double {
             if abs(v - legacyDefaultCursorSpeed) < 0.0001 {
