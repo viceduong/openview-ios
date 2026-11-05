@@ -991,10 +991,27 @@ final class RemoteInputController: ObservableObject {
 
     /// Accessory-bar tap: off -> latched; latched -> locked when tapped
     /// again within 0.35 s, else off; locked -> off.
+    /// Win is different (like TeamViewer's Win button): a tap sends the
+    /// Windows key on its own (opens Start); a second tap within 0.35 s
+    /// locks Win held for combos (Win+R, Win+E...); a tap releases it.
     func tapModifier(_ m: ModifierKey) {
         let now = CACurrentMediaTime()
         let last = lastModifierTap[m.rawValue]
         lastModifierTap[m.rawValue] = now
+        if m == .win {
+            switch state(of: m) {
+            case .off:
+                if now - last < Self.modifierDoubleTap {
+                    setModifier(m, .locked)
+                } else {
+                    sendKey(m.stroke, down: true)
+                    sendKey(m.stroke, down: false)
+                }
+            case .latched, .locked:
+                setModifier(m, .off)
+            }
+            return
+        }
         switch state(of: m) {
         case .off:
             setModifier(m, .latched)
