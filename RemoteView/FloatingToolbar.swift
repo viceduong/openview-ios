@@ -297,6 +297,11 @@ final class KeyboardTracker: NSObject, ObservableObject {
     private var sentinel: UIView?
     private var link: CADisplayLink?
     private var trackUntil: CFTimeInterval = 0
+    /// Where the keyboard ends up, from the notification's end frame. The
+    /// reference: the per-frame sentinel reading only refines the motion
+    /// toward it, and is ignored when it disagrees (e.g. the guide never
+    /// moves for this keyboard).
+    private var targetHeight: CGFloat = 0
 
     override init() {
         super.init()
@@ -318,7 +323,12 @@ final class KeyboardTracker: NSObject, ObservableObject {
 
     private func keyboardWillMove(_ note: Notification) {
         installSentinelIfNeeded()
-        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        let info = note.userInfo ?? [:]
+        let end = (info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue ?? .zero
+        let hiding = note.name == UIResponder.keyboardWillHideNotification
+        targetHeight = hiding ? 0 : max(UIScreen.main.bounds.maxY - end.minY, 0)
+        if targetHeight > 0 && !up { up = true }
+        let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
         // The keyboard's spring settles a little after the stated duration.
         trackUntil = CACurrentMediaTime() + max(duration, 0.25) + 0.35
         if link == nil {
@@ -354,15 +364,22 @@ final class KeyboardTracker: NSObject, ObservableObject {
     }
 
     @objc private func tick() {
-        guard let v = sentinel, let window = v.window else { return }
-        // The presentation layer is where the keyboard is right now.
-        let frame = v.layer.presentation()?.frame ?? v.frame
-        let keyboardTop = frame.maxY
-        let bottomInset = window.safeAreaInsets.bottom
-        var h = max(window.bounds.height - keyboardTop, 0)
-        // With no keyboard the guide sits on the safe area: that is not a
-        // keyboard.
-        if h <= bottomInset + 1 { h = 0 }
+        var h = targetHeight
+        if let v = sentinel, let window = v.window {
+            // The presentation layer is where the keyboard is right now.
+            let frame = v.layer.presentation()?.frame ?? v.frame
+            var sampled = max(window.bounds.height - frame.maxY, 0)
+            // With no keyboard the guide sits on the safe area: that is not
+            // a keyboard.
+            if sampled <= window.safeAreaInsets.bottom + 1 { sampled = 0 }
+            // Use the live reading only while it is plausibly between where
+            // we are and where the keyboard is going.
+            let lo = min(height, targetHeight) - 2
+            let hi = max(height, targetHeight) + 2
+            if sampled >= lo && sampled <= hi { h = sampled }
+        }
+        // Tracking over: settle exactly on the notification's end frame.
+        if CACurrentMediaTime() > trackUntil { h = targetHeight }
         // Position: every frame, no animation of our own (the keyboard's
         // motion is the animation). The up/down switch is a normal change,
         // so the toolbar's collapse spring still plays.
@@ -372,7 +389,7 @@ final class KeyboardTracker: NSObject, ObservableObject {
             withTransaction(t) { height = h }
         }
         if h > 0 && !up { up = true }
-        if h == 0 && up { up = false }
+        if h == 0 && targetHeight == 0 && up { up = false }
         if CACurrentMediaTime() > trackUntil {
             link?.invalidate()
             link = nil
