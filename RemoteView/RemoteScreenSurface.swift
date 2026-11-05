@@ -11,12 +11,19 @@ import UIKit
 // Gestures (CRD structure, timings tuned to TeamViewer iOS 15.81):
 //
 //   MOUSE (trackpad) mode
-//     1-finger pan        relative cursor move: finger travel x "Cursor
-//                         speed" (setting "ov.cursorSpeed", 1x-5x, default
-//                         2.5x) in on-screen points, so zooming in still
-//                         slows it in remote pixels (precision); optional
+//     1-finger pan        TeamViewer 15.81 model: normalised position
+//                         pct += finger travel (screen points) / displayed
+//                         image size (points), clamped, sent as ABSOLUTE
+//                         moves (RemoteInputController.moveCursorTrackpad).
+//                         At fit, sliding across the image crosses the
+//                         whole remote screen; zoomed in by z, 1 pt = 1/z
+//                         remote px. "Cursor speed" (setting
+//                         "ov.cursorSpeed", 0.5x-3x, default 1.0x = exact
+//                         TeamViewer) multiplies the finger travel; optional
 //                         acceleration curve 1x -> 2.5x on top (setting
-//                         "ov.cursorAccel"); viewport edge-push follows
+//                         "ov.cursorAccel", off). Zoomed in, the viewport
+//                         keeps the cursor centred (TeamViewer; setting
+//                         "ov.viewportFollow" = "edge" restores edge-push)
 //     tap                 left click at the cursor (2nd tap = double click)
 //     tap, then hold/drag left drag (DOWN at 0.15 s, UP on lift) + ring
 //     long-press 0.30 s   right click (10 pt cancel radius)
@@ -24,7 +31,8 @@ import UIKit
 //                         3-finger tap: middle click
 //     2-finger pan        wheel (natural direction) + inertia (T = 250 ms)
 //     pinch               zoom around the cursor; snaps to fit / fill / 1:1
-//                         within +-20% on release
+//                         within +-20% on release. Zoom range (TeamViewer):
+//                         fit inside the safe area ... max(2 pt/px, fit)
 //   TOUCH (direct) mode
 //     tap                 left click at the finger (+ ripple)
 //     long-press          loupe; lift = right click, drag = left drag
@@ -241,6 +249,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var multiTouchEnd: CFTimeInterval = 0
     /// The current one-finger pan started inside a multi-finger sequence.
     private var pan1Suppressed = false
+    /// Where the latest finger touched down (TeamViewer measures trackpad
+    /// travel from touch-down: the pan's recognition slop is not lost).
+    private var fingerDownLocation: CGPoint?
     /// Lock local zoom: touch-mode one-finger drag holding the left button.
     private var touchDragActive = false
     /// Lock local zoom: Ctrl held on the host for a pinch (Ctrl+wheel).
@@ -250,6 +261,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var cursorFling = FlingTracker(timeConstant: 180)
     private var scrollFling = FlingTracker(timeConstant: 250)
     private var scrollFlingFactor: CGFloat = 0
+    /// Mouse mode, zoomed in: the cursor-centred offset the viewport is
+    /// easing towards (nil = not animating).
+    private var followTarget: CGPoint?
+    /// Timestamp of the previous animation tick (0 = none yet).
+    private var lastAnimTime: CFTimeInterval = 0
     private lazy var animTicker = FrameTicker { [weak self] now in
         self?.animate(now)
     }
@@ -261,8 +277,12 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// Wheel units (1/120 notch) per point of two-finger travel: one
     /// notch per 36 pt.
     private static let wheelUnitsPerPoint: CGFloat = 120.0 / 36.0
-    /// Max zoom: one remote pixel = 3 device pixels (3x native).
-    private static let maxDevicePixelsPerRemotePixel: CGFloat = 3
+    /// Max zoom (TeamViewer): 2 view points per remote pixel, or fit when
+    /// that is larger.
+    private static let maxZoomScale: CGFloat = 2
+    /// Smooth centring (viewport catching up after a jump: resync, zoom,
+    /// preset), exponential time constant in seconds.
+    private static let followTimeConstant: Double = 0.08
     /// Pinch release snaps to fit / fill / 1:1 within this ratio.
     private static let snapTolerance: CGFloat = 0.2
     /// Tap windows (double click at the same pixel, drag-end tap swallow).
@@ -437,7 +457,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         gcMouse.onMove = { [weak self] dx, dy in
             guard let self else { return }
             self.input.moveCursorRelative(by: CGPoint(x: dx, y: dy), raw: true)
-            self.updateCursorLayer()
+            self.followCursorAfterMove()
         }
         gcMouse.onButton = { [weak self] button, pressed in
             guard let self else { return }
@@ -466,6 +486,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
         input.onCursorResync = { [weak self] in
             self?.updateCursorLayer()
+            self?.followHostCursor()
         }
         input.zoomPresetHandler = { [weak self] preset in
             self?.applyPreset(preset)
@@ -495,6 +516,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         super.didMoveToWindow()
         if window == nil {
             animTicker.stop()
+            lastAnimTime = 0
             renderTicker.stop()
             gcMouse.stop()
             releasePointerButtons()
@@ -502,6 +524,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             input.touching = false
         } else {
             installInputHooks()
+            // The safe area (fit scale) is only known inside a window.
+            refit()
             setNeedsRender()
             // Always observe mice: GCMouseBridge delivers only while the
             // scene's pointer is actually locked, and the lock can be
@@ -521,6 +545,12 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         endLocalGestures()
         cursorFling.stop()
         scrollFling.stop()
+        // Touch mode keeps the image inside the view; mouse mode may centre
+        // the cursor. @Published delivers in willSet (input.mode is still
+        // the old mode here), so settle on the next main-queue turn.
+        DispatchQueue.main.async { [weak self] in
+            self?.settleViewport(animated: false)
+        }
     }
 
     /// Drop transient gesture UI / held buttons (mode switch, teardown).
@@ -653,6 +683,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         lastHostCursor = p
         if input.hostCursorMoved(to: p) {
             updateCursorLayer()
+            followHostCursor()
         }
     }
 
@@ -663,11 +694,36 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return s > 0 ? s : UIScreen.main.scale
     }
 
-    /// Scale that fits the whole frame (letterboxed): min of the ratios.
+    /// The part of the view outside the window's safe area insets (notch,
+    /// home indicator, status bar), in view coordinates. Computed from the
+    /// window (the SwiftUI host lays this view out ignoring the safe area,
+    /// and what it reports as the view's own safeAreaInsets is not
+    /// guaranteed); zero outside a window.
+    private var safeInsets: UIEdgeInsets {
+        guard let window, bounds.width > 0, bounds.height > 0 else { return .zero }
+        let wi = window.safeAreaInsets
+        let wb = window.bounds
+        let f = convert(bounds, to: window)
+        return UIEdgeInsets(top: max(0, wi.top - f.minY),
+                            left: max(0, wi.left - f.minX),
+                            bottom: max(0, f.maxY - (wb.maxY - wi.bottom)),
+                            right: max(0, f.maxX - (wb.maxX - wi.right)))
+    }
+
+    /// The safe part of the view (the whole view if the insets leave
+    /// nothing).
+    private var safeRect: CGRect {
+        let r = bounds.inset(by: safeInsets)
+        return r.width >= 1 && r.height >= 1 ? r : bounds
+    }
+
+    /// TeamViewer's minimum zoom: the whole frame inside the safe area,
+    /// min((w - l - r) / R.w, (h - t - b) / R.h).
     private var fitScale: CGFloat {
         guard frameSize.width > 0, frameSize.height > 0,
               bounds.width > 0, bounds.height > 0 else { return 0 }
-        return min(bounds.width / frameSize.width, bounds.height / frameSize.height)
+        let s = safeRect
+        return min(s.width / frameSize.width, s.height / frameSize.height)
     }
 
     /// Scale that fills the view (cropped on one axis): max of the ratios.
@@ -682,9 +738,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         1 / displayScale
     }
 
-    /// Up to 3x native, and never below fill.
+    /// TeamViewer's maximum zoom: max(2.0, fit) view points per pixel.
     private var maxScale: CGFloat {
-        max(fitScale, fillScale, Self.maxDevicePixelsPerRemotePixel / displayScale)
+        max(Self.maxZoomScale, fitScale)
     }
 
     /// Zoom relative to fit (1 = fit).
@@ -698,6 +754,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return min(max(s, fitScale), maxScale)
     }
 
+    /// Fit / fill / 1:1, each capped to the zoom range (1:1 above
+    /// max(2, fit) becomes the max).
     private func scaleFor(_ preset: ZoomPreset) -> CGFloat {
         switch preset {
         case .fit: return fitScale
@@ -706,21 +764,131 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Keep the content inside the view (centered on axes where it is
-    /// smaller than the view).
+    /// Keep the content in view: centred in the safe area on axes where it
+    /// fits there, else inside the view (no empty band when it is larger
+    /// than the view).
     private func clampOffset() {
         let cw = frameSize.width * scale
         let ch = frameSize.height * scale
-        if cw <= bounds.width {
-            offset.x = (bounds.width - cw) / 2
+        let safe = safeRect
+        if cw <= safe.width + 0.5 { // tolerance: fit is computed from it
+            offset.x = safe.minX + (safe.width - cw) / 2
         } else {
-            offset.x = min(0, max(bounds.width - cw, offset.x))
+            let lo = min(0, bounds.width - cw)
+            let hi = max(0, bounds.width - cw)
+            offset.x = min(max(offset.x, lo), hi)
         }
-        if ch <= bounds.height {
-            offset.y = (bounds.height - ch) / 2
+        if ch <= safe.height + 0.5 {
+            offset.y = safe.minY + (safe.height - ch) / 2
         } else {
-            offset.y = min(0, max(bounds.height - ch, offset.y))
+            let lo = min(0, bounds.height - ch)
+            let hi = max(0, bounds.height - ch)
+            offset.y = min(max(offset.y, lo), hi)
         }
+    }
+
+    /// Mouse mode, zoomed in beyond fit, "centre" follow (TeamViewer: its
+    /// scroll view has insets of half the visible size, so the cursor can
+    /// always sit at the centre, the image edges included).
+    private var centresCursor: Bool {
+        guard input.mode == .mouse, scale > 0, input.hasCursor,
+              input.viewportFollow == .center else { return false }
+        let f = fitScale
+        return f > 0 && scale > f * 1.001
+    }
+
+    /// The offset that puts the predicted cursor at the view's centre.
+    private var cursorCentredOffset: CGPoint {
+        let c = input.cursor
+        return CGPoint(x: bounds.midX - c.x * scale, y: bounds.midY - c.y * scale)
+    }
+
+    /// Mouse mode with "centre" follow: viewport jumps (zoom, resync,
+    /// leaving / reaching fit) are eased instead of applied at once.
+    private var easesViewport: Bool {
+        input.mode == .mouse && input.viewportFollow == .center
+    }
+
+    /// Place the viewport for the current zoom / mode: cursor-centred
+    /// (mouse mode zoomed in, TeamViewer) or clamped (plus the edge-push
+    /// in mouse mode with "edge" follow). In "centre" mode the change is
+    /// eased when `animated` or while an easing is already running, else
+    /// immediate; other modes are always immediate.
+    private func settleViewport(animated: Bool) {
+        guard scale > 0 else { return }
+        let target: CGPoint
+        if centresCursor {
+            target = cursorCentredOffset
+        } else {
+            let saved = offset
+            clampOffset()
+            target = offset
+            offset = saved
+        }
+        if easesViewport && (animated || followTarget != nil) {
+            followTarget = target
+            if !animTicker.isRunning {
+                lastAnimTime = 0
+                animTicker.start()
+            }
+            return
+        }
+        followTarget = nil
+        if target != offset {
+            offset = target
+            applyViewport()
+        }
+        if input.mode == .mouse && !centresCursor {
+            edgePush()
+        }
+    }
+
+    /// After the cursor moved locally (trackpad, fling, pointer lock).
+    private func followCursorAfterMove() {
+        if centresCursor || followTarget != nil {
+            settleViewport(animated: false)
+        } else {
+            edgePush()
+        }
+        updateCursorLayer()
+    }
+
+    /// The host moved the cursor (resync after local input, or someone at
+    /// the host): centred mode eases the viewport over only when the
+    /// cursor left the middle 80% of the view (no hover feedback loop on
+    /// iPad); edge mode pushes.
+    private func followHostCursor() {
+        guard input.mode == .mouse, scale > 0 else { return }
+        if centresCursor {
+            let v = frameToView(input.cursor)
+            let inner = bounds.insetBy(dx: bounds.width * 0.1, dy: bounds.height * 0.1)
+            if !inner.contains(v) {
+                settleViewport(animated: true)
+            }
+        } else {
+            edgePush()
+        }
+    }
+
+    /// One easing step towards `followTarget`; false when done.
+    private func stepFollow(_ now: CFTimeInterval) -> Bool {
+        guard let target = followTarget else { return false }
+        guard easesViewport, scale > 0 else {
+            // Mode / setting changed meanwhile: place it at once.
+            followTarget = nil
+            settleViewport(animated: false)
+            return false
+        }
+        let dt = lastAnimTime > 0 ? min(max(now - lastAnimTime, 0), 0.1) : 1.0 / 60.0
+        let k = CGFloat(1 - exp(-dt / Self.followTimeConstant))
+        offset.x += (target.x - offset.x) * k
+        offset.y += (target.y - offset.y) * k
+        if abs(target.x - offset.x) < 0.25 && abs(target.y - offset.y) < 0.25 {
+            offset = target
+            followTarget = nil
+        }
+        applyViewport()
+        return followTarget != nil
     }
 
     /// View or frame size changed (rotation, keyboard, monitor switch):
@@ -736,7 +904,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         } else {
             scale = clampScale(scale)
         }
-        clampOffset()
+        followTarget = nil
+        settleViewport(animated: false)
+        // Centred mode with an unchanged offset skips applyViewport: the
+        // scale may still have changed.
         applyViewport()
     }
 
@@ -762,7 +933,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         scale = newScale
         offset = CGPoint(x: pivot.x - fx * newScale, y: pivot.y - fy * newScale)
         followPreset = abs(newScale - fitScale) < 0.0001 ? .fit : nil
-        clampOffset()
+        // Mouse mode, "centre" follow: left unclamped, the caller eases it
+        // (settleViewport) to the cursor-centred or clamped offset.
+        if !easesViewport {
+            clampOffset()
+        }
         applyViewport()
     }
 
@@ -783,11 +958,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         scale = scaleFor(preset)
         followPreset = preset
         offset = CGPoint(x: center.x - fp.x * scale, y: center.y - fp.y * scale)
-        clampOffset()
+        followTarget = nil
+        settleViewport(animated: false)
         applyViewport()
-        if input.mode == .mouse {
-            edgePush()
-        }
     }
 
     /// Pinch released: snap to fit / fill / 1:1 when within +-20%.
@@ -812,8 +985,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         followPreset = preset
     }
 
-    /// Mouse mode: pan the zoomed view so the cursor stays out of the
-    /// outer 13% band.
+    /// Mouse mode ("edge" follow): pan the zoomed view so the cursor stays
+    /// out of the outer 13% band.
     private func edgePush() {
         guard scale > 0, bounds.width > 0, bounds.height > 0 else { return }
         let cw = frameSize.width * scale
@@ -854,13 +1027,18 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
         if bounds.size != lastBoundsSize {
             lastBoundsSize = bounds.size
+            // Also keeps the cursor in sight (centred / edge-pushed in
+            // mouse mode) when the view shrank (soft keyboard / key bar)
+            // or rotated.
             refit()
-            // The view shrank (soft keyboard / key bar) or rotated: keep
-            // the cursor in sight.
-            if input.mode == .mouse {
-                edgePush()
-            }
         }
+    }
+
+    /// Rotation / status bar changes move the notch or home indicator:
+    /// the fit scale (safe area) changes even when the bounds do not.
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        refit()
     }
 
     // MARK: Cursor
@@ -935,16 +1113,17 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         CATransaction.commit()
     }
 
-    /// Trackpad motion of `d` view points (finger travel already multiplied
-    /// by `cursorGain`) -> relative cursor move. Dividing by the zoom keeps
-    /// the on-screen cursor travel = `d` at any zoom. The same frame-pixel
-    /// delta updates the predicted cursor and is queued for the host
-    /// (moveCursorRelative), so both stay in step.
+    /// Trackpad motion of `d` screen points (finger travel in this view,
+    /// which is never transformed: the zoom lives on the container layer;
+    /// already multiplied by `cursorGain`, 1.0 by default) -> TeamViewer's
+    /// pct += d / (R * z): `scale` is view POINTS per remote pixel (not
+    /// device pixels), so frameSize * scale is the displayed image size in
+    /// points. The controller sends the resulting absolute position.
     private func moveCursor(byViewPoints d: CGPoint) {
-        guard scale > 0 else { return }
-        input.moveCursorRelative(by: CGPoint(x: d.x / scale, y: d.y / scale))
-        edgePush()
-        updateCursorLayer()
+        guard scale > 0, frameSize.width > 0, frameSize.height > 0 else { return }
+        let displayed = CGSize(width: frameSize.width * scale, height: frameSize.height * scale)
+        input.moveCursorTrackpad(byPoints: d, displayed: displayed)
+        followCursorAfterMove()
     }
 
     /// Pointer acceleration: 1x below 0.5 pt/ms, smoothstep up to 2.5x at
@@ -1051,8 +1230,13 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             running = true
             sendWheel(byViewPoints: d, factor: scrollFlingFactor)
         }
+        if stepFollow(now) {
+            running = true
+        }
+        lastAnimTime = now
         if !running {
             animTicker.stop()
+            lastAnimTime = 0
         }
     }
 
@@ -1160,6 +1344,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
                 pointerTouchBegan(t, event: event)
             } else {
                 finger = true
+                fingerDownLocation = t.location(in: self)
             }
         }
         if finger {
@@ -1278,6 +1463,17 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         case .began:
             cursorFling.stop()
             pan1Suppressed = inMultiFingerAftermath
+            // Mouse mode: count the travel since touch-down (TeamViewer's
+            // P - P_prev with P_prev reset at touch-down), whatever part of
+            // it UIKit's translation leaves out; .changed continues from
+            // here.
+            guard input.mode == .mouse, let down = fingerDownLocation else { return }
+            fingerDownLocation = nil
+            let loc = g.location(in: self)
+            g.setTranslation(.zero, in: self)
+            if isPinching || pan1Suppressed || multiTouchSequence { return }
+            let gain = cursorGain(g)
+            moveCursor(byViewPoints: CGPoint(x: (loc.x - down.x) * gain, y: (loc.y - down.y) * gain))
         case .changed:
             let t = g.translation(in: self)
             g.setTranslation(.zero, in: self)
@@ -1303,7 +1499,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Trackpad gain: the Cursor speed setting (1x...5x, linear), times the
+    /// Trackpad gain: the Cursor speed setting (0.5x...3x, linear, default
+    /// 1x = TeamViewer), times the
     /// acceleration curve when that setting is on (evaluated on the finger's
     /// own speed). Used for pan steps and the fling velocity alike.
     private func cursorGain(_ g: UIPanGestureRecognizer) -> CGFloat {
@@ -1398,8 +1595,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             g.scale = 1
             switch input.mode {
             case .mouse:
+                // Around the cursor; zoomed in, the viewport eases it to
+                // the centre (TeamViewer) or edge-pushes.
                 zoom(by: s, pivot: frameToView(input.cursor))
-                edgePush()
+                settleViewport(animated: true)
             case .touch:
                 let loc = g.location(in: self)
                 if g.numberOfTouches >= 2 {
@@ -1418,7 +1617,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             let pivot = input.mode == .mouse ? frameToView(input.cursor) : g.location(in: self)
             snapZoom(pivot: pivot)
             if input.mode == .mouse {
-                edgePush()
+                settleViewport(animated: true)
             }
         default:
             lastPinchCentroid = nil

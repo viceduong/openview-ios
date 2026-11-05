@@ -5,6 +5,11 @@ import SwiftUI
 struct OpenViewApp: App {
     @StateObject private var app = AppModel()
 
+    init() {
+        // One-time settings migrations, before any @AppStorage reads them.
+        RemoteInputController.migrateDefaults()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

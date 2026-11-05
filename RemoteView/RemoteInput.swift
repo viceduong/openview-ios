@@ -25,7 +25,8 @@ import QuartzCore
 /// `RemoteInputController.modeDefaultsKey` (SwiftUI uses
 /// `@AppStorage("ov.inputMode")` with the same strings).
 enum InputMode: String {
-    /// Trackpad: one finger moves the cursor relatively, taps click at it.
+    /// Trackpad: one finger moves the cursor (TeamViewer model: normalised
+    /// position, absolute moves on the wire), taps click at it.
     case mouse
     /// Direct: taps click where the finger is.
     case touch
@@ -155,6 +156,15 @@ enum ZoomPreset {
     case fill
     /// One remote pixel = one device pixel.
     case native
+}
+
+/// Mouse mode, zoomed in: how the viewport follows the cursor. Raw values
+/// are persisted under `RemoteInputController.viewportFollowDefaultsKey`.
+enum ViewportFollow: String {
+    /// TeamViewer: the cursor stays at the centre, the image moves.
+    case center
+    /// Pan only when the cursor enters the outer 13% band.
+    case edge
 }
 
 /// Sticky modifier state: latched = one-shot (applies to the next key or
@@ -347,10 +357,19 @@ final class RemoteInputController: ObservableObject {
     static let pointerLockDefaultsKey = "ov.pointerLock"
     /// Trackpad pointer acceleration curve (default off: linear motion).
     static let cursorAccelDefaultsKey = "ov.cursorAccel"
-    /// Trackpad cursor speed multiplier (Double).
+    /// Trackpad cursor speed multiplier (Double). 1.0 = TeamViewer exactly
+    /// (sliding across the displayed image crosses the whole remote screen).
     static let cursorSpeedDefaultsKey = "ov.cursorSpeed"
-    static let cursorSpeedRange: ClosedRange<Double> = 1.0...5.0
-    static let defaultCursorSpeed: Double = 2.5
+    static let cursorSpeedRange: ClosedRange<Double> = 0.5...3.0
+    static let defaultCursorSpeed: Double = 1.0
+    /// v0.40 shipped a 2.5x default to make up for a slow-feeling 1x (the
+    /// old relative path, not a units error); a stored 2.5 is reset to 1.0
+    /// once (this flag).
+    static let cursorSpeedMigratedDefaultsKey = "ov.cursorSpeedTVMigrated"
+    private static let legacyDefaultCursorSpeed: Double = 2.5
+    /// Mouse mode, zoomed in: how the viewport follows the cursor
+    /// ("center" = TeamViewer, default; "edge" = push at a 13% margin).
+    static let viewportFollowDefaultsKey = "ov.viewportFollow"
     /// "Lock local zoom": every gesture, pinch included, goes to the host.
     static let lockLocalZoomDefaultsKey = "ov.lockLocalZoom"
 
@@ -382,20 +401,25 @@ final class RemoteInputController: ObservableObject {
     /// takes touches inside them, so they always reach the chrome.
     var chromeExclusionRects: [CGRect] = []
 
-    // ---- cursor (remote frame pixels) ----
+    // ---- cursor ----
     /// Frame size the cursor and normalized coordinates refer to.
     var frameSize: CGSize = .zero {
         didSet {
             guard frameSize != oldValue, frameSize.width > 0, frameSize.height > 0 else { return }
             if !hasCursor {
-                cursor = CGPoint(x: frameSize.width / 2, y: frameSize.height / 2)
+                pct = CGPoint(x: 0.5, y: 0.5) // TeamViewer: start at the centre
                 hasCursor = true
-            } else {
-                cursor = clampToFrame(cursor)
             }
+            // Keep the normalised position (TeamViewer's state) across
+            // frame-size changes; the host's next CURSOR resyncs it.
+            cursor = Self.pixel(fromPct: pct, frame: frameSize)
         }
     }
-    /// Predicted cursor position (drawn locally).
+    /// TeamViewer's cursor state: the normalised position in [0, 1]^2
+    /// (mouse-mode trackpad moves update this; `cursor` follows).
+    private(set) var pct = CGPoint(x: 0.5, y: 0.5)
+    /// Predicted cursor position in frame pixels (drawn locally; the wire
+    /// position is its whole pixel). Kept in step with `pct`.
     private(set) var cursor: CGPoint = .zero
     private(set) var hasCursor = false
     /// Fingers on the surface: host CURSOR echoes are ignored meanwhile.
@@ -432,6 +456,7 @@ final class RemoteInputController: ObservableObject {
     private static let modifierDoubleTap: CFTimeInterval = 0.35
 
     init() {
+        RemoteInputController.migrateDefaults()
         let raw = UserDefaults.standard.string(forKey: RemoteInputController.modeDefaultsKey)
             ?? InputMode.mouse.rawValue
         mode = InputMode(rawValue: raw) ?? .mouse
@@ -463,9 +488,34 @@ final class RemoteInputController: ObservableObject {
         UserDefaults.standard.bool(forKey: Self.cursorAccelDefaultsKey)
     }
 
-    /// Trackpad cursor speed: finger travel (on-screen points) -> cursor
-    /// travel multiplier, 1x...5x (default 2.5x). Read on every pan step,
-    /// so the session menu slider takes effect live.
+    /// One-time settings migration (idempotent; called at app start and by
+    /// every controller): the old 2.5x default becomes 1.0x (TeamViewer).
+    static func migrateDefaults() {
+        let d = UserDefaults.standard
+        guard !d.bool(forKey: cursorSpeedMigratedDefaultsKey) else { return }
+        if let v = d.object(forKey: cursorSpeedDefaultsKey) as? Double {
+            if abs(v - legacyDefaultCursorSpeed) < 0.0001 {
+                d.set(defaultCursorSpeed, forKey: cursorSpeedDefaultsKey)
+            } else if v.isFinite {
+                d.set(min(max(v, cursorSpeedRange.lowerBound), cursorSpeedRange.upperBound),
+                      forKey: cursorSpeedDefaultsKey)
+            } else {
+                d.removeObject(forKey: cursorSpeedDefaultsKey)
+            }
+        }
+        d.set(true, forKey: cursorSpeedMigratedDefaultsKey)
+    }
+
+    /// Mouse mode, zoomed in: centre the cursor (TeamViewer) or push at
+    /// the edges.
+    var viewportFollow: ViewportFollow {
+        let raw = UserDefaults.standard.string(forKey: Self.viewportFollowDefaultsKey) ?? ""
+        return ViewportFollow(rawValue: raw) ?? .center
+    }
+
+    /// Trackpad cursor speed: multiplier on finger travel (on-screen
+    /// points), 0.5x...3x, default 1.0x = TeamViewer. Read on every pan
+    /// step, so the session menu slider takes effect live.
     var cursorSpeed: CGFloat {
         let raw = UserDefaults.standard.object(forKey: Self.cursorSpeedDefaultsKey) as? Double
             ?? Self.defaultCursorSpeed
@@ -522,6 +572,41 @@ final class RemoteInputController: ObservableObject {
                        y: min(max(y, 0), frameSize.height - 1))
     }
 
+    /// TeamViewer's pct -> frame pixel: 1 + pct * (R - 2) per axis (its
+    /// wire position is the truncation of this), clamped to the frame.
+    static func pixel(fromPct q: CGPoint, frame r: CGSize) -> CGPoint {
+        func axis(_ t: CGFloat, _ extent: CGFloat) -> CGFloat {
+            let last = max(extent - 1, 0)
+            let v = extent > 2 ? 1 + t * (extent - 2) : t * last
+            return v.isFinite ? min(max(v, 0), last) : last / 2
+        }
+        return CGPoint(x: axis(q.x, r.width), y: axis(q.y, r.height))
+    }
+
+    /// Inverse of `pixel(fromPct:)`, clamped to [0, 1].
+    static func normalised(fromPixel p: CGPoint, frame r: CGSize) -> CGPoint {
+        func axis(_ v: CGFloat, _ extent: CGFloat) -> CGFloat {
+            let t: CGFloat
+            if extent > 2 {
+                t = (v - 1) / (extent - 2)
+            } else if extent > 1 {
+                t = v / (extent - 1)
+            } else {
+                t = 0.5
+            }
+            return t.isFinite ? min(max(t, 0), 1) : 0.5
+        }
+        return CGPoint(x: axis(p.x, r.width), y: axis(p.y, r.height))
+    }
+
+    /// Set the predicted cursor to frame pixel `p` (clamped) and derive
+    /// the normalised position from it.
+    private func setCursorPixel(_ p: CGPoint) {
+        cursor = clampToFrame(p)
+        pct = Self.normalised(fromPixel: cursor, frame: frameSize)
+        hasCursor = true
+    }
+
     func noteLocalInput() {
         lastLocalInput = CACurrentMediaTime()
     }
@@ -537,9 +622,18 @@ final class RemoteInputController: ObservableObject {
             scheduleResync()
             return false
         }
-        cursor = clampToFrame(p)
-        hasCursor = true
+        // The host reports whole pixels: keep the sub-pixel prediction
+        // (TeamViewer's pct) when it is in that pixel already.
+        if isOnWirePixel(p) { return false }
+        setCursorPixel(p)
         return true
+    }
+
+    /// The predicted cursor's wire pixel (truncated, as sent) is `p`.
+    private func isOnWirePixel(_ p: CGPoint) -> Bool {
+        let q = clampToFrame(p)
+        return cursor.x.rounded(.towardZero) == q.x.rounded(.towardZero)
+            && cursor.y.rounded(.towardZero) == q.y.rounded(.towardZero)
     }
 
     private var hasPendingPointer: Bool {
@@ -560,8 +654,8 @@ final class RemoteInputController: ObservableObject {
                 return
             }
             let p = self.clampToFrame(host)
-            if p != self.cursor {
-                self.cursor = p
+            if !self.isOnWirePixel(p) {
+                self.setCursorPixel(p)
                 self.onCursorResync?()
             }
         }
@@ -571,10 +665,11 @@ final class RemoteInputController: ObservableObject {
     /// motion subject to host acceleration, for pointer-lock deltas only).
     /// The local cursor clamps to the frame; the unclamped delta goes to the
     /// host, which clamps itself (pushing into an edge resyncs both).
+    /// Mouse-mode trackpad uses `moveCursorTrackpad` (absolute, like
+    /// TeamViewer); this path remains for pointer-lock RAW deltas.
     func moveCursorRelative(by d: CGPoint, raw: Bool = false) {
         guard d.x.isFinite, d.y.isFinite, frameSize.width > 0 else { return }
-        cursor = clampToFrame(CGPoint(x: cursor.x + d.x, y: cursor.y + d.y))
-        hasCursor = true
+        setCursorPixel(CGPoint(x: cursor.x + d.x, y: cursor.y + d.y))
         if raw {
             pendingRaw.x += d.x
             pendingRaw.y += d.y
@@ -590,8 +685,33 @@ final class RemoteInputController: ObservableObject {
     /// any pending relative motion.
     func moveCursorAbsolute(to p: CGPoint) {
         guard frameSize.width > 0 else { return }
-        cursor = clampToFrame(p)
+        setCursorPixel(p)
+        queueAbsoluteMove()
+    }
+
+    /// TeamViewer's trackpad model (mouse mode). `d` = finger travel in
+    /// screen points (already times the speed setting); `displayed` = the
+    /// remote image's on-screen size in points (frame pixels x zoom, i.e.
+    /// TeamViewer's R * z). pct += d / max(displayed, 1) per axis, clamped
+    /// to [0, 1] (no wrap); the host gets the ABSOLUTE position
+    /// trunc(1 + pct * (R - 2)), so it can never drift from the
+    /// prediction. Sliding across the displayed image's width crosses the
+    /// whole remote width; zoomed in by z, 1 pt = 1/z remote pixels.
+    func moveCursorTrackpad(byPoints d: CGPoint, displayed: CGSize) {
+        guard d.x.isFinite, d.y.isFinite, frameSize.width > 0, frameSize.height > 0,
+              displayed.width.isFinite, displayed.height.isFinite else { return }
+        let w = max(displayed.width, 1)
+        let h = max(displayed.height, 1)
+        pct = CGPoint(x: min(max(pct.x + d.x / w, 0), 1),
+                      y: min(max(pct.y + d.y / h, 0), 1))
+        cursor = Self.pixel(fromPct: pct, frame: frameSize)
         hasCursor = true
+        queueAbsoluteMove()
+    }
+
+    /// Send the predicted cursor as an absolute move at the next flush
+    /// (replaces any pending relative motion).
+    private func queueAbsoluteMove() {
         pendingAbs = true
         pendingRel = .zero
         pendingRaw = .zero
@@ -666,8 +786,8 @@ final class RemoteInputController: ObservableObject {
     }
 
     private func sendAbsoluteMove(_ p: CGPoint) {
-        let x = InputWire.normalize(p.x, extent: frameSize.width)
-        let y = InputWire.normalize(p.y, extent: frameSize.height)
+        let x = InputWire.normalize(p.x.rounded(.towardZero), extent: frameSize.width)
+        let y = InputWire.normalize(p.y.rounded(.towardZero), extent: frameSize.height)
         if input2 {
             emit(InputWire.pointerEx(action: InputWire.actionMoveAbs, button: 0, flags: 0,
                                      x: Int32(x), y: Int32(y)))
@@ -686,8 +806,7 @@ final class RemoteInputController: ObservableObject {
         guard frameSize.width > 0 else { return }
         flushPointer()
         if let p {
-            cursor = clampToFrame(p)
-            hasCursor = true
+            setCursorPixel(p)
         }
         noteLocalInput()
         guard input2 || button == .left else { return }
@@ -703,7 +822,7 @@ final class RemoteInputController: ObservableObject {
         guard pressedButtons.contains(button) else { return }
         flushPointer()
         if let p {
-            cursor = clampToFrame(p)
+            setCursorPixel(p)
         }
         noteLocalInput()
         pressedButtons.remove(button)
@@ -728,8 +847,8 @@ final class RemoteInputController: ObservableObject {
             var x: Int32 = 0
             var y: Int32 = 0
             if withPos {
-                x = Int32(InputWire.normalize(cursor.x, extent: frameSize.width))
-                y = Int32(InputWire.normalize(cursor.y, extent: frameSize.height))
+                x = Int32(InputWire.normalize(cursor.x.rounded(.towardZero), extent: frameSize.width))
+                y = Int32(InputWire.normalize(cursor.y.rounded(.towardZero), extent: frameSize.height))
             }
             emit(InputWire.pointerEx(action: down ? InputWire.actionDown : InputWire.actionUp,
                                      button: button.rawValue,
@@ -738,8 +857,8 @@ final class RemoteInputController: ObservableObject {
         } else {
             // Legacy POINTER always carries a position: the tracked cursor.
             emit(InputWire.pointer(kind: down ? 1 : 2,
-                                   x: InputWire.normalize(cursor.x, extent: frameSize.width),
-                                   y: InputWire.normalize(cursor.y, extent: frameSize.height)))
+                                   x: InputWire.normalize(cursor.x.rounded(.towardZero), extent: frameSize.width),
+                                   y: InputWire.normalize(cursor.y.rounded(.towardZero), extent: frameSize.height)))
         }
     }
 
@@ -903,8 +1022,8 @@ final class RemoteInputController: ObservableObject {
         } else {
             if pressedButtons.contains(.left) {
                 emit(InputWire.pointer(kind: 2,
-                                       x: InputWire.normalize(cursor.x, extent: frameSize.width),
-                                       y: InputWire.normalize(cursor.y, extent: frameSize.height)))
+                                       x: InputWire.normalize(cursor.x.rounded(.towardZero), extent: frameSize.width),
+                                       y: InputWire.normalize(cursor.y.rounded(.towardZero), extent: frameSize.height)))
             }
             for k in pressedKeys {
                 emit(InputWire.key(vk: k.legacyVK, down: false))

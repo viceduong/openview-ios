@@ -20,6 +20,7 @@ struct SettingsView: View {
     @AppStorage(RemoteInputController.cursorFlingDefaultsKey) private var cursorFling = false
     @AppStorage(SettingsKey.cursorAccel) private var cursorAccel = false
     @AppStorage(SettingsKey.cursorSpeed) private var cursorSpeed = RemoteInputController.defaultCursorSpeed
+    @AppStorage(SettingsKey.viewportFollow) private var viewportFollow = ViewportFollow.center.rawValue
     @AppStorage(RemoteInputController.pointerLockDefaultsKey) private var pointerLock = false
     // Session
     @AppStorage(SettingsKey.keepAwake) private var keepAwake = true
@@ -146,6 +147,10 @@ struct SettingsView: View {
             CursorSpeedRow(speed: $cursorSpeed)
             Toggle("Cursor inertia (fling)", isOn: $cursorFling)
             Toggle("Cursor acceleration", isOn: $cursorAccel)
+            Picker("Zoomed view follows cursor", selection: $viewportFollow) {
+                Text("Centre (TeamViewer)").tag(ViewportFollow.center.rawValue)
+                Text("At edges").tag(ViewportFollow.edge.rawValue)
+            }
             Toggle(isOn: $pointerLock) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Pointer lock (iPad)")
@@ -250,7 +255,8 @@ struct SettingsView: View {
 }
 
 /// "Cursor speed" slider (Settings > Input and the session menu): the
-/// trackpad-mode multiplier, 1.0x...5.0x. Read live by the remote surface.
+/// trackpad-mode multiplier, 0.5x...3.0x; 1.0x = TeamViewer exactly (the
+/// default). Read live by the remote surface.
 struct CursorSpeedRow: View {
     @Binding var speed: Double
 
@@ -259,7 +265,7 @@ struct CursorSpeedRow: View {
             HStack {
                 Text("Cursor speed")
                 Spacer()
-                Text(String(format: "%.1f×", speed))
+                Text(Self.label(speed))
                     .font(.body.monospacedDigit())
                     .foregroundColor(.secondary)
             }
@@ -274,10 +280,16 @@ struct CursorSpeedRow: View {
                     .foregroundColor(.secondary)
                     .accessibilityHidden(true)
             }
-            Text("Mouse (trackpad) mode: how far the cursor travels for each finger movement.")
+            Text("Mouse (trackpad) mode: how far the cursor travels for each finger movement. At 1.0× (TeamViewer) sliding across the shown screen moves the cursor across the whole remote screen.")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
         .padding(.vertical, 2)
+    }
+
+    /// "1.0× (TeamViewer)" at the default, else "1.7×".
+    static func label(_ speed: Double) -> String {
+        let text = String(format: "%.1f×", speed)
+        return abs(speed - RemoteInputController.defaultCursorSpeed) < 0.05 ? text + " (TeamViewer)" : text
     }
 }
