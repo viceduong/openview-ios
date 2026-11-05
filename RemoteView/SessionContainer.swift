@@ -40,7 +40,9 @@ struct SessionContainer: View {
                 // above the keyboard (the surface refits and keeps the
                 // cursor visible).
                 RemoteScreenView(model: controller.screenModel, input: controller.input)
-                    .ignoresSafeArea(.container, edges: .all)
+                    // Also the keyboard: the soft keyboard overlays the
+                    // remote screen instead of shrinking (zooming out) it.
+                    .ignoresSafeArea(.all, edges: .all)
                 phaseLayer(landscape: geo.size.width > geo.size.height)
             }
             .frame(width: geo.size.width, height: geo.size.height)

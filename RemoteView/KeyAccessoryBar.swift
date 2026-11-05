@@ -20,7 +20,7 @@ final class KeyAccessoryBar: UIView {
     /// Hide button tapped.
     var onDismiss: (() -> Void)?
 
-    private let scroll = UIScrollView()
+    private let scroll = KeyStripScrollView()
     private let content = UIStackView()
     private var mainKeys: [UIView] = []
     private var functionKeys: [UIView] = []
@@ -64,6 +64,15 @@ final class KeyAccessoryBar: UIView {
                               label: "Hide keyboard") { [weak self] in
             self?.onDismiss?()
         }
+        // Distinct from the keys: filled accent pill with a white glyph.
+        var hideCfg = UIButton.Configuration.filled()
+        hideCfg.image = UIImage(systemName: "keyboard.chevron.compact.down",
+                                withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold))
+        hideCfg.baseBackgroundColor = .systemBlue
+        hideCfg.baseForegroundColor = .white
+        hideCfg.cornerStyle = .capsule
+        hideCfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10)
+        hide.configuration = hideCfg
         hide.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hide)
 
@@ -73,6 +82,11 @@ final class KeyAccessoryBar: UIView {
         addSubview(divider)
 
         scroll.showsHorizontalScrollIndicator = false
+        // Deliver touches to the keys immediately (default: held ~150 ms to
+        // detect a scroll, so a quick tap's press never showed). Scrolling
+        // still works: a drag cancels the key's touch.
+        scroll.delaysContentTouches = false
+        scroll.canCancelContentTouches = true
         scroll.alwaysBounceHorizontal = true
         scroll.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scroll)
@@ -312,5 +326,13 @@ final class KeyAccessoryBar: UIView {
             b.configuration = cfg
             b.accessibilityValue = s == .off ? nil : (s == .locked ? "locked" : "latched")
         }
+    }
+}
+
+/// The key strip: touches reach the keys at once (no press delay), and a
+/// drag that starts on a key still scrolls the strip.
+private final class KeyStripScrollView: UIScrollView {
+    override func touchesShouldCancel(in view: UIView) -> Bool {
+        true
     }
 }
