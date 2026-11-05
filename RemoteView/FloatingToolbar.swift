@@ -39,6 +39,9 @@ struct FloatingToolbar: View {
     private static let spacing: CGFloat = 2
     private static let pillInset: CGFloat = 4
     private static let edgeGap: CGFloat = 12
+    /// Handle position (fraction of the screen height) while the keyboard
+    /// is up: above any keyboard in either orientation.
+    private static let keyboardHandleY: CGFloat = 0.22
     /// Length of the pill along its axis (5 x 44 + spacing + insets).
     private static let pillLength: CGFloat =
         FloatingToolbar.buttonCount * FloatingToolbar.target
@@ -56,6 +59,10 @@ struct FloatingToolbar: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
+        // Don't resize with the keyboard: the area changing size mid-way
+        // through the collapse spring made the animation jumpy. Positions
+        // used while the keyboard is up are chosen to stay above it.
+        .ignoresSafeArea(.keyboard, edges: .bottom)
         .opacity(chrome.toolbarFaded ? SessionChrome.fadedOpacity : 1)
         .animation(.easeInOut(duration: 0.3), value: chrome.toolbarFaded)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isCollapsed)
@@ -94,11 +101,23 @@ struct FloatingToolbar: View {
         // Too short: the button column scrolls inside a pill filling the
         // edge (at least one button tall).
         let scrollLength: CGFloat? = fits ? nil : max(room - 2 * Self.pillInset, Self.target)
-        return pill(scrollLength: scrollLength)
+        if input.keyInputActive {
+            // Expanded over the keyboard: hang from the handle's position
+            // near the top so the pill stays clear of the keyboard, scrolling
+            // if it doesn't fit in the space above it.
+            let top = max(size.height * Self.keyboardHandleY - Self.handleHeight / 2, Self.edgeGap)
+            let above = max(size.height * 0.5 - top - Self.edgeGap, Self.target)
+            let length: CGFloat? = above >= Self.pillLength ? nil : max(above - 2 * Self.pillInset, Self.target)
+            return AnyView(pill(scrollLength: length)
+                .padding(.trailing, Self.edgeGap)
+                .padding(.top, top)
+                .frame(width: size.width, height: size.height, alignment: .topTrailing))
+        }
+        return AnyView(pill(scrollLength: scrollLength)
             .padding(.trailing, Self.edgeGap)
             .padding(.bottom, below ? Self.edgeGap : 0)
             .frame(width: size.width, height: size.height,
-                   alignment: below ? .bottomTrailing : .trailing)
+                   alignment: below ? .bottomTrailing : .trailing))
     }
 
     /// Portrait: the pill docked bottom-trailing stays entirely below the
@@ -140,7 +159,9 @@ struct FloatingToolbar: View {
     private var buttons: some View {
         toolButton("keyboard", label: "Keyboard", action: onKeyboard)
         toolButton("ellipsis.circle", label: "Session menu", action: onMenu)
-        toolButton("doc.badge.arrow.up", label: "Send file", action: onSendFile)
+        // paperclip exists on iOS 15 (doc.badge.arrow.up is iOS 16+ and
+        // renders blank on 15).
+        toolButton("paperclip", label: "Send file", action: onSendFile)
         toolButton("xmark", label: "Disconnect", tint: Color(red: 1, green: 0.42, blue: 0.4), action: onDisconnect)
         toolButton("chevron.right", label: "Collapse toolbar") {
             setCollapsed(true)
@@ -169,12 +190,17 @@ struct FloatingToolbar: View {
     // MARK: Collapsed handle
 
     private func handle(in size: CGSize) -> some View {
-        let onTrailing = handleEdge != "leading"
+        // Keyboard-collapsed: always the trailing edge, high enough to stay
+        // clear of the keyboard (the layout ignores the keyboard, so the
+        // height here is the full screen).
+        let keyboardHandle = input.keyInputActive && !chrome.toolbarCollapsed
+        let onTrailing = keyboardHandle || handleEdge != "leading"
         let halfWidth = Self.target / 2
         let halfHeight = Self.handleHeight / 2
         let x = onTrailing ? size.width - halfWidth : halfWidth
         let maxY = max(halfHeight, size.height - halfHeight)
-        let y = min(max(CGFloat(handleY) * size.height, halfHeight), maxY)
+        let fraction: CGFloat = keyboardHandle ? Self.keyboardHandleY : CGFloat(handleY)
+        let y = min(max(fraction * size.height, halfHeight), maxY)
         return Image(systemName: onTrailing ? "chevron.compact.left" : "chevron.compact.right")
             .font(.system(size: 22, weight: .bold))
             .foregroundColor(.white)
