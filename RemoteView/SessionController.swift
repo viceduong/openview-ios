@@ -1426,6 +1426,11 @@ final class SessionController: ObservableObject {
         onMain { $0.appendLine(text) }
     }
 
+    /// Diagnostics lines from the session UI ("Log touch routing").
+    func appendDebugLog(_ text: String) {
+        log("[debug] " + text)
+    }
+
     /// Main thread: append and cap the log at `maxLines`.
     private func appendLine(_ text: String) {
         nextLineID += 1

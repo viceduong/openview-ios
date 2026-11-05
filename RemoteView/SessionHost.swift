@@ -1,6 +1,7 @@
 import Combine
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 // The immersive session host (section 3). The session is presented full
 // screen from UIKit with a UIHostingController subclass, because SwiftUI's
@@ -24,8 +25,15 @@ final class SessionChrome: ObservableObject {
             UserDefaults.standard.set(pointerLockOn, forKey: RemoteInputController.pointerLockDefaultsKey)
         }
     }
-    /// The toolbar faded to 40% after 3 s without interaction.
+    /// The toolbar faded to `fadedOpacity` after 3 s without interaction
+    /// (only with the "Fade toolbar when idle" setting, default off).
+    /// Purely visual: a faded toolbar stays fully interactive and its first
+    /// tap acts immediately.
     @Published private(set) var toolbarFaded = false
+    static let fadedOpacity: Double = 0.7
+
+    /// Session-log sink (set by AppModel); see `logTouchRouting`.
+    var debugLog: ((String) -> Void)?
 
     private var fadeWork: DispatchWorkItem?
     private static let fadeDelay: TimeInterval = 3
@@ -35,13 +43,20 @@ final class SessionChrome: ObservableObject {
         pointerLockOn = UserDefaults.standard.bool(forKey: RemoteInputController.pointerLockDefaultsKey)
     }
 
+    /// Diagnostics ("Log touch routing" setting): one session-log line.
+    func logTouchRouting(_ text: String) {
+        guard AppSettings.logTouchRouting else { return }
+        debugLog?(text)
+    }
+
     /// Any toolbar interaction: full opacity, then fade again when idle.
     func poke() {
         if toolbarFaded {
             toolbarFaded = false
         }
         fadeWork?.cancel()
-        guard AppSettings.toolbarAutoHide else { return }
+        fadeWork = nil
+        guard AppSettings.toolbarFade else { return }
         let work = DispatchWorkItem { [weak self] in
             self?.toolbarFaded = true
         }
@@ -87,6 +102,15 @@ final class SessionHostingController: PointerLockHostingController<SessionContai
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+        if AppSettings.logTouchRouting {
+            let logger = TouchRoutingLogger.make()
+            logger.hostController = self
+            logger.log = { [weak self] text in
+                self?.chrome.logTouchRouting(text)
+            }
+            view.addGestureRecognizer(logger)
+            chrome.logTouchRouting("touch routing log on")
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -139,6 +163,99 @@ final class SessionHostingController: PointerLockHostingController<SessionContai
 
     @objc func toggleToolbarCommand(_ sender: UIKeyCommand) {
         chrome.toggleToolbar()
+    }
+}
+
+/// Diagnostics ("Log touch routing"): a passive recognizer on the session's
+/// hosting view that logs, for every finger that goes down / up, the view
+/// UIKit hit-tested it to, the recognizers it was delivered to (with their
+/// states) and any controller presented over the session. It never
+/// recognizes, never prevents (or is prevented by) other recognizers and
+/// never delays or cancels touches; it fails itself once its touches end.
+final class TouchRoutingLogger: UIGestureRecognizer {
+    var log: ((String) -> Void)?
+    weak var hostController: UIViewController?
+    private var tracked = Set<ObjectIdentifier>()
+
+    /// A logger configured to stay out of the way (no init override, so
+    /// no NSCoding initializer requirements).
+    static func make() -> TouchRoutingLogger {
+        let r = TouchRoutingLogger(target: nil, action: nil)
+        r.cancelsTouchesInView = false
+        r.delaysTouchesBegan = false
+        r.delaysTouchesEnded = false
+        return r
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        for t in touches {
+            tracked.insert(ObjectIdentifier(t))
+            log?(describe(t, phase: "down"))
+        }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {}
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        finish(touches, phase: "up")
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        finish(touches, phase: "cancelled")
+    }
+
+    override func reset() {
+        super.reset()
+        tracked.removeAll()
+    }
+
+    private func finish(_ touches: Set<UITouch>, phase: String) {
+        for t in touches {
+            tracked.remove(ObjectIdentifier(t))
+            log?(describe(t, phase: phase))
+        }
+        if tracked.isEmpty && state == .possible {
+            state = .failed
+        }
+    }
+
+    private func describe(_ t: UITouch, phase: String) -> String {
+        let p = t.location(in: view)
+        let target = t.view.map { Self.typeName($0) } ?? "nil"
+        let others = (t.gestureRecognizers ?? []).filter { $0 !== self }
+        let recognizers = others.map { r -> String in
+            let owner = r.view.map { Self.typeName($0) } ?? "nil"
+            return "\(Self.typeName(r))@\(owner):\(Self.stateName(r.state))"
+        }
+        let presented = hostController?.presentedViewController.map { Self.typeName($0) } ?? "none"
+        return "touch \(phase) at (\(Int(p.x)), \(Int(p.y))) -> \(target); presented: \(presented); "
+            + "recognizers: [\(recognizers.joined(separator: ", "))]"
+    }
+
+    /// The type name without generic arguments (SwiftUI's are huge).
+    private static func typeName(_ value: Any) -> String {
+        let full = String(describing: type(of: value))
+        return full.split(separator: "<").first.map(String.init) ?? full
+    }
+
+    private static func stateName(_ s: UIGestureRecognizer.State) -> String {
+        switch s {
+        case .possible: return "possible"
+        case .began: return "began"
+        case .changed: return "changed"
+        case .ended: return "ended"
+        case .cancelled: return "cancelled"
+        case .failed: return "failed"
+        @unknown default: return "?"
+        }
     }
 }
 

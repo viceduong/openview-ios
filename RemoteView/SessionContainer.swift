@@ -154,6 +154,14 @@ struct SessionContainer: View {
                 .transition(.opacity)
             }
         }
+        // The remote surface leaves touches inside these frames to the
+        // chrome (see RemoteSurfaceView.point(inside:with:)).
+        .onPreferenceChange(ChromeFramesKey.self) { rects in
+            controller.input.chromeExclusionRects = rects
+        }
+        .onDisappear {
+            controller.input.chromeExclusionRects = []
+        }
     }
 
     @ViewBuilder
@@ -522,6 +530,7 @@ private struct StatsChip: View {
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
+        .reportsChromeFrame()
         .accessibilityLabel(accessibilityText)
     }
 

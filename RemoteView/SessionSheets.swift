@@ -37,6 +37,8 @@ struct SessionMenuSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.lockLocalZoom) private var lockLocalZoom = false
+    @AppStorage(SettingsKey.cursorSpeed) private var cursorSpeed = RemoteInputController.defaultCursorSpeed
+    @AppStorage(SettingsKey.cursorAccel) private var cursorAccel = false
     @AppStorage(SettingsKey.hideWallpaper) private var hideWallpaper = true
     @AppStorage(SettingsKey.disableAnimations) private var disableAnimations = false
 
@@ -116,6 +118,9 @@ struct SessionMenuSheet: View {
                 Text("Touch").tag(InputMode.touch)
             }
             .pickerStyle(.segmented)
+            // Live: the surface reads the setting on every pan step.
+            CursorSpeedRow(speed: $cursorSpeed)
+            Toggle("Cursor acceleration", isOn: $cursorAccel)
             ForEach(GestureHelp.items(for: input.mode)) { item in
                 GestureHelpRow(item: item)
             }

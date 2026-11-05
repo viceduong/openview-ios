@@ -19,18 +19,21 @@ struct SettingsView: View {
     @AppStorage(RemoteInputController.cmdAsCtrlDefaultsKey) private var cmdAsCtrl = true
     @AppStorage(RemoteInputController.cursorFlingDefaultsKey) private var cursorFling = false
     @AppStorage(SettingsKey.cursorAccel) private var cursorAccel = false
+    @AppStorage(SettingsKey.cursorSpeed) private var cursorSpeed = RemoteInputController.defaultCursorSpeed
     @AppStorage(RemoteInputController.pointerLockDefaultsKey) private var pointerLock = false
     // Session
     @AppStorage(SettingsKey.keepAwake) private var keepAwake = true
     @AppStorage(SettingsKey.orientation) private var orientation = "auto"
     @AppStorage(SettingsKey.showStats) private var showStats = true
-    @AppStorage(SettingsKey.toolbarAutoHide) private var toolbarAutoHide = true
+    @AppStorage(SettingsKey.toolbarFade) private var toolbarFade = false
     @AppStorage(SettingsKey.didShowGestureHelp) private var didShowGestureHelp = false
     // Security
     @AppStorage(SettingsKey.appLock) private var appLock = false
     @AppStorage(SettingsKey.pinBiometric) private var pinBiometric = false
     // Appearance
     @AppStorage(SettingsKey.appearance) private var appearance = "system"
+    // Diagnostics
+    @AppStorage(SettingsKey.logTouchRouting) private var logTouchRouting = false
 
     @State private var confirmForgetPINs = false
     @State private var biometryUnavailable = false
@@ -140,6 +143,7 @@ struct SettingsView: View {
                 Text("Touch").tag(InputMode.touch.rawValue)
             }
             Toggle("Cmd acts as Ctrl", isOn: $cmdAsCtrl)
+            CursorSpeedRow(speed: $cursorSpeed)
             Toggle("Cursor inertia (fling)", isOn: $cursorFling)
             Toggle("Cursor acceleration", isOn: $cursorAccel)
             Toggle(isOn: $pointerLock) {
@@ -161,7 +165,7 @@ struct SettingsView: View {
                 Text("Lock to landscape").tag("landscape")
             }
             Toggle("Show connection stats", isOn: $showStats)
-            Toggle("Fade toolbar when idle", isOn: $toolbarAutoHide)
+            Toggle("Fade toolbar when idle", isOn: $toolbarFade)
             Button("Show gesture help again") {
                 didShowGestureHelp = false
             }
@@ -218,6 +222,14 @@ struct SettingsView: View {
             NavigationLink(destination: SessionLogView(lines: app.lastSessionLog)) {
                 Text("Last session log")
             }
+            Toggle(isOn: $logTouchRouting) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Log touch routing")
+                    Text("Debug: the session log records which view received each touch and every toolbar action. Applies to new sessions.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
         }
     }
 
@@ -234,5 +246,38 @@ struct SettingsView: View {
 
     private static func canAuthenticate() -> Bool {
         LAContext().canEvaluatePolicy(.deviceOwnerAuthentication, error: nil)
+    }
+}
+
+/// "Cursor speed" slider (Settings > Input and the session menu): the
+/// trackpad-mode multiplier, 1.0x...5.0x. Read live by the remote surface.
+struct CursorSpeedRow: View {
+    @Binding var speed: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Cursor speed")
+                Spacer()
+                Text(String(format: "%.1f×", speed))
+                    .font(.body.monospacedDigit())
+                    .foregroundColor(.secondary)
+            }
+            HStack(spacing: 10) {
+                Image(systemName: "tortoise")
+                    .foregroundColor(.secondary)
+                    .accessibilityHidden(true)
+                Slider(value: $speed, in: RemoteInputController.cursorSpeedRange, step: 0.1)
+                    .accessibilityLabel("Cursor speed")
+                    .accessibilityValue(String(format: "%.1f times", speed))
+                Image(systemName: "hare")
+                    .foregroundColor(.secondary)
+                    .accessibilityHidden(true)
+            }
+            Text("Mouse (trackpad) mode: how far the cursor travels for each finger movement.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 2)
     }
 }

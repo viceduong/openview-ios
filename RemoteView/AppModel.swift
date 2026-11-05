@@ -65,6 +65,9 @@ final class AppModel: ObservableObject {
         guard controller == nil else { return }
         let c = SessionController(request: req)
         let chrome = SessionChrome()
+        chrome.debugLog = { [weak c] text in
+            c?.appendDebugLog(text)
+        }
         c.onEstablished = { [weak self, weak c] pine in
             guard let self, let c else { return }
             self.sessionEstablished(c, pine: pine)

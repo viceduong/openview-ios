@@ -25,13 +25,19 @@ enum SettingsKey {
     static let disableAnimations = "ov.disableAnimations"
     // Input (the rest live on RemoteInputController)
     static let cursorAccel = RemoteInputController.cursorAccelDefaultsKey
+    /// Trackpad cursor speed multiplier (Double, 1.0...5.0, default 2.5).
+    static let cursorSpeed = RemoteInputController.cursorSpeedDefaultsKey
     static let lockLocalZoom = RemoteInputController.lockLocalZoomDefaultsKey
     // Session
     static let keepAwake = "ov.keepAwake"
     /// "auto" or "landscape".
     static let orientation = "ov.orientation"
     static let showStats = "ov.showStats"
+    /// Legacy key (v0.39 and earlier, default on); superseded by
+    /// `toolbarFade` so every install starts with fading off.
     static let toolbarAutoHide = "ov.toolbarAutoHide"
+    /// "Fade toolbar when idle" (default off): 70% after 3 s idle.
+    static let toolbarFade = "ov.toolbarFadeIdle"
     static let toolbarCollapsed = "ov.toolbarCollapsed"
     /// Collapsed toolbar handle: "leading" / "trailing" edge, and its
     /// vertical position as a fraction of the height.
@@ -43,6 +49,10 @@ enum SettingsKey {
     static let pinBiometric = "ov.pinBiometric"
     // Appearance: "system" / "light" / "dark".
     static let appearance = "ov.appearance"
+    // Diagnostics
+    /// Append every touch's routing (receiving view, recognizers, presented
+    /// controller) and toolbar actions to the session log (default off).
+    static let logTouchRouting = "ov.debugTouchRouting"
 }
 
 enum AppSettings {
@@ -68,7 +78,8 @@ enum AppSettings {
     static var hideWallpaper: Bool { bool(SettingsKey.hideWallpaper, default: true) }
     static var disableAnimations: Bool { bool(SettingsKey.disableAnimations, default: false) }
     static var keepAwake: Bool { bool(SettingsKey.keepAwake, default: true) }
-    static var toolbarAutoHide: Bool { bool(SettingsKey.toolbarAutoHide, default: true) }
+    static var toolbarFade: Bool { bool(SettingsKey.toolbarFade, default: false) }
+    static var logTouchRouting: Bool { bool(SettingsKey.logTouchRouting, default: false) }
     static var pinBiometric: Bool { bool(SettingsKey.pinBiometric, default: false) }
     static var lockLandscape: Bool {
         UserDefaults.standard.string(forKey: SettingsKey.orientation) == "landscape"

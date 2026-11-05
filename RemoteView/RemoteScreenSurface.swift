@@ -11,8 +11,11 @@ import UIKit
 // Gestures (CRD structure, timings tuned to TeamViewer iOS 15.81):
 //
 //   MOUSE (trackpad) mode
-//     1-finger pan        relative cursor move, linear and scaled by zoom
-//                         (optional acceleration curve 1x -> 2.5x, setting
+//     1-finger pan        relative cursor move: finger travel x "Cursor
+//                         speed" (setting "ov.cursorSpeed", 1x-5x, default
+//                         2.5x) in on-screen points, so zooming in still
+//                         slows it in remote pixels (precision); optional
+//                         acceleration curve 1x -> 2.5x on top (setting
 //                         "ov.cursorAccel"); viewport edge-push follows
 //     tap                 left click at the cursor (2nd tap = double click)
 //     tap, then hold/drag left drag (DOWN at 0.15 s, UP on lift) + ring
@@ -39,6 +42,13 @@ import UIKit
 //
 // Every DOWN gets its UP: positions are clamped to the frame (never
 // dropped) and cancelled / failed gestures release what they pressed.
+//
+// Coexistence with the SwiftUI chrome drawn over this view (v0.40): the
+// surface consumes its touches (never forwards them up the responder
+// chain into the hosting view), never takes touches inside the chrome's
+// frames (`RemoteInputController.chromeExclusionRects`), and its
+// recognizers never block recognizers of ancestor views (SwiftUI's hosting
+// view gesture recognizer drives every SwiftUI Button in the session).
 
 /// SwiftUI wrapper. The parent observes ScreenModel and passes values in.
 struct RemoteScreenSurface: UIViewRepresentable {
@@ -925,7 +935,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         CATransaction.commit()
     }
 
-    /// Trackpad motion of `d` view points -> relative cursor move.
+    /// Trackpad motion of `d` view points (finger travel already multiplied
+    /// by `cursorGain`) -> relative cursor move. Dividing by the zoom keeps
+    /// the on-screen cursor travel = `d` at any zoom. The same frame-pixel
+    /// delta updates the predicted cursor and is queued for the host
+    /// (moveCursorRelative), so both stay in step.
     private func moveCursor(byViewPoints d: CGPoint) {
         guard scale > 0 else { return }
         input.moveCursorRelative(by: CGPoint(x: d.x / scale, y: d.y / scale))
@@ -1121,6 +1135,24 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         multiTouchSequence || CACurrentMediaTime() - multiTouchEnd < Self.multiFingerLiftDebounce
     }
 
+    /// Never take touches over the session chrome (toolbar / handle, stats
+    /// chip): those points fall through to the SwiftUI hosting view, so the
+    /// chrome's buttons get them even if SwiftUI's own hit testing would
+    /// have picked this platform view underneath.
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        guard super.point(inside: point, with: event) else { return false }
+        let rects = input.chromeExclusionRects
+        guard !rects.isEmpty, window != nil else { return true }
+        let p = convert(point, to: nil)
+        return !rects.contains { $0.contains(p) }
+    }
+
+    // The touch overrides below deliberately do NOT call super: UIView's
+    // implementation forwards every touch up the responder chain into
+    // SwiftUI's hosting view, which then tracks remote-screen touches in
+    // the same event bridge that drives the toolbar's Buttons. The surface
+    // consumes its touches completely (all four phases are overridden).
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         var finger = false
         for t in touches {
@@ -1136,7 +1168,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             claimKeyboardFocus()
         }
         updateTouching(event)
-        super.touchesBegan(touches, with: event)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1145,7 +1176,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             input.moveCursorAbsolute(to: viewToFrame(t.location(in: self)))
             updateCursorLayer()
         }
-        super.touchesMoved(touches, with: event)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1153,7 +1183,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             pointerTouchEnded(t)
         }
         updateTouching(event)
-        super.touchesEnded(touches, with: event)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1161,7 +1190,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             pointerTouchEnded(t)
         }
         updateTouching(event)
-        super.touchesCancelled(touches, with: event)
     }
 
     /// A mouse / trackpad click: the button comes from the event's button
@@ -1275,11 +1303,14 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Trackpad gain: 1 (linear) unless the acceleration setting is on.
+    /// Trackpad gain: the Cursor speed setting (1x...5x, linear), times the
+    /// acceleration curve when that setting is on (evaluated on the finger's
+    /// own speed). Used for pan steps and the fling velocity alike.
     private func cursorGain(_ g: UIPanGestureRecognizer) -> CGFloat {
-        guard input.cursorAccelEnabled else { return 1 }
+        let speed = input.cursorSpeed
+        guard input.cursorAccelEnabled else { return speed }
         let v = g.velocity(in: self)
-        return Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
+        return speed * Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
     }
 
     /// Lock local zoom, touch mode: a one-finger drag is a left-button drag
@@ -1503,9 +1534,18 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     /// CRD pairs: pinch + pan, long-press + pan, two-finger tap +
     /// long-press; plus tap-hold drag + pan / tap. Pointer recognizers
-    /// (hover, scroll) never block anything.
+    /// (hover, scroll) never block anything. Recognizers of ancestor views
+    /// (SwiftUI's hosting-view gesture recognizer, the touch-routing
+    /// logger) are never blocked either: by default a surface recognizer
+    /// that recognizes forces them to fail for the whole touch sequence,
+    /// and while any finger stays on the remote screen every new touch on
+    /// the toolbar would join that failed sequence and be ignored. Window
+    /// (system) recognizers keep the default exclusivity.
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        if let v = other.view, v !== self, !(v is UIWindow), isDescendant(of: v) {
+            return true
+        }
         let g = gestureRecognizer
         if g === hover || other === hover { return true }
         if g === scrollContinuous || other === scrollContinuous { return true }

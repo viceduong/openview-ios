@@ -347,6 +347,10 @@ final class RemoteInputController: ObservableObject {
     static let pointerLockDefaultsKey = "ov.pointerLock"
     /// Trackpad pointer acceleration curve (default off: linear motion).
     static let cursorAccelDefaultsKey = "ov.cursorAccel"
+    /// Trackpad cursor speed multiplier (Double).
+    static let cursorSpeedDefaultsKey = "ov.cursorSpeed"
+    static let cursorSpeedRange: ClosedRange<Double> = 1.0...5.0
+    static let defaultCursorSpeed: Double = 2.5
     /// "Lock local zoom": every gesture, pinch included, goes to the host.
     static let lockLocalZoomDefaultsKey = "ov.lockLocalZoom"
 
@@ -373,6 +377,10 @@ final class RemoteInputController: ObservableObject {
     /// The surface that installed the hooks above (a re-hosted surface
     /// takes over; a dismantled one only unhooks if it is still active).
     weak var activeSurface: AnyObject?
+    /// Frames (window coordinates) of the tappable session chrome laid over
+    /// the remote screen (toolbar / handle, stats chip). The surface never
+    /// takes touches inside them, so they always reach the chrome.
+    var chromeExclusionRects: [CGRect] = []
 
     // ---- cursor (remote frame pixels) ----
     /// Frame size the cursor and normalized coordinates refer to.
@@ -453,6 +461,17 @@ final class RemoteInputController: ObservableObject {
     /// Trackpad acceleration curve (default off: linear, scaled by zoom).
     var cursorAccelEnabled: Bool {
         UserDefaults.standard.bool(forKey: Self.cursorAccelDefaultsKey)
+    }
+
+    /// Trackpad cursor speed: finger travel (on-screen points) -> cursor
+    /// travel multiplier, 1x...5x (default 2.5x). Read on every pan step,
+    /// so the session menu slider takes effect live.
+    var cursorSpeed: CGFloat {
+        let raw = UserDefaults.standard.object(forKey: Self.cursorSpeedDefaultsKey) as? Double
+            ?? Self.defaultCursorSpeed
+        guard raw.isFinite else { return CGFloat(Self.defaultCursorSpeed) }
+        let r = Self.cursorSpeedRange
+        return CGFloat(min(max(raw, r.lowerBound), r.upperBound))
     }
 
     /// Local zoom locked: pinch becomes Ctrl+wheel on the host and touch
