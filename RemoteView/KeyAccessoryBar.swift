@@ -223,6 +223,21 @@ final class KeyAccessoryBar: UIView {
         return v
     }
 
+    @objc private func keyPressed(_ sender: UIButton) {
+        UIView.animate(withDuration: 0.08, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+            sender.transform = CGAffineTransform(scaleX: 0.9, y: 0.9)
+            sender.alpha = 0.55
+        }
+    }
+
+    @objc private func keyReleased(_ sender: UIButton) {
+        UIView.animate(withDuration: 0.3, delay: 0.06,
+                       options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]) {
+            sender.transform = .identity
+            sender.alpha = 1
+        }
+    }
+
     /// Uniform key width (TeamViewer-style even ribbon).
     private static let keyWidth: CGFloat = 60
 
@@ -277,6 +292,11 @@ final class KeyAccessoryBar: UIView {
         b.widthAnchor.constraint(equalToConstant: Self.keyWidth).isActive = true
         b.titleLabel?.adjustsFontSizeToFitWidth = true
         b.titleLabel?.minimumScaleFactor = 0.8
+        // Visible press feedback that lingers a moment after the finger
+        // lifts (the configuration's own highlight is instant).
+        b.addTarget(self, action: #selector(keyPressed(_:)), for: [.touchDown, .touchDragEnter])
+        b.addTarget(self, action: #selector(keyReleased(_:)),
+                    for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
         return b
     }
 

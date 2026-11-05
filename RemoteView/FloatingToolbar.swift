@@ -283,72 +283,99 @@ extension View {
 /// keyboard frame notifications, applied with the keyboard's own animation
 /// duration so views tracking it move in step with the keyboard. Includes
 /// an input accessory view (the key bar), also when it is shown alone.
-final class KeyboardTracker: ObservableObject {
-    /// The keyboard is (coming) up. Set before `height` animates, so a
-    /// view switching on it (the toolbar handle) is inserted at the bottom
-    /// and then rides up with the keyboard; cleared after it went down.
+final class KeyboardTracker: NSObject, ObservableObject {
+    /// The keyboard (or the key bar alone) is on screen or animating.
     @Published private(set) var up = false
+    /// Keyboard height on screen, sampled every frame from the keyboard's
+    /// actual animated position, so views following it move in lockstep.
     @Published private(set) var height: CGFloat = 0
-    private var observers: [NSObjectProtocol] = []
-    private var hideWork: DispatchWorkItem?
 
-    init() {
+    private var observers: [NSObjectProtocol] = []
+    /// Invisible view pinned to the window's keyboard layout guide: during
+    /// the keyboard animation its presentation layer moves exactly with the
+    /// keyboard.
+    private var sentinel: UIView?
+    private var link: CADisplayLink?
+    private var trackUntil: CFTimeInterval = 0
+
+    override init() {
+        super.init()
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: UIResponder.keyboardWillChangeFrameNotification,
-                                            object: nil, queue: .main) { [weak self] note in
-            self?.update(note)
-        })
-        observers.append(center.addObserver(forName: UIResponder.keyboardWillHideNotification,
-                                            object: nil, queue: .main) { [weak self] note in
-            self?.update(note, hiding: true)
-        })
+        for name in [UIResponder.keyboardWillChangeFrameNotification,
+                     UIResponder.keyboardWillHideNotification,
+                     UIResponder.keyboardWillShowNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                self?.keyboardWillMove(note)
+            })
+        }
     }
 
     deinit {
         observers.forEach(NotificationCenter.default.removeObserver)
+        link?.invalidate()
+        sentinel?.removeFromSuperview()
     }
 
-    /// iOS animates the keyboard with a spring (UIKit curve 7); these are
-    /// its parameters, so the handle tracks the keyboard frame for frame.
-    /// (The notification's duration is shorter than the spring's settle.)
-    private static func keyboardAnimation(_ duration: Double) -> Animation {
-        _ = duration
-        return .interpolatingSpring(mass: 3, stiffness: 1000, damping: 500, initialVelocity: 0)
+    private func keyboardWillMove(_ note: Notification) {
+        installSentinelIfNeeded()
+        let duration = (note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        // The keyboard's spring settles a little after the stated duration.
+        trackUntil = CACurrentMediaTime() + max(duration, 0.25) + 0.35
+        if link == nil {
+            let l = CADisplayLink(target: self, selector: #selector(tick))
+            if #available(iOS 15.0, *) {
+                l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            }
+            l.add(to: .main, forMode: .common)
+            link = l
+        }
     }
 
-    private func update(_ note: Notification, hiding: Bool = false) {
-        let info = note.userInfo ?? [:]
-        let end = (info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue ?? .zero
-        let screen = UIScreen.main.bounds
-        let newHeight = hiding ? 0 : max(screen.maxY - end.minY, 0)
-        let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
-        let animation = Self.keyboardAnimation(duration)
-        hideWork?.cancel()
-        hideWork = nil
-        if newHeight > 0 {
-            if !up {
-                // Insert the handle at the bottom first (height still 0),
-                // then animate it up together with the keyboard.
-                // Insert the handle at the bottom first (a newly inserted
-                // view appears at its final layout), then slide it up with
-                // the keyboard's spring on the next frame.
-                up = true
-                DispatchQueue.main.async { [weak self] in
-                    withAnimation(animation) { self?.height = newHeight }
-                }
-            } else {
-                withAnimation(animation) { height = newHeight }
-            }
-        } else if up {
-            // Slide the handle down with the keyboard, then restore the
-            // normal toolbar once it is gone.
-            withAnimation(animation) { height = 0 }
-            let work = DispatchWorkItem { [weak self] in
-                self?.up = false
-            }
-            hideWork = work
-            // The keyboard spring settles in about 0.5 s.
-            DispatchQueue.main.asyncAfter(deadline: .now() + max(duration, 0.45), execute: work)
+    private func installSentinelIfNeeded() {
+        guard sentinel == nil || sentinel?.window == nil else { return }
+        sentinel?.removeFromSuperview()
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+        guard let window = windows.first(where: { $0.isKeyWindow }) ?? windows.first else { return }
+        let v = UIView()
+        v.isUserInteractionEnabled = false
+        v.isHidden = true
+        v.translatesAutoresizingMaskIntoConstraints = false
+        window.addSubview(v)
+        NSLayoutConstraint.activate([
+            v.leadingAnchor.constraint(equalTo: window.leadingAnchor),
+            v.widthAnchor.constraint(equalToConstant: 1),
+            v.heightAnchor.constraint(equalToConstant: 1),
+            v.bottomAnchor.constraint(equalTo: window.keyboardLayoutGuide.topAnchor),
+        ])
+        window.layoutIfNeeded()
+        sentinel = v
+    }
+
+    @objc private func tick() {
+        guard let v = sentinel, let window = v.window else { return }
+        // The presentation layer is where the keyboard is right now.
+        let frame = v.layer.presentation()?.frame ?? v.frame
+        let keyboardTop = frame.maxY
+        let bottomInset = window.safeAreaInsets.bottom
+        var h = max(window.bounds.height - keyboardTop, 0)
+        // With no keyboard the guide sits on the safe area: that is not a
+        // keyboard.
+        if h <= bottomInset + 1 { h = 0 }
+        // Position: every frame, no animation of our own (the keyboard's
+        // motion is the animation). The up/down switch is a normal change,
+        // so the toolbar's collapse spring still plays.
+        var t = Transaction()
+        t.disablesAnimations = true
+        if abs(height - h) > 0.25 {
+            withTransaction(t) { height = h }
+        }
+        if h > 0 && !up { up = true }
+        if h == 0 && up { up = false }
+        if CACurrentMediaTime() > trackUntil {
+            link?.invalidate()
+            link = nil
         }
     }
 }
