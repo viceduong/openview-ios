@@ -5,7 +5,7 @@ import UIKit
 /// `inputAccessoryView`, re-hostable anywhere). One horizontally scrolling
 /// ribbon in TeamViewer's order:
 ///   ⊞ Shift Ctrl Alt | ScrLk Fn | Esc Tab PrtScn Pause Ins Del Home End
-///   PgUp PgDn | ← ↑ → ↓ | Ctrl+Alt+Del
+///   PgUp PgDn | ← ↑ → ↓
 /// "Fn" swaps the ribbon for F1–F12 (‹ goes back). A fixed "hide keyboard"
 /// button sits on the trailing edge. Modifier buttons are sticky (see
 /// `RemoteInputController.tapModifier`): tap = one-shot (tinted), double
@@ -141,10 +141,6 @@ final class KeyAccessoryBar: UIView {
         mainKeys.append(keyButton("↑", .up, label: "Up arrow"))
         mainKeys.append(keyButton("→", .right, label: "Right arrow"))
         mainKeys.append(keyButton("↓", .down, label: "Down arrow"))
-        mainKeys.append(separator())
-        mainKeys.append(makeButton(title: "Ctrl+Alt+Del", symbol: nil, label: "Control Alt Delete") { [weak self] in
-            self?.input?.sendSAS()
-        })
 
         // Function-key page.
         functionKeys.append(makeButton(title: "‹", symbol: nil, label: "Back") { [weak self] in
@@ -228,7 +224,7 @@ final class KeyAccessoryBar: UIView {
     }
 
     /// Uniform key width (TeamViewer-style even ribbon).
-    private static let keyWidth: CGFloat = 54
+    private static let keyWidth: CGFloat = 60
 
     /// The Windows 11 logo: four equal squares in a 2 x 2 grid, as a
     /// template image so it takes the button's tint in every state.

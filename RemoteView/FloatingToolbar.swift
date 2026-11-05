@@ -308,9 +308,12 @@ final class KeyboardTracker: ObservableObject {
         observers.forEach(NotificationCenter.default.removeObserver)
     }
 
-    /// iOS's keyboard animation (curve 7) is close to this ease-out.
+    /// iOS animates the keyboard with a spring (UIKit curve 7); these are
+    /// its parameters, so the handle tracks the keyboard frame for frame.
+    /// (The notification's duration is shorter than the spring's settle.)
     private static func keyboardAnimation(_ duration: Double) -> Animation {
-        .timingCurve(0.38, 0.7, 0.125, 1.0, duration: max(duration, 0.1))
+        _ = duration
+        return .interpolatingSpring(mass: 3, stiffness: 1000, damping: 500, initialVelocity: 0)
     }
 
     private func update(_ note: Notification, hiding: Bool = false) {
@@ -326,6 +329,9 @@ final class KeyboardTracker: ObservableObject {
             if !up {
                 // Insert the handle at the bottom first (height still 0),
                 // then animate it up together with the keyboard.
+                // Insert the handle at the bottom first (a newly inserted
+                // view appears at its final layout), then slide it up with
+                // the keyboard's spring on the next frame.
                 up = true
                 DispatchQueue.main.async { [weak self] in
                     withAnimation(animation) { self?.height = newHeight }
@@ -341,7 +347,8 @@ final class KeyboardTracker: ObservableObject {
                 self?.up = false
             }
             hideWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + max(duration, 0.1), execute: work)
+            // The keyboard spring settles in about 0.5 s.
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(duration, 0.45), execute: work)
         }
     }
 }
