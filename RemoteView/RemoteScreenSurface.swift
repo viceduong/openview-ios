@@ -837,9 +837,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Keep the content in view: centred in the safe area on axes where it
-    /// fits there, else inside the view (no empty band when it is larger
-    /// than the view).
+    /// The content fits the safe area vertically at the current zoom: it is
+    /// pinned to the top of the safe area (TeamViewer layout: the screen at
+    /// the top, the free space below it), whatever the cursor does.
+    private var pinsToTop: Bool {
+        frameSize.height * scale <= safeRect.height + 0.5 // tolerance: fit is computed from it
+    }
+
+    /// Keep the content in view: where it fits the safe area, horizontally
+    /// centred and vertically at the top of the safe area (TeamViewer),
+    /// else inside the view (no empty band when it is larger than the view).
     private func clampOffset() {
         let cw = frameSize.width * scale
         let ch = frameSize.height * scale
@@ -852,7 +859,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             offset.x = min(max(offset.x, lo), hi)
         }
         if ch <= safe.height + 0.5 {
-            offset.y = safe.minY + (safe.height - ch) / 2
+            offset.y = safe.minY
         } else {
             let lo = min(0, bounds.height - ch)
             let hi = max(0, bounds.height - ch)
@@ -883,7 +890,14 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         guard scale > 0 else { return }
         let target: CGPoint
         if centresCursor {
-            target = cursorCentredOffset
+            // Zoomed in: the cursor at the centre — except vertically while
+            // the image is still no taller than the safe area, where it
+            // stays at the top (no jump away from the top on a small zoom).
+            var t = cursorCentredOffset
+            if pinsToTop {
+                t.y = safeRect.minY
+            }
+            target = t
         } else {
             let saved = offset
             clampOffset()
@@ -920,7 +934,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         guard scale > 0, centresCursor else { return }
         let v = frameToView(input.cursor)
         let inner = bounds.insetBy(dx: bounds.width * 0.1, dy: bounds.height * 0.1)
-        if !inner.contains(v) {
+        // A top-pinned axis never follows: only the horizontal position
+        // counts then.
+        let outX = v.x < inner.minX || v.x > inner.maxX
+        let outY = !pinsToTop && (v.y < inner.minY || v.y > inner.maxY)
+        if outX || outY {
             settleViewport(animated: true)
         }
     }
@@ -962,6 +980,28 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         // Centred mode with an unchanged offset skips applyViewport: the
         // scale may still have changed.
         applyViewport()
+        publishFitImageFrame()
+    }
+
+    /// Tell the chrome where the image sits at fit (window coordinates:
+    /// centred horizontally, top of the safe area), so the toolbar can dock
+    /// in the free space below it. Independent of the current zoom, so the
+    /// toolbar does not move while zooming / panning. Published on the next
+    /// main-queue turn: refit runs inside SwiftUI view updates
+    /// (updateUIView -> setFrame), where publishing is not allowed.
+    private func publishFitImageFrame() {
+        let f = fitScale
+        guard f > 0, window != nil else { return }
+        let safe = safeRect
+        let w = frameSize.width * f
+        let h = frameSize.height * f
+        let local = CGRect(x: safe.minX + (safe.width - w) / 2, y: safe.minY, width: w, height: h)
+        let r = convert(local, to: nil).integral
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.input.activeSurface === self,
+                  self.input.fitImageFrame != r else { return }
+            self.input.fitImageFrame = r
+        }
     }
 
     private func applyViewport() {

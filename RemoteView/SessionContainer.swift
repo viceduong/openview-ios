@@ -130,6 +130,7 @@ struct SessionContainer: View {
             .animation(.easeInOut(duration: 0.25), value: controller.toast)
 
             FloatingToolbar(chrome: chrome,
+                            input: controller.input,
                             isLandscape: landscape,
                             unread: controller.unreadChat,
                             onKeyboard: { controller.input.showKeyboard(soft: true) },

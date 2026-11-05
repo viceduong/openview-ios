@@ -373,6 +373,11 @@ final class RemoteInputController: ObservableObject {
     /// the remote screen (toolbar / handle, stats chip). The surface never
     /// takes touches inside them, so they always reach the chrome.
     var chromeExclusionRects: [CGRect] = []
+    /// Where the remote image sits at fit zoom (window coordinates; `.null`
+    /// until the surface has laid out a frame). Published by the surface
+    /// when it refits; the floating toolbar docks below it when there is
+    /// room (portrait).
+    @Published var fitImageFrame: CGRect = .null
 
     // ---- cursor ----
     /// Frame size the cursor and normalized coordinates refer to.

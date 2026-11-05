@@ -2,9 +2,12 @@ import SwiftUI
 
 /// The session toolbar: a collapsible pill (.ultraThinMaterial capsule,
 /// 44 pt targets) — Keyboard, Menu, Chat (unread
-/// badge), Disconnect, Collapse. Bottom-trailing in portrait, vertical on
-/// the trailing edge in landscape (horizontal at the bottom when the
-/// landscape height cannot fit the vertical pill, e.g. keyboard up).
+/// badge), Disconnect, Collapse. Always a vertical pill docked on the
+/// trailing edge (TeamViewer layout, the remote screen at the top): in
+/// portrait at the bottom-trailing corner when that leaves it below the
+/// fitted remote image, else (and in landscape) vertically centred. When
+/// the height cannot fit the whole pill (e.g. landscape with the keyboard
+/// up) its buttons scroll inside it.
 /// Collapsed it is a small handle the user drags anywhere; it snaps to the
 /// nearest side edge and the position is persisted. Optionally fades to
 /// 70% after 3 s without interaction ("Fade toolbar when idle", default
@@ -15,6 +18,8 @@ import SwiftUI
 /// remote surface underneath never takes touches meant for them.
 struct FloatingToolbar: View {
     @ObservedObject var chrome: SessionChrome
+    /// Publishes where the remote image sits at fit (`fitImageFrame`).
+    @ObservedObject var input: RemoteInputController
     let isLandscape: Bool
     let unread: Int
     let onKeyboard: () -> Void
@@ -43,12 +48,7 @@ struct FloatingToolbar: View {
             if chrome.toolbarCollapsed {
                 handle(in: geo.size)
             } else {
-                let vertical = isLandscape && geo.size.height >= Self.pillLength + 2 * Self.edgeGap
-                pill(vertical: vertical)
-                    .padding(.trailing, Self.edgeGap)
-                    .padding(.bottom, vertical ? 0 : Self.edgeGap)
-                    .frame(width: geo.size.width, height: geo.size.height,
-                           alignment: vertical ? .trailing : .bottomTrailing)
+                expanded(in: geo)
             }
         }
         .opacity(chrome.toolbarFaded ? SessionChrome.fadedOpacity : 1)
@@ -58,16 +58,44 @@ struct FloatingToolbar: View {
 
     // MARK: Expanded pill
 
-    private func pill(vertical: Bool) -> some View {
+    /// The vertical pill on the trailing edge: bottom-trailing below the
+    /// image when there is room (portrait), else vertically centred; its
+    /// buttons scroll when the edge is shorter than the pill.
+    private func expanded(in geo: GeometryProxy) -> some View {
+        let size = geo.size
+        let room = max(size.height - 2 * Self.edgeGap, 0)
+        let fits = room >= Self.pillLength
+        let below = fits && !isLandscape && fitsBelowImage(in: geo)
+        // Too short: the button column scrolls inside a pill filling the
+        // edge (at least one button tall).
+        let scrollLength: CGFloat? = fits ? nil : max(room - 2 * Self.pillInset, Self.target)
+        return pill(scrollLength: scrollLength)
+            .padding(.trailing, Self.edgeGap)
+            .padding(.bottom, below ? Self.edgeGap : 0)
+            .frame(width: size.width, height: size.height,
+                   alignment: below ? .bottomTrailing : .trailing)
+    }
+
+    /// Portrait: the pill docked bottom-trailing stays entirely below the
+    /// remote image at fit (the surface publishes its window frame).
+    private func fitsBelowImage(in geo: GeometryProxy) -> Bool {
+        let image = input.fitImageFrame
+        guard !image.isNull, !image.isEmpty else { return false }
+        // Both in window (global) coordinates -> this view's local space.
+        let imageBottom = image.maxY - geo.frame(in: .global).minY
+        let pillTop = geo.size.height - Self.edgeGap - Self.pillLength
+        return pillTop >= imageBottom + Self.edgeGap
+    }
+
+    private func pill(scrollLength: CGFloat?) -> some View {
         Group {
-            if vertical {
-                VStack(spacing: Self.spacing) {
-                    buttons(vertical: true)
+            if let length = scrollLength {
+                ScrollView(.vertical, showsIndicators: false) {
+                    buttonColumn
                 }
+                .frame(width: Self.target, height: length)
             } else {
-                HStack(spacing: Self.spacing) {
-                    buttons(vertical: false)
-                }
+                buttonColumn
             }
         }
         .padding(Self.pillInset)
@@ -77,8 +105,14 @@ struct FloatingToolbar: View {
         .reportsChromeFrame()
     }
 
+    private var buttonColumn: some View {
+        VStack(spacing: Self.spacing) {
+            buttons
+        }
+    }
+
     @ViewBuilder
-    private func buttons(vertical: Bool) -> some View {
+    private var buttons: some View {
         toolButton("keyboard", label: "Keyboard", action: onKeyboard)
         toolButton("ellipsis.circle", label: "Session menu", action: onMenu)
         toolButton("bubble.left.and.bubble.right", label: "Chat", action: onChat)
@@ -95,7 +129,7 @@ struct FloatingToolbar: View {
                 }
             }
         toolButton("xmark", label: "Disconnect", tint: Color(red: 1, green: 0.42, blue: 0.4), action: onDisconnect)
-        toolButton(vertical ? "chevron.right" : "chevron.down", label: "Collapse toolbar") {
+        toolButton("chevron.right", label: "Collapse toolbar") {
             chrome.toolbarCollapsed = true
         }
     }
