@@ -130,7 +130,6 @@ struct SessionContainer: View {
             .animation(.easeInOut(duration: 0.25), value: controller.toast)
 
             FloatingToolbar(chrome: chrome,
-                            input: controller.input,
                             isLandscape: landscape,
                             unread: controller.unreadChat,
                             onKeyboard: { controller.input.showKeyboard(soft: true) },
@@ -147,7 +146,7 @@ struct SessionContainer: View {
                 }
 
             if showGestureHelp {
-                GestureHelpOverlay(mode: controller.input.mode) {
+                GestureHelpOverlay {
                     didShowGestureHelp = true
                     showGestureHelp = false
                 }
@@ -571,32 +570,17 @@ struct GestureHelpItem: Identifiable {
 }
 
 enum GestureHelp {
-    /// The help rows for `mode`, matching RemoteScreenSurface's gestures.
-    static func items(for mode: InputMode) -> [GestureHelpItem] {
-        switch mode {
-        case .mouse:
-            return [
-                GestureHelpItem(id: 0, symbol: "hand.draw", text: "Slide a finger to move the mouse"),
-                GestureHelpItem(id: 1, symbol: "hand.tap", text: "Tap to click at the mouse pointer"),
-                GestureHelpItem(id: 2, symbol: "hand.tap", text: "Double-tap to double-click"),
-                GestureHelpItem(id: 3, symbol: "cursorarrow.motionlines", text: "Double-tap and drag to select"),
-                GestureHelpItem(id: 4, symbol: "hand.point.up.left", text: "Long press to right-click"),
-                GestureHelpItem(id: 5, symbol: "hand.tap.fill", text: "Two-finger tap to right-click"),
-                GestureHelpItem(id: 6, symbol: "arrow.up.and.down", text: "Two fingers to scroll"),
-                GestureHelpItem(id: 7, symbol: "arrow.up.left.and.arrow.down.right", text: "Pinch to zoom"),
-            ]
-        case .touch:
-            return [
-                GestureHelpItem(id: 0, symbol: "hand.tap", text: "Tap to click where you touch"),
-                GestureHelpItem(id: 1, symbol: "hand.point.up.left", text: "Long press to right-click (with magnifier)"),
-                GestureHelpItem(id: 2, symbol: "hand.draw", text: "Long press and drag to select"),
-                GestureHelpItem(id: 3, symbol: "hand.tap.fill", text: "Two-finger tap to right-click"),
-                GestureHelpItem(id: 4, symbol: "arrow.up.and.down", text: "One finger to scroll"),
-                GestureHelpItem(id: 5, symbol: "arrow.up.and.down.and.arrow.left.and.right", text: "Two fingers to pan"),
-                GestureHelpItem(id: 6, symbol: "arrow.up.left.and.arrow.down.right", text: "Pinch to zoom"),
-            ]
-        }
-    }
+    /// The help rows, matching RemoteScreenSurface's (trackpad) gestures.
+    static let items: [GestureHelpItem] = [
+        GestureHelpItem(id: 0, symbol: "hand.draw", text: "Slide a finger to move the mouse"),
+        GestureHelpItem(id: 1, symbol: "hand.tap", text: "Tap to click at the mouse pointer"),
+        GestureHelpItem(id: 2, symbol: "hand.tap", text: "Double-tap to double-click"),
+        GestureHelpItem(id: 3, symbol: "cursorarrow.motionlines", text: "Double-tap and drag to select"),
+        GestureHelpItem(id: 4, symbol: "hand.point.up.left", text: "Long press to right-click"),
+        GestureHelpItem(id: 5, symbol: "hand.tap.fill", text: "Two-finger tap to right-click"),
+        GestureHelpItem(id: 6, symbol: "arrow.up.and.down", text: "Two fingers to scroll"),
+        GestureHelpItem(id: 7, symbol: "arrow.up.left.and.arrow.down.right", text: "Pinch to zoom"),
+    ]
 }
 
 struct GestureHelpRow: View {
@@ -616,19 +600,18 @@ struct GestureHelpRow: View {
 
 /// First-session gesture help (also from the menu).
 struct GestureHelpOverlay: View {
-    let mode: InputMode
     let onContinue: () -> Void
 
     var body: some View {
         ZStack {
             Color.black.opacity(0.7).ignoresSafeArea()
             VStack(alignment: .leading, spacing: 12) {
-                Text(mode == .mouse ? "Mouse mode" : "Touch mode")
+                Text("Gestures")
                     .font(.title3.weight(.bold))
-                Text("Switch modes from the toolbar.")
+                Text("One finger works like a laptop trackpad.")
                     .font(.footnote)
                     .foregroundColor(Color.white.opacity(0.7))
-                ForEach(GestureHelp.items(for: mode)) { item in
+                ForEach(GestureHelp.items) { item in
                     GestureHelpRow(item: item)
                 }
                 Button(action: onContinue) {

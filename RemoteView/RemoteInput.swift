@@ -21,17 +21,6 @@ import QuartzCore
 //     0x3A TEXT       [utf-8...]
 //     0x3B RELEASE_ALL, 0x3C SAS
 
-/// Input interpretation for touches. Raw values are persisted under
-/// `RemoteInputController.modeDefaultsKey` (SwiftUI uses
-/// `@AppStorage("ov.inputMode")` with the same strings).
-enum InputMode: String {
-    /// Trackpad: one finger moves the cursor (TeamViewer model: normalised
-    /// position, absolute moves on the wire), taps click at it.
-    case mouse
-    /// Direct: taps click where the finger is.
-    case touch
-}
-
 /// POINTER_EX button ids.
 enum MouseButton: UInt8 {
     case left = 0
@@ -343,19 +332,20 @@ final class FrameTicker {
 /// preserved). Every button or key we press on the host is tracked, so
 /// `releaseAll()` can always undo it.
 final class RemoteInputController: ObservableObject {
-    static let modeDefaultsKey = "ov.inputMode"
     static let cmdAsCtrlDefaultsKey = "ov.cmdAsCtrl"
     static let pointerLockDefaultsKey = "ov.pointerLock"
     /// "Lock local zoom": every gesture, pinch included, goes to the host.
     static let lockLocalZoomDefaultsKey = "ov.lockLocalZoom"
     /// Keys of control settings removed in favour of the fixed TeamViewer
     /// behaviour (cursor speed / acceleration / fling, immediate clicks,
-    /// scroll inertia, classic touch gestures, viewport follow) and of
-    /// their old migration flags; `migrateDefaults` deletes them.
+    /// scroll inertia, classic touch gestures, viewport follow, the removed
+    /// Mouse / Touch input-mode switch) and of their old migration flags;
+    /// `migrateDefaults` deletes them.
     static let obsoleteDefaultsKeys = [
         "ov.cursorSpeed", "ov.cursorAccel", "ov.cursorFling", "ov.immediateClicks",
         "ov.scrollInertia", "ov.classicTouchGestures", "ov.viewportFollow",
         "ov.cursorSpeedTVMigrated", "ov.tvParityDefaultsV42",
+        "ov.inputMode",
     ]
 
     /// Sends one channel-0 command (SessionController.sendCommand).
@@ -364,8 +354,6 @@ final class RemoteInputController: ObservableObject {
     /// queue through a main hop).
     var input2 = false
 
-    /// Current touch interpretation (persisted).
-    @Published private(set) var mode: InputMode
     /// Sticky modifier states, indexed by `ModifierKey.rawValue`.
     @Published private(set) var modifierStates: [ModifierState] = [.off, .off, .off, .off]
 
@@ -401,7 +389,7 @@ final class RemoteInputController: ObservableObject {
         }
     }
     /// TeamViewer's cursor state: the normalised position in [0, 1]^2
-    /// (mouse-mode trackpad moves update this; `cursor` follows).
+    /// (trackpad moves update this; `cursor` follows).
     private(set) var pct = CGPoint(x: 0.5, y: 0.5)
     /// Predicted cursor position in frame pixels (drawn locally; the wire
     /// position is its whole pixel). Kept in step with `pct`.
@@ -445,9 +433,6 @@ final class RemoteInputController: ObservableObject {
 
     init() {
         RemoteInputController.migrateDefaults()
-        let raw = UserDefaults.standard.string(forKey: RemoteInputController.modeDefaultsKey)
-            ?? InputMode.mouse.rawValue
-        mode = InputMode(rawValue: raw) ?? .mouse
     }
 
     deinit {
@@ -476,8 +461,7 @@ final class RemoteInputController: ObservableObject {
         }
     }
 
-    /// Local zoom locked: pinch becomes Ctrl+wheel on the host and touch
-    /// mode drags go to the host (default off).
+    /// Local zoom locked: pinch becomes Ctrl+wheel on the host (default off).
     var lockLocalZoom: Bool {
         UserDefaults.standard.bool(forKey: Self.lockLocalZoomDefaultsKey)
     }
@@ -485,14 +469,6 @@ final class RemoteInputController: ObservableObject {
     /// Ask the surface to apply a zoom preset (session menu).
     func applyZoomPreset(_ preset: ZoomPreset) {
         zoomPresetHandler?(preset)
-    }
-
-    /// Switch the touch interpretation: releases everything held first.
-    func setMode(_ newMode: InputMode) {
-        guard newMode != mode else { return }
-        releaseAll()
-        mode = newMode
-        UserDefaults.standard.set(newMode.rawValue, forKey: Self.modeDefaultsKey)
     }
 
     /// Show / toggle the remote keyboard (see `keyboardPresenter`).
@@ -617,7 +593,7 @@ final class RemoteInputController: ObservableObject {
     /// motion subject to host acceleration, for pointer-lock deltas only).
     /// The local cursor clamps to the frame; the unclamped delta goes to the
     /// host, which clamps itself (pushing into an edge resyncs both).
-    /// Mouse-mode trackpad uses `moveCursorTrackpad` (absolute, like
+    /// The finger trackpad uses `moveCursorTrackpad` (absolute, like
     /// TeamViewer); this path remains for pointer-lock RAW deltas.
     func moveCursorRelative(by d: CGPoint, raw: Bool = false) {
         guard d.x.isFinite, d.y.isFinite, frameSize.width > 0 else { return }
@@ -633,15 +609,15 @@ final class RemoteInputController: ObservableObject {
         ensureTicking()
     }
 
-    /// Absolute move to frame pixel `p` (touch drags, iPad hover). Replaces
-    /// any pending relative motion.
+    /// Absolute move to frame pixel `p` (iPad hover / pointer clicks, tap
+    /// pixel restore). Replaces any pending relative motion.
     func moveCursorAbsolute(to p: CGPoint) {
         guard frameSize.width > 0 else { return }
         setCursorPixel(p)
         queueAbsoluteMove()
     }
 
-    /// TeamViewer's trackpad model (mouse mode). `d` = finger travel in
+    /// TeamViewer's trackpad model. `d` = finger travel in
     /// screen points (1:1, no speed factor or acceleration); `displayed` = the
     /// remote image's on-screen size in points (frame pixels x zoom, i.e.
     /// TeamViewer's R * z). pct += d / max(displayed, 1) per axis, clamped
@@ -976,7 +952,7 @@ final class RemoteInputController: ObservableObject {
     }
 
     /// Release every key / button we hold on the host and clear the sticky
-    /// modifiers (backgrounding, mode switch, disconnect).
+    /// modifiers (backgrounding, disconnect).
     func releaseAll() {
         flushPointer()
         wheelAcc = .zero

@@ -15,7 +15,6 @@ struct SettingsView: View {
     // Display
     @AppStorage(SettingsKey.sharpen) private var sharpen = true
     // Input
-    @AppStorage(RemoteInputController.modeDefaultsKey) private var inputMode = InputMode.mouse.rawValue
     @AppStorage(RemoteInputController.cmdAsCtrlDefaultsKey) private var cmdAsCtrl = true
     @AppStorage(RemoteInputController.pointerLockDefaultsKey) private var pointerLock = false
     // Session
@@ -135,10 +134,6 @@ struct SettingsView: View {
 
     private var input: some View {
         Section(header: Text("Input")) {
-            Picker("Default mode", selection: $inputMode) {
-                Text("Mouse").tag(InputMode.mouse.rawValue)
-                Text("Touch").tag(InputMode.touch.rawValue)
-            }
             Toggle("Cmd acts as Ctrl", isOn: $cmdAsCtrl)
             Toggle(isOn: $pointerLock) {
                 VStack(alignment: .leading, spacing: 2) {

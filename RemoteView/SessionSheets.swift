@@ -111,12 +111,7 @@ struct SessionMenuSheet: View {
 
     private var interaction: some View {
         Section(header: Text("Interaction Method")) {
-            Picker("Mode", selection: modeBinding) {
-                Text("Mouse").tag(InputMode.mouse)
-                Text("Touch").tag(InputMode.touch)
-            }
-            .pickerStyle(.segmented)
-            ForEach(GestureHelp.items(for: input.mode)) { item in
+            ForEach(GestureHelp.items) { item in
                 GestureHelpRow(item: item)
             }
         }
@@ -281,10 +276,6 @@ struct SessionMenuSheet: View {
     }
 
     // MARK: Bindings
-
-    private var modeBinding: Binding<InputMode> {
-        Binding(get: { input.mode }, set: { input.setMode($0) })
-    }
 
     private var monitorBinding: Binding<Int> {
         Binding(get: { controller.monitorIndex }, set: { controller.selectMonitor($0) })

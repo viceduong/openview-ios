@@ -38,7 +38,6 @@ struct ConnectRequest {
     var defaultFps: UInt16
     /// Monitor to switch to once the host announces its monitors.
     var lastMonitor: Int
-    var inputMode: InputMode?
     /// TOFU: the fingerprint the host must present (nil = first contact).
     var pinnedFingerprint: String?
 
@@ -50,7 +49,6 @@ struct ConnectRequest {
          pinIsStored: Bool = false,
          defaultFps: UInt16 = 0,
          lastMonitor: Int = 0,
-         inputMode: InputMode? = nil,
          pinnedFingerprint: String? = nil) {
         self.connectionID = connectionID
         self.name = name
@@ -60,7 +58,6 @@ struct ConnectRequest {
         self.pinIsStored = pinIsStored
         self.defaultFps = defaultFps
         self.lastMonitor = lastMonitor
-        self.inputMode = inputMode
         self.pinnedFingerprint = pinnedFingerprint
     }
 

@@ -356,9 +356,6 @@ final class SessionController: ObservableObject {
         input.send = { [weak self] payload in
             self?.sendCommand(payload)
         }
-        if let mode = request.inputMode {
-            input.setMode(mode)
-        }
         // Phase 5: the overlay's decoder failed (main) -> ask the host for an
         // IDR from the session queue.
         screenModel.video.onFailure = { [weak self] in

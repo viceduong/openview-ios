@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The session toolbar: a collapsible pill (.ultraThinMaterial capsule,
-/// 44 pt targets) — Keyboard, Mode (Mouse / Touch), Menu, Chat (unread
+/// 44 pt targets) — Keyboard, Menu, Chat (unread
 /// badge), Disconnect, Collapse. Bottom-trailing in portrait, vertical on
 /// the trailing edge in landscape (horizontal at the bottom when the
 /// landscape height cannot fit the vertical pill, e.g. keyboard up).
@@ -15,7 +15,6 @@ import SwiftUI
 /// remote surface underneath never takes touches meant for them.
 struct FloatingToolbar: View {
     @ObservedObject var chrome: SessionChrome
-    @ObservedObject var input: RemoteInputController
     let isLandscape: Bool
     let unread: Int
     let onKeyboard: () -> Void
@@ -29,11 +28,11 @@ struct FloatingToolbar: View {
 
     private static let target: CGFloat = 44
     private static let handleHeight: CGFloat = 64
-    private static let buttonCount: CGFloat = 6
+    private static let buttonCount: CGFloat = 5
     private static let spacing: CGFloat = 2
     private static let pillInset: CGFloat = 4
     private static let edgeGap: CGFloat = 12
-    /// Length of the pill along its axis (6 x 44 + spacing + insets).
+    /// Length of the pill along its axis (5 x 44 + spacing + insets).
     private static let pillLength: CGFloat =
         FloatingToolbar.buttonCount * FloatingToolbar.target
             + (FloatingToolbar.buttonCount - 1) * FloatingToolbar.spacing
@@ -81,10 +80,6 @@ struct FloatingToolbar: View {
     @ViewBuilder
     private func buttons(vertical: Bool) -> some View {
         toolButton("keyboard", label: "Keyboard", action: onKeyboard)
-        toolButton(input.mode == .mouse ? "cursorarrow" : "hand.point.up.left",
-                   label: input.mode == .mouse ? "Mouse mode, switch to touch" : "Touch mode, switch to mouse") {
-            input.setMode(input.mode == .mouse ? .touch : .mouse)
-        }
         toolButton("ellipsis.circle", label: "Session menu", action: onMenu)
         toolButton("bubble.left.and.bubble.right", label: "Chat", action: onChat)
             .overlay(alignment: .topTrailing) {

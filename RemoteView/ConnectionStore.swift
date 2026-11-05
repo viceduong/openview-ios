@@ -89,8 +89,6 @@ struct SavedConnection: Codable, Identifiable, Equatable {
     /// Target fps (0 = Auto).
     var defaultFps: UInt16
     var lastMonitor: Int
-    /// InputMode raw value (nil = app default).
-    var inputMode: String?
     /// SF Symbol shown in lists.
     var symbol: String
     /// A PIN is stored in the Keychain for this connection.
@@ -105,7 +103,6 @@ struct SavedConnection: Codable, Identifiable, Equatable {
          isFavorite: Bool = false,
          defaultFps: UInt16 = 0,
          lastMonitor: Int = 0,
-         inputMode: String? = nil,
          symbol: String = "desktopcomputer",
          hasPIN: Bool = false) {
         self.id = id
@@ -117,17 +114,18 @@ struct SavedConnection: Codable, Identifiable, Equatable {
         self.isFavorite = isFavorite
         self.defaultFps = defaultFps
         self.lastMonitor = lastMonitor
-        self.inputMode = inputMode
         self.symbol = symbol
         self.hasPIN = hasPIN
     }
 
     enum CodingKeys: String, CodingKey {
         case id, name, deviceId, transport, pinnedFingerprint, lastConnected
-        case isFavorite, defaultFps, lastMonitor, inputMode, symbol, hasPIN
+        case isFavorite, defaultFps, lastMonitor, symbol, hasPIN
     }
 
-    /// Tolerant decoding: fields added later default instead of failing.
+    /// Tolerant decoding: fields added later default instead of failing;
+    /// keys no longer used (e.g. the removed per-connection "inputMode")
+    /// are ignored and dropped on the next save.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
@@ -140,7 +138,6 @@ struct SavedConnection: Codable, Identifiable, Equatable {
         isFavorite = try c.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
         defaultFps = try c.decodeIfPresent(UInt16.self, forKey: .defaultFps) ?? 0
         lastMonitor = try c.decodeIfPresent(Int.self, forKey: .lastMonitor) ?? 0
-        inputMode = try c.decodeIfPresent(String.self, forKey: .inputMode)
         symbol = try c.decodeIfPresent(String.self, forKey: .symbol) ?? "desktopcomputer"
         hasPIN = try c.decodeIfPresent(Bool.self, forKey: .hasPIN) ?? false
     }

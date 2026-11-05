@@ -39,7 +39,6 @@ final class AppModel: ObservableObject {
                               pinIsStored: pinIsStored,
                               defaultFps: c.defaultFps,
                               lastMonitor: c.lastMonitor,
-                              inputMode: c.inputMode.flatMap { InputMode(rawValue: $0) },
                               pinnedFingerprint: c.pinnedFingerprint)
     }
 
@@ -148,7 +147,6 @@ final class AppModel: ObservableObject {
         guard let id = activeConnectionID, var conn = store.connection(id: id) else { return }
         conn.defaultFps = c.targetFps
         conn.lastMonitor = c.monitorIndex
-        conn.inputMode = c.input.mode.rawValue
         store.upsert(conn)
     }
 
