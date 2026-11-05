@@ -64,14 +64,15 @@ final class KeyAccessoryBar: UIView {
                               label: "Hide keyboard") { [weak self] in
             self?.onDismiss?()
         }
-        // Distinct from the keys: filled accent pill with a white glyph.
+        // Distinct from the keys: filled accent key with a white glyph.
         var hideCfg = UIButton.Configuration.filled()
         hideCfg.image = UIImage(systemName: "keyboard.chevron.compact.down",
                                 withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold))
         hideCfg.baseBackgroundColor = .systemBlue
         hideCfg.baseForegroundColor = .white
-        hideCfg.cornerStyle = .capsule
-        hideCfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10)
+        // Same rounded-rectangle shape and insets as the other keys.
+        hideCfg.cornerStyle = .medium
+        hideCfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 4, bottom: 6, trailing: 4)
         hide.configuration = hideCfg
         hide.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hide)
