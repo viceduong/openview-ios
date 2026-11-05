@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The session toolbar: a collapsible pill (.ultraThinMaterial capsule,
 /// 44 pt targets) — Keyboard, Menu, Disconnect, Collapse. Always a vertical pill docked on the
@@ -31,6 +32,9 @@ struct FloatingToolbar: View {
     @State private var dragOffset: CGSize = .zero
     /// Expanded by the user while the keyboard is up (reset per keyboard).
     @State private var expandedOverKeyboard = false
+    /// The on-screen keyboard (incl. the key bar shown alone) as iOS
+    /// reports it, animated with iOS's own keyboard timing.
+    @StateObject private var keyboard = KeyboardTracker()
 
     private static let target: CGFloat = 44
     private static let handleHeight: CGFloat = 64
@@ -38,9 +42,8 @@ struct FloatingToolbar: View {
     private static let spacing: CGFloat = 2
     private static let pillInset: CGFloat = 4
     private static let edgeGap: CGFloat = 12
-    /// Handle position (fraction of the screen height) while the keyboard
-    /// is up: above any keyboard in either orientation.
-    private static let keyboardHandleY: CGFloat = 0.22
+    /// Gap between the keyboard's top edge and the handle / pill.
+    private static let keyboardGap: CGFloat = 8
     /// Length of the pill along its axis (4 x 44 + spacing + insets).
     private static let pillLength: CGFloat =
         FloatingToolbar.buttonCount * FloatingToolbar.target
@@ -51,7 +54,7 @@ struct FloatingToolbar: View {
         GeometryReader { geo in
             ZStack {
                 if isCollapsed {
-                    handle(in: geo.size)
+                    handle(in: geo)
                 } else {
                     expanded(in: geo)
                 }
@@ -65,10 +68,25 @@ struct FloatingToolbar: View {
         .opacity(chrome.toolbarFaded ? SessionChrome.fadedOpacity : 1)
         .animation(.easeInOut(duration: 0.3), value: chrome.toolbarFaded)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isCollapsed)
-        .onChange(of: input.keyInputActive) { _ in
+        .onChange(of: keyboardUp) { _ in
             // Each keyboard appearance starts collapsed again.
             expandedOverKeyboard = false
         }
+    }
+
+    /// The keyboard (or the key bar alone) is on screen. iOS's keyboard
+    /// notification drives this, so the collapse starts together with the
+    /// keyboard animation (the same spring as a manual collapse).
+    private var keyboardUp: Bool {
+        keyboard.height > 0
+    }
+
+    /// Keyboard top edge in this view's local coordinates (the view ignores
+    /// the keyboard safe area, so it keeps its full height).
+    private func keyboardTop(in geo: GeometryProxy) -> CGFloat {
+        let global = geo.frame(in: .global)
+        let screenHeight = UIScreen.main.bounds.height
+        return screenHeight - keyboard.height - global.minY
     }
 
     /// While the soft keyboard / key bar is up the toolbar collapses to its
@@ -76,11 +94,11 @@ struct FloatingToolbar: View {
     /// applies again when the keyboard hides). Tapping the handle expands
     /// it over the keyboard until the keyboard goes away.
     private var isCollapsed: Bool {
-        chrome.toolbarCollapsed || (input.keyInputActive && !expandedOverKeyboard)
+        chrome.toolbarCollapsed || (keyboardUp && !expandedOverKeyboard)
     }
 
     private func setCollapsed(_ collapsed: Bool) {
-        if input.keyInputActive {
+        if keyboardUp {
             expandedOverKeyboard = !collapsed
         } else {
             chrome.toolbarCollapsed = collapsed
@@ -100,17 +118,16 @@ struct FloatingToolbar: View {
         // Too short: the button column scrolls inside a pill filling the
         // edge (at least one button tall).
         let scrollLength: CGFloat? = fits ? nil : max(room - 2 * Self.pillInset, Self.target)
-        if input.keyInputActive {
-            // Expanded over the keyboard: hang from the handle's position
-            // near the top so the pill stays clear of the keyboard, scrolling
-            // if it doesn't fit in the space above it.
-            let top = max(size.height * Self.keyboardHandleY - Self.handleHeight / 2, Self.edgeGap)
-            let above = max(size.height * 0.5 - top - Self.edgeGap, Self.target)
+        if keyboardUp {
+            // Expanded over the keyboard: sits just above it on the trailing
+            // edge, scrolling if the space above the keyboard is too short.
+            let kbTop = keyboardTop(in: geo)
+            let above = max(kbTop - 2 * Self.edgeGap, Self.target)
             let length: CGFloat? = above >= Self.pillLength ? nil : max(above - 2 * Self.pillInset, Self.target)
             return AnyView(pill(scrollLength: length)
                 .padding(.trailing, Self.edgeGap)
-                .padding(.top, top)
-                .frame(width: size.width, height: size.height, alignment: .topTrailing))
+                .padding(.bottom, max(size.height - kbTop, 0) + Self.keyboardGap)
+                .frame(width: size.width, height: size.height, alignment: .bottomTrailing))
         }
         return AnyView(pill(scrollLength: scrollLength)
             .padding(.trailing, Self.edgeGap)
@@ -185,18 +202,21 @@ struct FloatingToolbar: View {
 
     // MARK: Collapsed handle
 
-    private func handle(in size: CGSize) -> some View {
+    private func handle(in geo: GeometryProxy) -> some View {
+        let size = geo.size
         // Keyboard-collapsed: always the trailing edge, high enough to stay
         // clear of the keyboard (the layout ignores the keyboard, so the
         // height here is the full screen).
-        let keyboardHandle = input.keyInputActive && !chrome.toolbarCollapsed
+        let keyboardHandle = keyboardUp
         let onTrailing = keyboardHandle || handleEdge != "leading"
         let halfWidth = Self.target / 2
         let halfHeight = Self.handleHeight / 2
         let x = onTrailing ? size.width - halfWidth : halfWidth
         let maxY = max(halfHeight, size.height - halfHeight)
-        let fraction: CGFloat = keyboardHandle ? Self.keyboardHandleY : CGFloat(handleY)
-        let y = min(max(fraction * size.height, halfHeight), maxY)
+        // Keyboard up: just above the keyboard (follows it as it moves).
+        let y = keyboardHandle
+            ? max(keyboardTop(in: geo) - Self.keyboardGap - halfHeight, halfHeight)
+            : min(max(CGFloat(handleY) * size.height, halfHeight), maxY)
         return Image(systemName: onTrailing ? "chevron.compact.left" : "chevron.compact.right")
             .font(.system(size: 22, weight: .bold))
             .foregroundColor(.white)
@@ -256,5 +276,41 @@ extension View {
                 Color.clear.preference(key: ChromeFramesKey.self, value: [g.frame(in: .global)])
             }
         )
+    }
+}
+
+/// The software keyboard's on-screen height (0 when hidden), from iOS's
+/// keyboard frame notifications, applied with the keyboard's own animation
+/// duration so views tracking it move in step with the keyboard. Includes
+/// an input accessory view (the key bar), also when it is shown alone.
+final class KeyboardTracker: ObservableObject {
+    @Published private(set) var height: CGFloat = 0
+    private var observers: [NSObjectProtocol] = []
+
+    init() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIResponder.keyboardWillChangeFrameNotification,
+                                            object: nil, queue: .main) { [weak self] note in
+            self?.update(note)
+        })
+        observers.append(center.addObserver(forName: UIResponder.keyboardWillHideNotification,
+                                            object: nil, queue: .main) { [weak self] note in
+            self?.update(note, hiding: true)
+        })
+    }
+
+    deinit {
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    private func update(_ note: Notification, hiding: Bool = false) {
+        let info = note.userInfo ?? [:]
+        let end = (info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue ?? .zero
+        let screen = UIScreen.main.bounds
+        let newHeight = hiding ? 0 : max(screen.maxY - end.minY, 0)
+        let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        withAnimation(.easeOut(duration: max(duration, 0.1))) {
+            height = newHeight
+        }
     }
 }
