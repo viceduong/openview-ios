@@ -96,6 +96,7 @@ struct HomeView: View {
             .modifier(SearchableIfNeeded(enabled: store.connections.count > 6, text: $search))
         }
         .navigationViewStyle(.stack)
+        .onAppear(perform: autoConnectOnLaunchIfWanted)
         .sheet(item: $sheet) { which in
             sheetView(which)
                 .environmentObject(app)
@@ -225,6 +226,18 @@ struct HomeView: View {
     }
 
     // MARK: Connecting
+
+    /// Once per app launch (not when returning from a session): connect to
+    /// the most recent device with a saved PIN, if the setting is on.
+    private static var didAttemptLaunchConnect = false
+
+    private func autoConnectOnLaunchIfWanted() {
+        guard !Self.didAttemptLaunchConnect else { return }
+        Self.didAttemptLaunchConnect = true
+        guard AppSettings.autoConnectOnLaunch, !app.sessionActive,
+              let last = store.mostRecentWithPIN else { return }
+        connect(last)
+    }
 
     /// Connect a saved device: stored PIN (Face ID if protected) or prompt.
     private func connect(_ c: SavedConnection) {

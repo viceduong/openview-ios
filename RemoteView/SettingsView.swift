@@ -10,6 +10,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.defaultRelayURL) private var relayURL = builtInRelayURL
     @AppStorage(SettingsKey.defaultQuality) private var defaultQuality = 0
     @AppStorage(SettingsKey.autoReconnect) private var autoReconnect = true
+    @AppStorage(SettingsKey.autoConnectOnLaunch) private var autoConnectOnLaunch = false
     @AppStorage(SettingsKey.confirmDisconnect) private var confirmDisconnect = true
     @AppStorage(SettingsKey.directConnection) private var directConnection = true
     // Display
@@ -96,6 +97,14 @@ struct SettingsView: View {
                 }
             }
             Toggle("Reconnect automatically", isOn: $autoReconnect)
+            Toggle(isOn: $autoConnectOnLaunch) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Connect to last device on launch")
+                    Text("Opens the most recent device that has a saved PIN when the app starts.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
             Toggle("Confirm before disconnecting", isOn: $confirmDisconnect)
         }
     }

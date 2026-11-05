@@ -14,6 +14,9 @@ enum SettingsKey {
     /// Default quality for new connections, target fps (0 = Auto).
     static let defaultQuality = "ov.defaultQuality"
     static let autoReconnect = "ov.autoReconnect"
+    /// Connect to the most recent saved device (with a saved PIN) when the
+    /// app launches.
+    static let autoConnectOnLaunch = "ov.autoConnectOnLaunch"
     static let confirmDisconnect = "ov.confirmDisconnect"
     /// Section 5: try a direct UDP path next to relay sessions.
     static let directConnection = "ov.directConnection"
@@ -69,6 +72,7 @@ enum AppSettings {
     }
 
     static var autoReconnect: Bool { bool(SettingsKey.autoReconnect, default: true) }
+    static var autoConnectOnLaunch: Bool { bool(SettingsKey.autoConnectOnLaunch, default: false) }
     static var confirmDisconnect: Bool { bool(SettingsKey.confirmDisconnect, default: true) }
     static var directConnection: Bool { bool(SettingsKey.directConnection, default: true) }
     static var sharpen: Bool { bool(SettingsKey.sharpen, default: true) }
