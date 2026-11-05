@@ -378,6 +378,14 @@ final class RemoteInputController: ObservableObject {
     /// when it refits; the floating toolbar docks below it when there is
     /// room (portrait).
     @Published var fitImageFrame: CGRect = .null
+    /// Bottom edge (window y coordinate) of the chrome docked at the top of
+    /// the screen (the stats chip); 0 = none shown. The surface lays the
+    /// remote image out below it (fit scale + top pinning).
+    @Published var topChromeInset: CGFloat = 0
+    /// The remote key input is first responder: the soft keyboard and / or
+    /// the key accessory bar is on screen (the floating toolbar hides
+    /// meanwhile). Published by RemoteKeyInputView.
+    @Published var keyInputActive = false
 
     // ---- cursor ----
     /// Frame size the cursor and normalized coordinates refer to.

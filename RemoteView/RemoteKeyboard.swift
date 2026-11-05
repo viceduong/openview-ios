@@ -414,6 +414,40 @@ final class RemoteKeyInputView: UIView, UIKeyInput, RemoteKeyCommandTarget {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        publishActive()
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        publishActive()
+        return ok
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        publishActive()
+    }
+
+    /// Tell the chrome whether the keyboard / key bar is up
+    /// (`RemoteInputController.keyInputActive`). Read on the next main-queue
+    /// turn: the responder state is settled then (a resign + become pair
+    /// publishes once), and it is never published inside a SwiftUI update.
+    private func publishActive() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let input = self.input else { return }
+            // A replaced (re-hosted) surface's key view does not speak for
+            // the active one.
+            if let active = input.activeSurface, active !== self.superview { return }
+            let on = self.window != nil && self.isFirstResponder
+            if input.keyInputActive != on {
+                input.keyInputActive = on
+            }
+        }
+    }
+
     override var inputView: UIView? {
         showsSoftKeyboard ? nil : emptyInputView
     }

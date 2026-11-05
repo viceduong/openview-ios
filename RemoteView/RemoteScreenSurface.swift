@@ -20,7 +20,9 @@ import UIKit.UIGestureRecognizerSubclass
 //                         whole remote screen; zoomed in by z, 1 pt = 1/z
 //                         remote px. Linear, 1:1 (no speed factor, no
 //                         acceleration, no cursor inertia). Zoomed in, the
-//                         viewport keeps the cursor centred (TeamViewer).
+//                         viewport keeps the cursor centred, but never
+//                         scrolls past the image edges (near an edge the
+//                         cursor moves off-centre towards it).
 //                         One custom recognizer (TrackpadTouchRecognizer,
 //                         the MouseGestureRecognizer model) moves the cursor
 //                         from the very first touchesMoved (no pan slop, no
@@ -331,6 +333,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// (nil = free zoom, kept as is).
     private var followPreset: ZoomPreset? = .fit
     private var lastBoundsSize: CGSize = .zero
+    /// Bottom edge (window y) of the top chrome (stats chip), 0 = none:
+    /// the image is laid out below it (`safeInsets`).
+    private var topChromeBottom: CGFloat = 0
+    private var topChromeCancellable: AnyCancellable?
 
     // ---- gestures ----
     private let tap2 = UITapGestureRecognizer(target: nil, action: nil)
@@ -427,6 +433,15 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         setupGestures()
         addInteraction(UIPointerInteraction(delegate: pointerHider))
         setupPointerLock()
+        // The stats chip appeared / moved / went away: refit below it.
+        // (@Published emits before the property changes: use the value.)
+        topChromeCancellable = input.$topChromeInset
+            .removeDuplicates()
+            .sink { [weak self] bottom in
+                guard let self else { return }
+                self.topChromeBottom = bottom
+                self.refit()
+            }
     }
 
     required init?(coder: NSCoder) {
@@ -773,17 +788,26 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return s > 0 ? s : UIScreen.main.scale
     }
 
+    /// Gap between the stats chip and the top of the remote image.
+    private static let topChromeGap: CGFloat = 6
+
     /// The part of the view outside the window's safe area insets (notch,
     /// home indicator, status bar), in view coordinates. Computed from the
     /// window (the SwiftUI host lays this view out ignoring the safe area,
     /// and what it reports as the view's own safeAreaInsets is not
-    /// guaranteed); zero outside a window.
+    /// guaranteed); zero outside a window. While the stats chip is shown
+    /// the top inset reaches below it (+ `topChromeGap`): the image at fit /
+    /// pinned to the top starts under the chip, not behind it.
     private var safeInsets: UIEdgeInsets {
         guard let window, bounds.width > 0, bounds.height > 0 else { return .zero }
         let wi = window.safeAreaInsets
         let wb = window.bounds
         let f = convert(bounds, to: window)
-        return UIEdgeInsets(top: max(0, wi.top - f.minY),
+        var top = max(0, wi.top - f.minY)
+        if topChromeBottom > 0 {
+            top = max(top, topChromeBottom + Self.topChromeGap - f.minY)
+        }
+        return UIEdgeInsets(top: top,
                             left: max(0, wi.left - f.minX),
                             bottom: max(0, f.maxY - (wb.maxY - wi.bottom)),
                             right: max(0, f.maxX - (wb.maxX - wi.right)))
@@ -844,32 +868,38 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         frameSize.height * scale <= safeRect.height + 0.5 // tolerance: fit is computed from it
     }
 
-    /// Keep the content in view: where it fits the safe area, horizontally
-    /// centred and vertically at the top of the safe area (TeamViewer),
-    /// else inside the view (no empty band when it is larger than the view).
-    private func clampOffset() {
+    /// `p` (a frame-origin offset) with the content kept in view, per axis:
+    /// where the content fits the safe area, horizontally centred and
+    /// vertically at the top of the safe area (below the stats chip;
+    /// TeamViewer layout); where it is larger than the view, never scrolled
+    /// past its edges (the image always covers the view, no black band);
+    /// in between, kept inside the view.
+    private func clamped(_ p: CGPoint) -> CGPoint {
         let cw = frameSize.width * scale
         let ch = frameSize.height * scale
         let safe = safeRect
+        var q = p
         if cw <= safe.width + 0.5 { // tolerance: fit is computed from it
-            offset.x = safe.minX + (safe.width - cw) / 2
+            q.x = safe.minX + (safe.width - cw) / 2
         } else {
             let lo = min(0, bounds.width - cw)
             let hi = max(0, bounds.width - cw)
-            offset.x = min(max(offset.x, lo), hi)
+            q.x = min(max(p.x, lo), hi)
         }
         if ch <= safe.height + 0.5 {
-            offset.y = safe.minY
+            q.y = safe.minY
         } else {
             let lo = min(0, bounds.height - ch)
             let hi = max(0, bounds.height - ch)
-            offset.y = min(max(offset.y, lo), hi)
+            q.y = min(max(p.y, lo), hi)
         }
+        return q
     }
 
-    /// Zoomed in beyond fit (TeamViewer: its scroll view has insets of half
-    /// the visible size, so the cursor can always sit at the centre, the
-    /// image edges included).
+    /// Zoomed in beyond fit: the viewport follows the cursor, centring it
+    /// as far as the image edges allow (`viewportTarget`). Near an edge the
+    /// view stops at the edge and the cursor moves off-centre towards it;
+    /// centring resumes once the cursor is back far enough inside.
     private var centresCursor: Bool {
         guard scale > 0, input.hasCursor else { return false }
         let f = fitScale
@@ -882,28 +912,22 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return CGPoint(x: bounds.midX - c.x * scale, y: bounds.midY - c.y * scale)
     }
 
-    /// Place the viewport for the current zoom: cursor-centred (zoomed in,
-    /// TeamViewer) or clamped. Viewport jumps (zoom, resync, leaving /
-    /// reaching fit) are eased when `animated` or while an easing is
-    /// already running, else immediate.
+    /// Where the viewport belongs at the current zoom: zoomed in, the
+    /// cursor-centred offset clamped to the image edges (a continuous
+    /// function of the cursor, so following never jumps or oscillates);
+    /// else the current offset clamped. On an axis where the image is no
+    /// larger than the safe area the clamp keeps it centred / at the top
+    /// (no jump away from the top on a small zoom).
+    private func viewportTarget() -> CGPoint {
+        clamped(centresCursor ? cursorCentredOffset : offset)
+    }
+
+    /// Place the viewport for the current zoom (`viewportTarget`).
+    /// Viewport jumps (zoom, resync, leaving / reaching fit) are eased when
+    /// `animated` or while an easing is already running, else immediate.
     private func settleViewport(animated: Bool) {
         guard scale > 0 else { return }
-        let target: CGPoint
-        if centresCursor {
-            // Zoomed in: the cursor at the centre — except vertically while
-            // the image is still no taller than the safe area, where it
-            // stays at the top (no jump away from the top on a small zoom).
-            var t = cursorCentredOffset
-            if pinsToTop {
-                t.y = safeRect.minY
-            }
-            target = t
-        } else {
-            let saved = offset
-            clampOffset()
-            target = offset
-            offset = saved
-        }
+        let target = viewportTarget()
         if animated || followTarget != nil {
             followTarget = target
             if !animTicker.isRunning {
@@ -929,7 +953,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     /// The host moved the cursor (resync after local input, or someone at
     /// the host): zoomed in, the viewport eases over only when the cursor
-    /// left the middle 80% of the view (no hover feedback loop on iPad).
+    /// left the middle 80% of the view (no hover feedback loop on iPad) and
+    /// the clamped target actually differs (a cursor parked near an image
+    /// edge, where the view already stops, starts no easing).
     private func followHostCursor() {
         guard scale > 0, centresCursor else { return }
         let v = frameToView(input.cursor)
@@ -938,18 +964,22 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         // counts then.
         let outX = v.x < inner.minX || v.x > inner.maxX
         let outY = !pinsToTop && (v.y < inner.minY || v.y > inner.maxY)
-        if outX || outY {
+        guard outX || outY else { return }
+        let target = viewportTarget()
+        if followTarget != nil || abs(target.x - offset.x) > 0.5 || abs(target.y - offset.y) > 0.5 {
             settleViewport(animated: true)
         }
     }
 
-    /// One easing step towards `followTarget`; false when done.
+    /// One easing step towards `followTarget` (re-clamped, so it stays
+    /// inside the image edges); false when done.
     private func stepFollow(_ now: CFTimeInterval) -> Bool {
-        guard let target = followTarget else { return false }
+        guard let rawTarget = followTarget else { return false }
         guard scale > 0 else {
             followTarget = nil
             return false
         }
+        let target = clamped(rawTarget)
         let dt = lastAnimTime > 0 ? min(max(now - lastAnimTime, 0), 0.1) : 1.0 / 60.0
         let k = CGFloat(1 - exp(-dt / Self.followTimeConstant))
         offset.x += (target.x - offset.x) * k

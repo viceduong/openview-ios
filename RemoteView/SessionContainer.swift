@@ -159,8 +159,24 @@ struct SessionContainer: View {
         .onPreferenceChange(ChromeFramesKey.self) { rects in
             controller.input.chromeExclusionRects = rects
         }
+        // The remote image is laid out below the stats chip (0 = no chip:
+        // the plain safe area). Published on the next main-queue turn (the
+        // surface refits on it).
+        .onPreferenceChange(TopChromeBottomKey.self) { bottom in
+            let input = controller.input
+            DispatchQueue.main.async {
+                if input.topChromeInset != bottom {
+                    input.topChromeInset = bottom
+                }
+            }
+        }
         .onDisappear {
             controller.input.chromeExclusionRects = []
+            // Queued like the updates above, so it lands after any of them.
+            let input = controller.input
+            DispatchQueue.main.async {
+                input.topChromeInset = 0
+            }
         }
     }
 
@@ -470,6 +486,8 @@ private struct StatsChip: View {
     let fingerprint: String
     @State private var expanded = false
 
+    private static let verticalPadding: CGFloat = 7
+
     private var qualityColor: Color {
         guard liveness.peerAlive else { return .red }
         let rtt = liveness.rttMs
@@ -514,6 +532,16 @@ private struct StatsChip: View {
                             .foregroundColor(p == "Direct" ? .green : Color.white.opacity(0.75))
                     }
                 }
+                // The collapsed chip's bottom edge (header row + bottom
+                // padding): the remote image starts below it. The detail
+                // rows of the expanded chip overlay the image instead, so
+                // tapping the chip does not resize the screen.
+                .background(
+                    GeometryReader { g in
+                        Color.clear.preference(key: TopChromeBottomKey.self,
+                                               value: g.frame(in: .global).maxY + Self.verticalPadding)
+                    }
+                )
                 if expanded {
                     detailRow("RTT", rttText)
                     detailRow("FPS", String(format: "%.1f", Double(liveness.fps)))
@@ -526,7 +554,7 @@ private struct StatsChip: View {
             }
             .foregroundColor(.white)
             .padding(.horizontal, 10)
-            .padding(.vertical, 7)
+            .padding(.vertical, Self.verticalPadding)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
@@ -544,6 +572,17 @@ private struct StatsChip: View {
                 .frame(maxWidth: 210, alignment: .leading)
         }
         .font(.caption2.monospacedDigit())
+    }
+}
+
+/// Bottom edge (global = window y) of the chrome docked at the top of the
+/// session (the stats chip); 0 when none is shown. Collected by the session
+/// view into `RemoteInputController.topChromeInset`.
+struct TopChromeBottomKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 

@@ -12,7 +12,9 @@ import SwiftUI
 /// nearest side edge and the position is persisted. Optionally fades to
 /// 70% after 3 s without interaction ("Fade toolbar when idle", default
 /// off) — purely visual: every tap acts immediately, faded or not.
-/// Cmd+Shift+Space toggles it (SessionHostingController).
+/// Cmd+Shift+Space toggles it (SessionHostingController). While the soft
+/// keyboard or the key accessory bar is up (`input.keyInputActive`) the
+/// pill / handle slide out and come back when it hides.
 ///
 /// The pill / handle report their frames (`reportsChromeFrame`) so the
 /// remote surface underneath never takes touches meant for them.
@@ -45,15 +47,34 @@ struct FloatingToolbar: View {
 
     var body: some View {
         GeometryReader { geo in
-            if chrome.toolbarCollapsed {
-                handle(in: geo.size)
-            } else {
-                expanded(in: geo)
+            // Hidden while the soft keyboard / key bar is up (the bar's
+            // hide-keyboard key brings it back). Removed from the hierarchy,
+            // so it reports no chrome frame: the whole screen takes touches.
+            if !input.keyInputActive {
+                // A ZStack (not a Group): the transition applies to the
+                // toolbar as a whole, the collapse / expand swap inside it
+                // keeps its own (default) transition.
+                ZStack {
+                    if chrome.toolbarCollapsed {
+                        handle(in: geo.size)
+                    } else {
+                        expanded(in: geo)
+                    }
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .transition(.move(edge: slideEdge).combined(with: .opacity))
             }
         }
         .opacity(chrome.toolbarFaded ? SessionChrome.fadedOpacity : 1)
         .animation(.easeInOut(duration: 0.3), value: chrome.toolbarFaded)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: chrome.toolbarCollapsed)
+        .animation(.easeInOut(duration: 0.25), value: input.keyInputActive)
+    }
+
+    /// The side the toolbar slides out to / in from when the keyboard
+    /// hides / shows it: its own edge.
+    private var slideEdge: Edge {
+        chrome.toolbarCollapsed && handleEdge == "leading" ? .leading : .trailing
     }
 
     // MARK: Expanded pill
