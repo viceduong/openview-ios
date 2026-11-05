@@ -158,15 +158,6 @@ enum ZoomPreset {
     case native
 }
 
-/// Mouse mode, zoomed in: how the viewport follows the cursor. Raw values
-/// are persisted under `RemoteInputController.viewportFollowDefaultsKey`.
-enum ViewportFollow: String {
-    /// TeamViewer: the cursor stays at the centre, the image moves.
-    case center
-    /// Pan only when the cursor enters the outer 13% band.
-    case edge
-}
-
 /// Sticky modifier state: latched = one-shot (applies to the next key or
 /// click, then turns off); locked = applies until tapped again.
 enum ModifierState {
@@ -354,35 +345,18 @@ final class FrameTicker {
 final class RemoteInputController: ObservableObject {
     static let modeDefaultsKey = "ov.inputMode"
     static let cmdAsCtrlDefaultsKey = "ov.cmdAsCtrl"
-    static let cursorFlingDefaultsKey = "ov.cursorFling"
     static let pointerLockDefaultsKey = "ov.pointerLock"
-    /// Trackpad pointer acceleration curve (default off: linear motion).
-    static let cursorAccelDefaultsKey = "ov.cursorAccel"
-    /// Trackpad cursor speed multiplier (Double). 1.0 = TeamViewer exactly
-    /// (sliding across the displayed image crosses the whole remote screen).
-    static let cursorSpeedDefaultsKey = "ov.cursorSpeed"
-    static let cursorSpeedRange: ClosedRange<Double> = 0.5...3.0
-    static let defaultCursorSpeed: Double = 1.0
-    /// v0.40 shipped a 2.5x default to make up for a slow-feeling 1x (the
-    /// old relative path, not a units error); a stored 2.5 is reset to 1.0
-    /// once (this flag).
-    static let cursorSpeedMigratedDefaultsKey = "ov.cursorSpeedTVMigrated"
-    private static let legacyDefaultCursorSpeed: Double = 2.5
-    /// Mouse mode, zoomed in: how the viewport follows the cursor
-    /// ("center" = TeamViewer, default; "edge" = push at a 13% margin).
-    static let viewportFollowDefaultsKey = "ov.viewportFollow"
     /// "Lock local zoom": every gesture, pinch included, goes to the host.
     static let lockLocalZoomDefaultsKey = "ov.lockLocalZoom"
-    /// v0.42 A/B switches for the pre-v0.42 gesture behaviours (all
-    /// default off = the TeamViewer-parity defaults):
-    /// mouse-mode taps click on lift instead of after the 0.3 s tap timer
-    /// (and tap-then-hold 0.15 s drags),
-    static let immediateClicksDefaultsKey = "ov.immediateClicks"
-    /// two-finger scroll keeps gliding after release,
-    static let scrollInertiaDefaultsKey = "ov.scrollInertia"
-    /// touch mode: one finger pans the view, two fingers scroll, long
-    /// press 0.3 s (instead of one finger = scroll, two = pan, 0.4 s).
-    static let classicTouchDefaultsKey = "ov.classicTouchGestures"
+    /// Keys of control settings removed in favour of the fixed TeamViewer
+    /// behaviour (cursor speed / acceleration / fling, immediate clicks,
+    /// scroll inertia, classic touch gestures, viewport follow) and of
+    /// their old migration flags; `migrateDefaults` deletes them.
+    static let obsoleteDefaultsKeys = [
+        "ov.cursorSpeed", "ov.cursorAccel", "ov.cursorFling", "ov.immediateClicks",
+        "ov.scrollInertia", "ov.classicTouchGestures", "ov.viewportFollow",
+        "ov.cursorSpeedTVMigrated", "ov.tvParityDefaultsV42",
+    ]
 
     /// Sends one channel-0 command (SessionController.sendCommand).
     var send: ((Data) -> Void)?
@@ -487,104 +461,25 @@ final class RemoteInputController: ObservableObject {
         UserDefaults.standard.object(forKey: Self.cmdAsCtrlDefaultsKey) as? Bool ?? true
     }
 
-    /// One-finger fling inertia for the trackpad cursor (default off).
-    var cursorFlingEnabled: Bool {
-        UserDefaults.standard.bool(forKey: Self.cursorFlingDefaultsKey)
-    }
-
     /// iPad pointer lock + raw GCMouse deltas (default off).
     var pointerLockEnabled: Bool {
         UserDefaults.standard.bool(forKey: Self.pointerLockDefaultsKey)
     }
 
-    /// Trackpad acceleration curve (default off: linear, scaled by zoom).
-    var cursorAccelEnabled: Bool {
-        UserDefaults.standard.bool(forKey: Self.cursorAccelDefaultsKey)
-    }
-
-    /// One-time settings migration (idempotent; called at app start and by
-    /// every controller): the old 2.5x default becomes 1.0x (TeamViewer).
-    /// Control settings that define the TeamViewer-parity experience.
-    static let teamViewerParityKeys = [
-        modeDefaultsKey, cursorFlingDefaultsKey, cursorAccelDefaultsKey,
-        cursorSpeedDefaultsKey, viewportFollowDefaultsKey, lockLocalZoomDefaultsKey,
-        immediateClicksDefaultsKey, scrollInertiaDefaultsKey, classicTouchDefaultsKey,
-    ]
-    /// One-time flag: stored control settings were reset to TeamViewer parity.
-    static let parityResetDefaultsKey = "ov.tvParityDefaultsV42"
-
-    /// Reset every control setting to its TeamViewer-parity default (mouse
-    /// mode, 1.0x linear cursor, no inertia, delayed tap clicks, centre
-    /// follow, TeamViewer touch gestures) by removing the stored values.
-    static func resetToTeamViewerDefaults() {
-        let d = UserDefaults.standard
-        for key in teamViewerParityKeys {
-            d.removeObject(forKey: key)
-        }
-    }
-
+    /// Settings cleanup (idempotent; called at app start and by every
+    /// controller): drop the stored values of the removed control settings.
+    /// Removing an absent key is a no-op, so this needs no flag of its own.
     static func migrateDefaults() {
         let d = UserDefaults.standard
-        if !d.bool(forKey: parityResetDefaultsKey) {
-            // TeamViewer parity is the default from v0.42 on: drop values
-            // saved by earlier builds or experiments, once.
-            resetToTeamViewerDefaults()
-            d.set(true, forKey: parityResetDefaultsKey)
-            d.set(true, forKey: cursorSpeedMigratedDefaultsKey)
-            return
+        for key in obsoleteDefaultsKeys where d.object(forKey: key) != nil {
+            d.removeObject(forKey: key)
         }
-        guard !d.bool(forKey: cursorSpeedMigratedDefaultsKey) else { return }
-        if let v = d.object(forKey: cursorSpeedDefaultsKey) as? Double {
-            if abs(v - legacyDefaultCursorSpeed) < 0.0001 {
-                d.set(defaultCursorSpeed, forKey: cursorSpeedDefaultsKey)
-            } else if v.isFinite {
-                d.set(min(max(v, cursorSpeedRange.lowerBound), cursorSpeedRange.upperBound),
-                      forKey: cursorSpeedDefaultsKey)
-            } else {
-                d.removeObject(forKey: cursorSpeedDefaultsKey)
-            }
-        }
-        d.set(true, forKey: cursorSpeedMigratedDefaultsKey)
-    }
-
-    /// Mouse mode, zoomed in: centre the cursor (TeamViewer) or push at
-    /// the edges.
-    var viewportFollow: ViewportFollow {
-        let raw = UserDefaults.standard.string(forKey: Self.viewportFollowDefaultsKey) ?? ""
-        return ViewportFollow(rawValue: raw) ?? .center
-    }
-
-    /// Trackpad cursor speed: multiplier on finger travel (on-screen
-    /// points), 0.5x...3x, default 1.0x = TeamViewer. Read on every pan
-    /// step, so the session menu slider takes effect live.
-    var cursorSpeed: CGFloat {
-        let raw = UserDefaults.standard.object(forKey: Self.cursorSpeedDefaultsKey) as? Double
-            ?? Self.defaultCursorSpeed
-        guard raw.isFinite else { return CGFloat(Self.defaultCursorSpeed) }
-        let r = Self.cursorSpeedRange
-        return CGFloat(min(max(raw, r.lowerBound), r.upperBound))
     }
 
     /// Local zoom locked: pinch becomes Ctrl+wheel on the host and touch
     /// mode drags go to the host (default off).
     var lockLocalZoom: Bool {
         UserDefaults.standard.bool(forKey: Self.lockLocalZoomDefaultsKey)
-    }
-
-    /// Mouse-mode taps click at once on lift (pre-v0.42; default off:
-    /// TeamViewer's 0.3 s tap timer with a tap count).
-    var immediateClicks: Bool {
-        UserDefaults.standard.bool(forKey: Self.immediateClicksDefaultsKey)
-    }
-
-    /// Two-finger scroll inertia (default off).
-    var scrollInertiaEnabled: Bool {
-        UserDefaults.standard.bool(forKey: Self.scrollInertiaDefaultsKey)
-    }
-
-    /// Touch mode with the pre-v0.42 gestures (default off).
-    var classicTouchGestures: Bool {
-        UserDefaults.standard.bool(forKey: Self.classicTouchDefaultsKey)
     }
 
     /// Ask the surface to apply a zoom preset (session menu).
@@ -747,7 +642,7 @@ final class RemoteInputController: ObservableObject {
     }
 
     /// TeamViewer's trackpad model (mouse mode). `d` = finger travel in
-    /// screen points (already times the speed setting); `displayed` = the
+    /// screen points (1:1, no speed factor or acceleration); `displayed` = the
     /// remote image's on-screen size in points (frame pixels x zoom, i.e.
     /// TeamViewer's R * z). pct += d / max(displayed, 1) per axis, clamped
     /// to [0, 1] (no wrap); the host gets the ABSOLUTE position

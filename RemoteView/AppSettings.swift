@@ -24,12 +24,6 @@ enum SettingsKey {
     static let hideWallpaper = "ov.hideWallpaper"
     static let disableAnimations = "ov.disableAnimations"
     // Input (the rest live on RemoteInputController)
-    static let cursorAccel = RemoteInputController.cursorAccelDefaultsKey
-    /// Trackpad cursor speed multiplier (Double, 0.5...3.0, default 1.0 =
-    /// TeamViewer; a stored v0.40 default of 2.5 is migrated to 1.0 once).
-    static let cursorSpeed = RemoteInputController.cursorSpeedDefaultsKey
-    /// Mouse mode, zoomed in: "center" (TeamViewer, default) or "edge".
-    static let viewportFollow = RemoteInputController.viewportFollowDefaultsKey
     static let lockLocalZoom = RemoteInputController.lockLocalZoomDefaultsKey
     // Session
     static let keepAwake = "ov.keepAwake"

@@ -18,25 +18,19 @@ import UIKit.UIGestureRecognizerSubclass
 //                         moves (RemoteInputController.moveCursorTrackpad).
 //                         At fit, sliding across the image crosses the
 //                         whole remote screen; zoomed in by z, 1 pt = 1/z
-//                         remote px. "Cursor speed" (setting
-//                         "ov.cursorSpeed", 0.5x-3x, default 1.0x = exact
-//                         TeamViewer) multiplies the finger travel; optional
-//                         acceleration curve 1x -> 2.5x on top (setting
-//                         "ov.cursorAccel", off). Zoomed in, the viewport
-//                         keeps the cursor centred (TeamViewer; setting
-//                         "ov.viewportFollow" = "edge" restores edge-push)
-//     v0.42 (TeamViewer parity): one custom recognizer
-//                         (TrackpadTouchRecognizer, the MouseGestureRecognizer
-//                         model) moves the cursor from the very first
-//                         touchesMoved (no pan slop, no waiting for a tap to
-//                         fail); tap / drag / long press are decided
-//                         afterwards, see "Mouse-mode trackpad". Cursor
-//                         inertia (ov.cursorFling) default off.
+//                         remote px. Linear, 1:1 (no speed factor, no
+//                         acceleration, no cursor inertia). Zoomed in, the
+//                         viewport keeps the cursor centred (TeamViewer).
+//                         One custom recognizer (TrackpadTouchRecognizer,
+//                         the MouseGestureRecognizer model) moves the cursor
+//                         from the very first touchesMoved (no pan slop, no
+//                         waiting for a tap to fail); tap / drag / long
+//                         press are decided afterwards, see "Mouse-mode
+//                         trackpad".
 //     tap                 a touch that never travelled 10 pt: counted; 0.3 s
 //                         after the last tap lifts, 1 tap = left click, 2 =
 //                         double click, at the cursor (the tapped pixel:
-//                         sub-slop jitter is undone). "Immediate clicks"
-//                         (ov.immediateClicks, off): click on lift instead
+//                         sub-slop jitter is undone)
 //     double-tap and drag second touch-down < 0.3 s after a tap, then move
 //                         10 pt (or hold 0.3 s) = left drag, DOWN at the
 //                         tapped pixel (haptic), UP on lift, + ring
@@ -45,8 +39,7 @@ import UIKit.UIGestureRecognizerSubclass
 //                         3-finger tap: middle click. Any second finger
 //                         cancels pending taps / the long press
 //     2-finger pan        wheel at the cursor: one notch (120) per 10 pt,
-//                         natural direction, both axes; inertia only with
-//                         "Scroll inertia" (ov.scrollInertia, off)
+//                         natural direction, both axes, no inertia
 //     pinch               zoom around the cursor; snaps to fit / fill / 1:1
 //                         within +-20% on release. Zoom range (TeamViewer):
 //                         fit inside the safe area ... max(2 pt/px, fit)
@@ -57,15 +50,14 @@ import UIKit.UIGestureRecognizerSubclass
 //     1-finger pan        wheel at the finger, one notch per 10 pt
 //     2-finger pan        pan the zoomed view (with the pinch)
 //     pinch               zoom at the fingers (and pan with them)
-//     "Classic touch gestures" (ov.classicTouchGestures, off): 1 finger
-//     pans the view, 2 fingers = wheel at the fingers, long tap 0.3 s
 //   LOCK LOCAL ZOOM (setting "ov.lockLocalZoom"): pinch becomes Ctrl+wheel
 //   on the host and the touch-mode 1-finger pan becomes a left drag.
 //   After a multi-finger gesture the remaining finger is ignored until
 //   every finger lifted + 0.1 s (no stray cursor moves / clicks).
 //   Fit / fill / 1:1 are menu commands (RemoteInputController.applyZoomPreset).
 //   iPad pointer: hover = absolute move, clicks / right clicks via indirect
-//   pointer touches, trackpad / wheel scroll = WHEEL, optional raw GCMouse
+//   pointer touches, trackpad / wheel scroll = WHEEL (trackpad scrolling
+//   glides on after release), optional raw GCMouse
 //   deltas while the pointer is locked.
 //
 // Every DOWN gets its UP: positions are clamped to the frame (never
@@ -113,6 +105,7 @@ struct RemoteScreenSurface: UIViewRepresentable {
 
 // MARK: - Fling
 
+/// iPad trackpad scroll inertia (finger gestures have none).
 /// CRD FlingTracker: exponential decay x(t) = T·v0·(1 − e^(−t/T)), stops
 /// when the speed falls below 0.01 pt/ms (duration = −T·ln(0.01/v0)); no
 /// fling when the total displacement would be under 20 pt.
@@ -274,33 +267,6 @@ final class TrackpadTouchRecognizer: UIGestureRecognizer {
     }
 }
 
-/// Recent finger samples -> release / acceleration velocity (points per
-/// second) over the last 100 ms.
-struct TouchVelocity {
-    private var samples: [(t: TimeInterval, p: CGPoint)] = []
-    private static let window: TimeInterval = 0.1
-
-    mutating func reset(_ p: CGPoint, at t: TimeInterval) {
-        samples.removeAll(keepingCapacity: true)
-        samples.append((t: t, p: p))
-    }
-
-    mutating func add(_ p: CGPoint, at t: TimeInterval) {
-        samples.append((t: t, p: p))
-        while samples.count > 2, let first = samples.first, t - first.t > Self.window {
-            samples.removeFirst()
-        }
-    }
-
-    /// The velocity at `now` (zero when the finger rested > 50 ms).
-    func velocity(now: TimeInterval) -> CGPoint {
-        guard let last = samples.last, let first = samples.first, now - last.t <= 0.05 else { return .zero }
-        let dt = last.t - first.t
-        guard dt >= 0.004 else { return .zero }
-        return CGPoint(x: (last.p.x - first.p.x) / CGFloat(dt), y: (last.p.y - first.p.y) / CGFloat(dt))
-    }
-}
-
 /// One mouse-mode trackpad touch (owned by RemoteSurfaceView).
 struct TrackpadTouch {
     /// A tracked finger is down (false: idle, or ignored to its end).
@@ -315,13 +281,12 @@ struct TrackpadTouch {
     /// The long press fired (right click): the lift is not a tap.
     var longPressed = false
     /// Began within the tap window after a tap: lift = double click, hold
-    /// 0.15 s or move past the slop = left drag.
+    /// 0.3 s or move past the slop = left drag.
     var pendingDrag = false
     /// pendingDrag: the taps counted before this touch.
     var priorTaps = 0
     /// pendingDrag: cursor travel held back until the drag has started.
     var heldTravel: CGPoint = .zero
-    var velocity = TouchVelocity()
 }
 
 // MARK: - Surface view
@@ -394,7 +359,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private let gcMouse = GCMouseBridge()
     private var cancellables = Set<AnyCancellable>()
 
-    /// Mouse mode: a tap-then-hold drag holds the left button.
+    /// Mouse mode: a double-tap-and-drag holds the left button.
     private var dragActive = false
     /// Mouse-mode trackpad touch (TrackpadTouchRecognizer) state.
     private var tp = TrackpadTouch()
@@ -403,9 +368,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// `tapWindow` of that is a further tap or a double-tap-and-drag.
     private var lastTap: (count: Int, cursor: CGPoint, time: CFTimeInterval)?
     /// TeamViewer tap timer: fires `tapWindow` after the last tap lifted
-    /// and sends the counted clicks (not used with "Immediate clicks").
+    /// and sends the counted clicks.
     private var tapTimer: DispatchWorkItem?
-    /// Long-press (right click) / tap-then-hold (drag) timer of the touch.
+    /// Long-press (right click) / double-tap-and-hold (drag) timer.
     private var tpTimer: DispatchWorkItem?
     /// Two-finger / one-finger wheel scrolling: finger travel (points)
     /// not yet emitted as whole 10 pt wheel steps.
@@ -434,11 +399,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var pinchCtrlHeld = false
 
     // ---- animation ----
-    private var cursorFling = FlingTracker(timeConstant: 180)
+    /// iPad trackpad (continuous pointer scroll) inertia.
     private var scrollFling = FlingTracker(timeConstant: 250)
-    private var scrollFlingFactor: CGFloat = 0
-    /// The scroll fling emits 10 pt wheel steps (finger scrolling).
-    private var scrollFlingStepped = false
     /// Mouse mode, zoomed in: the cursor-centred offset the viewport is
     /// easing towards (nil = not animating).
     private var followTarget: CGPoint?
@@ -451,8 +413,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     // ---- constants ----
     private static let cursorMinPoints: CGFloat = 20
     private static let cursorMaxPoints: CGFloat = 64
-    private static let edgeMargin: CGFloat = 0.13
-    /// Wheel units (1/120 notch) per point of two-finger travel: one
+    /// iPad pointer scrolling: wheel units (1/120 notch) per point, one
     /// notch per 36 pt.
     private static let wheelUnitsPerPoint: CGFloat = 120.0 / 36.0
     /// Max zoom (TeamViewer): 2 view points per remote pixel, or fit when
@@ -581,10 +542,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         pan2.maximumNumberOfTouches = 2
         pinch.addTarget(self, action: #selector(handlePinch(_:)))
         longPress.addTarget(self, action: #selector(handleLongPress(_:)))
-        longPress.minimumPressDuration = 0.40 // touch mode long tap; see shouldReceive
+        longPress.minimumPressDuration = 0.40 // touch mode long tap (TeamViewer)
         longPress.allowableMovement = 10
         // Mouse mode, one finger: moves from the first touchesMoved; taps,
-        // tap-then-hold drags and long presses are decided by the
+        // double-tap-and-drag and long presses are decided by the
         // trackpad handlers (TeamViewer's MouseGestureRecognizer model).
         trackpad.onTouch = { [weak self] phase, location, time in
             self?.handleTrackpad(phase, location, time)
@@ -730,7 +691,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         pan1.isEnabled = mode == .touch
         longPress.isEnabled = mode == .touch
         endLocalGestures()
-        cursorFling.stop()
         scrollFling.stop()
         // Touch mode keeps the image inside the view; mouse mode may centre
         // the cursor. @Published delivers in willSet (input.mode is still
@@ -955,12 +915,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         max(Self.maxZoomScale, fitScale)
     }
 
-    /// Zoom relative to fit (1 = fit).
-    private var zoomFactor: CGFloat {
-        let f = fitScale
-        return f > 0 && scale > 0 ? scale / f : 1
-    }
-
     private func clampScale(_ s: CGFloat) -> CGFloat {
         guard s.isFinite else { return fitScale }
         return min(max(s, fitScale), maxScale)
@@ -999,12 +953,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Mouse mode, zoomed in beyond fit, "centre" follow (TeamViewer: its
-    /// scroll view has insets of half the visible size, so the cursor can
-    /// always sit at the centre, the image edges included).
+    /// Mouse mode, zoomed in beyond fit (TeamViewer: its scroll view has
+    /// insets of half the visible size, so the cursor can always sit at the
+    /// centre, the image edges included).
     private var centresCursor: Bool {
-        guard input.mode == .mouse, scale > 0, input.hasCursor,
-              input.viewportFollow == .center else { return false }
+        guard input.mode == .mouse, scale > 0, input.hasCursor else { return false }
         let f = fitScale
         return f > 0 && scale > f * 1.001
     }
@@ -1015,17 +968,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return CGPoint(x: bounds.midX - c.x * scale, y: bounds.midY - c.y * scale)
     }
 
-    /// Mouse mode with "centre" follow: viewport jumps (zoom, resync,
-    /// leaving / reaching fit) are eased instead of applied at once.
+    /// Mouse mode: viewport jumps (zoom, resync, leaving / reaching fit)
+    /// are eased instead of applied at once.
     private var easesViewport: Bool {
-        input.mode == .mouse && input.viewportFollow == .center
+        input.mode == .mouse
     }
 
     /// Place the viewport for the current zoom / mode: cursor-centred
-    /// (mouse mode zoomed in, TeamViewer) or clamped (plus the edge-push
-    /// in mouse mode with "edge" follow). In "centre" mode the change is
-    /// eased when `animated` or while an easing is already running, else
-    /// immediate; other modes are always immediate.
+    /// (mouse mode zoomed in, TeamViewer) or clamped. In mouse mode the
+    /// change is eased when `animated` or while an easing is already
+    /// running, else immediate; touch mode is always immediate.
     private func settleViewport(animated: Bool) {
         guard scale > 0 else { return }
         let target: CGPoint
@@ -1050,35 +1002,25 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             offset = target
             applyViewport()
         }
-        if input.mode == .mouse && !centresCursor {
-            edgePush()
-        }
     }
 
-    /// After the cursor moved locally (trackpad, fling, pointer lock).
+    /// After the cursor moved locally (trackpad, pointer lock).
     private func followCursorAfterMove() {
         if centresCursor || followTarget != nil {
             settleViewport(animated: false)
-        } else {
-            edgePush()
         }
         updateCursorLayer()
     }
 
     /// The host moved the cursor (resync after local input, or someone at
-    /// the host): centred mode eases the viewport over only when the
-    /// cursor left the middle 80% of the view (no hover feedback loop on
-    /// iPad); edge mode pushes.
+    /// the host): zoomed in, the viewport eases over only when the cursor
+    /// left the middle 80% of the view (no hover feedback loop on iPad).
     private func followHostCursor() {
-        guard input.mode == .mouse, scale > 0 else { return }
-        if centresCursor {
-            let v = frameToView(input.cursor)
-            let inner = bounds.insetBy(dx: bounds.width * 0.1, dy: bounds.height * 0.1)
-            if !inner.contains(v) {
-                settleViewport(animated: true)
-            }
-        } else {
-            edgePush()
+        guard input.mode == .mouse, scale > 0, centresCursor else { return }
+        let v = frameToView(input.cursor)
+        let inner = bounds.insetBy(dx: bounds.width * 0.1, dy: bounds.height * 0.1)
+        if !inner.contains(v) {
+            settleViewport(animated: true)
         }
     }
 
@@ -1086,7 +1028,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private func stepFollow(_ now: CFTimeInterval) -> Bool {
         guard let target = followTarget else { return false }
         guard easesViewport, scale > 0 else {
-            // Mode / setting changed meanwhile: place it at once.
+            // Mode changed meanwhile: place it at once.
             followTarget = nil
             settleViewport(animated: false)
             return false
@@ -1145,7 +1087,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         scale = newScale
         offset = CGPoint(x: pivot.x - fx * newScale, y: pivot.y - fy * newScale)
         followPreset = abs(newScale - fitScale) < 0.0001 ? .fit : nil
-        // Mouse mode, "centre" follow: left unclamped, the caller eases it
+        // Mouse mode: left unclamped, the caller eases it
         // (settleViewport) to the cursor-centred or clamped offset.
         if !easesViewport {
             clampOffset()
@@ -1197,27 +1139,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         followPreset = preset
     }
 
-    /// Mouse mode ("edge" follow): pan the zoomed view so the cursor stays
-    /// out of the outer 13% band.
-    private func edgePush() {
-        guard scale > 0, bounds.width > 0, bounds.height > 0 else { return }
-        let cw = frameSize.width * scale
-        let ch = frameSize.height * scale
-        guard cw > bounds.width + 0.5 || ch > bounds.height + 0.5 else { return }
-        let v = frameToView(input.cursor)
-        let mx = bounds.width * Self.edgeMargin
-        let my = bounds.height * Self.edgeMargin
-        var dx: CGFloat = 0
-        var dy: CGFloat = 0
-        if v.x < mx { dx = mx - v.x } else if v.x > bounds.width - mx { dx = bounds.width - mx - v.x }
-        if v.y < my { dy = my - v.y } else if v.y > bounds.height - my { dy = bounds.height - my - v.y }
-        guard dx != 0 || dy != 0 else { return }
-        offset.x += dx
-        offset.y += dy
-        clampOffset()
-        applyViewport()
-    }
-
     /// View point -> frame pixel, clamped to the frame.
     func viewToFrame(_ p: CGPoint) -> CGPoint {
         guard scale > 0, frameSize.width > 0, frameSize.height > 0 else { return .zero }
@@ -1239,8 +1160,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
         if bounds.size != lastBoundsSize {
             lastBoundsSize = bounds.size
-            // Also keeps the cursor in sight (centred / edge-pushed in
-            // mouse mode) when the view shrank (soft keyboard / key bar)
+            // Also keeps the cursor in sight (centred in mouse mode)
+            // when the view shrank (soft keyboard / key bar)
             // or rotated.
             refit()
         }
@@ -1327,7 +1248,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     /// Trackpad motion of `d` screen points (finger travel in this view,
     /// which is never transformed: the zoom lives on the container layer;
-    /// already multiplied by `trackpadGain`, 1.0 by default) -> TeamViewer's
+    /// 1:1, no gain or acceleration) -> TeamViewer's
     /// pct += d / (R * z): `scale` is view POINTS per remote pixel (not
     /// device pixels), so frameSize * scale is the displayed image size in
     /// points. The controller sends the resulting absolute position.
@@ -1336,14 +1257,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         let displayed = CGSize(width: frameSize.width * scale, height: frameSize.height * scale)
         input.moveCursorTrackpad(byPoints: d, displayed: displayed)
         followCursorAfterMove()
-    }
-
-    /// Pointer acceleration: 1x below 0.5 pt/ms, smoothstep up to 2.5x at
-    /// 1.5 pt/ms and above.
-    private static func pointerGain(speedPtPerMs speed: CGFloat) -> CGFloat {
-        guard speed.isFinite else { return 1 }
-        let t = min(max(speed - 0.5, 0), 1)
-        return 1 + 1.5 * t * t * (3 - 2 * t)
     }
 
     private func setDragRingVisible(_ visible: Bool) {
@@ -1425,26 +1338,17 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         CATransaction.commit()
     }
 
-    // MARK: Animation (flings)
+    // MARK: Animation (iPad trackpad scroll inertia, viewport easing)
 
     private func stopFlings() {
-        cursorFling.stop()
         scrollFling.stop()
     }
 
     private func animate(_ now: CFTimeInterval) {
         var running = false
-        if let d = cursorFling.step(now: now) {
-            running = true
-            moveCursor(byViewPoints: d)
-        }
         if let d = scrollFling.step(now: now) {
             running = true
-            if scrollFlingStepped {
-                stepWheel(byViewPoints: d)
-            } else {
-                sendWheel(byViewPoints: d, factor: scrollFlingFactor)
-            }
+            sendWheel(byViewPoints: d, factor: Self.wheelUnitsPerPoint)
         }
         if stepFollow(now) {
             running = true
@@ -1675,23 +1579,21 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     }
 
     /// Touch mode, one finger (mouse mode: disabled — the trackpad
-    /// recognizer owns one-finger input there). Default: scroll at the
-    /// finger, one wheel notch per 10 pt ("One finger to scroll"); classic
-    /// touch gestures: pan the zoomed view; lock local zoom: left drag.
+    /// recognizer owns one-finger input there): scroll at the finger, one
+    /// wheel notch per 10 pt, no inertia ("One finger to scroll"); lock
+    /// local zoom: left drag.
     @objc private func handlePan1(_ g: UIPanGestureRecognizer) {
         guard input.mode == .touch else { return }
         if input.lockLocalZoom || touchDragActive {
             handleTouchDrag(g)
             return
         }
-        let classic = input.classicTouchGestures
         switch g.state {
         case .began:
-            cursorFling.stop()
             scrollFling.stop()
             scrollStepAcc = .zero
             pan1Suppressed = inMultiFingerAftermath
-            if !classic && !pan1Suppressed && !lpActive {
+            if !pan1Suppressed && !lpActive {
                 // Scroll where the finger went down.
                 let loc = g.location(in: self)
                 let t = g.translation(in: self)
@@ -1702,22 +1604,13 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             let t = g.translation(in: self)
             g.setTranslation(.zero, in: self)
             if isPinching || pan1Suppressed || multiTouchSequence || lpActive { return }
-            if classic {
-                panViewport(by: t)
-            } else {
-                stepWheel(byViewPoints: t)
-            }
-        case .ended:
-            let suppressed = pan1Suppressed
-            pan1Suppressed = false
-            guard !classic, !suppressed, !lpActive, input.input2, input.scrollInertiaEnabled else { return }
-            startScrollFling(velocity: g.velocity(in: self), stepped: true, factor: 0)
+            stepWheel(byViewPoints: t)
         default:
             pan1Suppressed = false
         }
     }
 
-    /// Touch mode, two fingers (default): pan the view with the fingers
+    /// Touch mode, two fingers: pan the view with the fingers
     /// ("Two fingers to pan"); while pinching the pinch pans itself.
     private func handleTwoFingerPan(_ g: UIPanGestureRecognizer) {
         switch g.state {
@@ -1737,8 +1630,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     // TeamViewer's MouseGestureRecognizer model: the cursor follows the
     // finger from its first movement (delta from the previous location;
-    // the previous location is reset at touch-down, no slop, no
-    // acceleration by default), and what the touch meant is decided
+    // the previous location is reset at touch-down, no slop, no speed
+    // factor or acceleration), and what the touch meant is decided
     // afterwards:
     //   lift, never moved 10 pt, no long press   a tap: the tap count goes
     //                                             up and a 0.3 s timer starts;
@@ -1753,17 +1646,12 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     //                                             drag to select")
     //   a second finger anywhere                  cancels pending taps / the
     //                                             long press
-    // "Immediate clicks" (setting, pre-v0.42): a tap clicks on lift (the
-    // second one at the first one's pixel = double click) and tap, then
-    // hold 0.15 s also drags.
     // Sub-slop jitter moves the cursor (zero latency), but taps / long
     // presses click at the touch-down pixel, so double clicks stay exact.
 
     /// Finger travel (points) that makes a touch a move instead of a tap.
     private static let tapSlop: CGFloat = 10
     private static let longPressDelay: TimeInterval = 0.30
-    /// "Immediate clicks": tap, then touch and hold this long = drag.
-    private static let immediateHoldDragDelay: TimeInterval = 0.15
     /// TeamViewer scrolling: one wheel notch (120 units) per 10 pt.
     private static let scrollStepPoints: CGFloat = 10
 
@@ -1782,7 +1670,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     private func trackpadBegan(_ loc: CGPoint, _ time: TimeInterval) {
         cancelTrackpadTimer()
-        cursorFling.stop()
         tp = TrackpadTouch()
         // A finger left over from (or right after) a multi-finger gesture
         // is ignored to its end.
@@ -1794,7 +1681,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         tp.downLocation = loc
         tp.lastLocation = loc
         tp.downCursor = input.cursor
-        tp.velocity.reset(loc, at: time)
         let now = CACurrentMediaTime()
         if let last = lastTap, now - last.time < Self.tapWindow, !dragActive {
             // A further tap, or a double-tap-and-drag: the counted clicks
@@ -1804,8 +1690,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             tp.pendingDrag = true
             tp.priorTaps = last.count
             tp.downCursor = last.cursor
-            let hold = input.immediateClicks ? Self.immediateHoldDragDelay : Self.longPressDelay
-            scheduleTrackpadTimer(after: hold) { [weak self] in
+            scheduleTrackpadTimer(after: Self.longPressDelay) { [weak self] in
                 self?.beginTrackpadDrag()
             }
         } else {
@@ -1826,7 +1711,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         guard tp.active, input.mode == .mouse else { return }
         let d = CGPoint(x: loc.x - tp.lastLocation.x, y: loc.y - tp.lastLocation.y)
         tp.lastLocation = loc
-        tp.velocity.add(loc, at: time)
         if !tp.moved && hypot(loc.x - tp.downLocation.x, loc.y - tp.downLocation.y) > Self.tapSlop {
             tp.moved = true
             if !tp.pendingDrag {
@@ -1834,20 +1718,18 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             }
         }
         if isPinching || multiTouchSequence { return }
-        let gain = trackpadGain(tp.velocity.velocity(now: time))
-        let step = CGPoint(x: d.x * gain, y: d.y * gain)
         if tp.pendingDrag && !dragActive {
             // A touch right after a tap: either one more tap (keep the
             // cursor on the tapped pixel) or a drag (starts once it
             // travelled past the slop; the held travel is applied then).
-            tp.heldTravel.x += step.x
-            tp.heldTravel.y += step.y
+            tp.heldTravel.x += d.x
+            tp.heldTravel.y += d.y
             if tp.moved {
                 beginTrackpadDrag()
             }
             return
         }
-        moveCursor(byViewPoints: step)
+        moveCursor(byViewPoints: d)
     }
 
     private func trackpadEnded(_ loc: CGPoint, _ time: TimeInterval) {
@@ -1864,28 +1746,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
         if t.moved || t.longPressed {
             cancelPendingTaps()
-            if t.moved, input.cursorFlingEnabled, !multiTouchSequence {
-                let v = t.velocity.velocity(now: time)
-                let gain = trackpadGain(v)
-                cursorFling.start(velocity: CGPoint(x: v.x * gain, y: v.y * gain), now: CACurrentMediaTime())
-                if cursorFling.isActive { animTicker.start() }
-            }
             return
         }
         let now = CACurrentMediaTime()
         guard !multiTouchSequence, now - multiTouchEnd >= Self.multiFingerLiftDebounce else {
             cancelPendingTaps()
-            return
-        }
-        if input.immediateClicks {
-            // Pre-v0.42: click now; a second tap clicks the same pixel.
-            input.click(.left, at: trackpadClickPoint(t))
-            if t.pendingDrag {
-                lastTap = nil
-            } else {
-                lastTap = (count: 1, cursor: input.cursor, time: now)
-            }
-            updateCursorLayer()
             return
         }
         // TeamViewer: count the tap and answer when no further tap
@@ -1992,16 +1857,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         tpTimer = nil
     }
 
-    /// Trackpad gain: the Cursor speed setting (0.5x...3x, linear, default
-    /// 1x = TeamViewer), times the acceleration curve when that setting is
-    /// on (evaluated on the finger's own speed `v`, points per second).
-    /// Used for move steps and the fling velocity alike.
-    private func trackpadGain(_ v: CGPoint) -> CGFloat {
-        let speed = input.cursorSpeed
-        guard input.cursorAccelEnabled else { return speed }
-        return speed * Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
-    }
-
     /// TeamViewer scrolling: finger travel accumulates and every whole
     /// 10 pt is one wheel notch (120 units), natural direction (content
     /// follows the finger), horizontal too.
@@ -2018,10 +1873,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         input.wheel(dx: Double(-sx * 120), dy: Double(sy * 120))
     }
 
-    /// Scroll inertia: glide on after a scrolling release.
-    private func startScrollFling(velocity v: CGPoint, stepped: Bool, factor: CGFloat) {
-        scrollFlingStepped = stepped
-        scrollFlingFactor = factor
+    /// iPad trackpad scrolling: glide on after the release.
+    private func startScrollFling(velocity v: CGPoint) {
         scrollFling.start(velocity: v, now: CACurrentMediaTime())
         if scrollFling.isActive { animTicker.start() }
     }
@@ -2058,51 +1911,33 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     }
 
     /// Two-finger pan and iPad trackpad / wheel scrolling -> WHEEL. Mouse
-    /// mode two-finger pan: at the cursor, one notch per 10 pt (TeamViewer);
-    /// touch mode two-finger pan pans the view (classic touch gestures:
-    /// wheel at the fingers); iPad pointer scrolling stays continuous.
+    /// mode two-finger pan: at the cursor, one notch per 10 pt, no inertia
+    /// (TeamViewer); touch mode two-finger pan pans the view; iPad pointer
+    /// scrolling stays continuous (trackpads glide on after release).
     @objc private func handleScroll(_ g: UIPanGestureRecognizer) {
         let touchPan = g === pan2
-        if touchPan && input.mode == .touch && !input.classicTouchGestures {
+        if touchPan && input.mode == .touch {
             handleTwoFingerPan(g)
             return
         }
-        let stepped = touchPan && input.mode == .mouse
         switch g.state {
         case .began:
             scrollFling.stop()
             scrollStepAcc = .zero
-            if touchPan && input.mode == .touch {
-                // Scroll where the fingers are.
-                input.moveCursorAbsolute(to: viewToFrame(g.location(in: self)))
-                updateCursorLayer()
-            }
         case .changed:
             let t = g.translation(in: self)
             g.setTranslation(.zero, in: self)
-            if stepped {
+            if touchPan {
                 stepWheel(byViewPoints: t)
             } else {
-                sendWheel(byViewPoints: t, factor: wheelFactor(for: g))
+                sendWheel(byViewPoints: t, factor: Self.wheelUnitsPerPoint)
             }
         case .ended:
-            guard g !== scrollDiscrete, input.input2 else { return }
-            // Finger scrolling glides on only with "Scroll inertia".
-            if touchPan && !input.scrollInertiaEnabled { return }
-            startScrollFling(velocity: g.velocity(in: self), stepped: stepped, factor: wheelFactor(for: g))
+            guard !touchPan, g !== scrollDiscrete, input.input2 else { return }
+            startScrollFling(velocity: g.velocity(in: self))
         default:
             break
         }
-    }
-
-    /// Wheel units per view point; in touch mode the two-finger scroll is
-    /// divided by the zoom so content keeps up with the fingers.
-    private func wheelFactor(for g: UIGestureRecognizer) -> CGFloat {
-        var k = Self.wheelUnitsPerPoint
-        if g === pan2 && input.mode == .touch {
-            k /= max(zoomFactor, 1)
-        }
-        return k
     }
 
     /// Natural scrolling: fingers down (t.y > 0) = content down = scroll
@@ -2126,7 +1961,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             switch input.mode {
             case .mouse:
                 // Around the cursor; zoomed in, the viewport eases it to
-                // the centre (TeamViewer) or edge-pushes.
+                // the centre (TeamViewer).
                 zoom(by: s, pivot: frameToView(input.cursor))
                 settleViewport(animated: true)
             case .touch:
@@ -2181,7 +2016,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Touch mode long tap (0.4 s; classic 0.3 s; 10 pt): loupe; lift =
+    /// Touch mode long tap (0.4 s, 10 pt): loupe; lift =
     /// right click at the finger, drag without lifting = left drag-select.
     /// (Mouse mode: disabled — the trackpad's long press right-clicks.)
     @objc private func handleLongPress(_ g: UILongPressGestureRecognizer) {
@@ -2261,23 +2096,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             (g === a && other === b) || (g === b && other === a)
         }
         if pair(pinch, pan2) {
-            return input.mode == .touch && !input.classicTouchGestures && !input.lockLocalZoom
+            return input.mode == .touch && !input.lockLocalZoom
         }
         return pair(pinch, pan1)
             || pair(longPress, pan1)
             || pair(tap2, longPress)
-    }
-
-    /// Touch mode long tap: 0.4 s (TeamViewer), 0.3 s with the classic
-    /// touch gestures — read when each touch arrives, so the setting
-    /// applies live.
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        if gestureRecognizer === longPress {
-            let d: TimeInterval = input.classicTouchGestures ? 0.30 : 0.40
-            if longPress.minimumPressDuration != d {
-                longPress.minimumPressDuration = d
-            }
-        }
-        return true
     }
 }

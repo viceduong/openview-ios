@@ -571,35 +571,28 @@ struct GestureHelpItem: Identifiable {
 }
 
 enum GestureHelp {
-    /// The help rows for `mode`, matching RemoteScreenSurface's gestures
-    /// (and the "Immediate clicks" / "Classic touch gestures" settings).
+    /// The help rows for `mode`, matching RemoteScreenSurface's gestures.
     static func items(for mode: InputMode) -> [GestureHelpItem] {
-        let d = UserDefaults.standard
         switch mode {
         case .mouse:
-            let immediate = d.bool(forKey: RemoteInputController.immediateClicksDefaultsKey)
             return [
                 GestureHelpItem(id: 0, symbol: "hand.draw", text: "Slide a finger to move the mouse"),
                 GestureHelpItem(id: 1, symbol: "hand.tap", text: "Tap to click at the mouse pointer"),
                 GestureHelpItem(id: 2, symbol: "hand.tap", text: "Double-tap to double-click"),
-                GestureHelpItem(id: 3, symbol: "cursorarrow.motionlines",
-                                text: immediate ? "Tap, then hold or drag to select" : "Double-tap and drag to select"),
+                GestureHelpItem(id: 3, symbol: "cursorarrow.motionlines", text: "Double-tap and drag to select"),
                 GestureHelpItem(id: 4, symbol: "hand.point.up.left", text: "Long press to right-click"),
                 GestureHelpItem(id: 5, symbol: "hand.tap.fill", text: "Two-finger tap to right-click"),
                 GestureHelpItem(id: 6, symbol: "arrow.up.and.down", text: "Two fingers to scroll"),
                 GestureHelpItem(id: 7, symbol: "arrow.up.left.and.arrow.down.right", text: "Pinch to zoom"),
             ]
         case .touch:
-            let classic = d.bool(forKey: RemoteInputController.classicTouchDefaultsKey)
             return [
                 GestureHelpItem(id: 0, symbol: "hand.tap", text: "Tap to click where you touch"),
                 GestureHelpItem(id: 1, symbol: "hand.point.up.left", text: "Long press to right-click (with magnifier)"),
                 GestureHelpItem(id: 2, symbol: "hand.draw", text: "Long press and drag to select"),
                 GestureHelpItem(id: 3, symbol: "hand.tap.fill", text: "Two-finger tap to right-click"),
-                GestureHelpItem(id: 4, symbol: "arrow.up.and.down",
-                                text: classic ? "Two fingers to scroll" : "One finger to scroll"),
-                GestureHelpItem(id: 5, symbol: "arrow.up.and.down.and.arrow.left.and.right",
-                                text: classic ? "Drag to move around a zoomed screen" : "Two fingers to pan"),
+                GestureHelpItem(id: 4, symbol: "arrow.up.and.down", text: "One finger to scroll"),
+                GestureHelpItem(id: 5, symbol: "arrow.up.and.down.and.arrow.left.and.right", text: "Two fingers to pan"),
                 GestureHelpItem(id: 6, symbol: "arrow.up.left.and.arrow.down.right", text: "Pinch to zoom"),
             ]
         }

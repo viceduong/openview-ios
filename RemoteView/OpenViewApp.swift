@@ -6,7 +6,8 @@ struct OpenViewApp: App {
     @StateObject private var app = AppModel()
 
     init() {
-        // One-time settings migrations, before any @AppStorage reads them.
+        // Settings cleanup (removed control settings), before any
+        // @AppStorage reads them.
         RemoteInputController.migrateDefaults()
     }
 
