@@ -132,10 +132,9 @@ struct SessionContainer: View {
             FloatingToolbar(chrome: chrome,
                             input: controller.input,
                             isLandscape: landscape,
-                            unread: controller.unreadChat,
                             onKeyboard: { controller.input.showKeyboard(soft: true) },
                             onMenu: { sheet = .menu },
-                            onChat: { sheet = .chat },
+                            onSendFile: { sheet = .filePicker },
                             onDisconnect: requestDisconnect)
                 .confirmationDialog("Disconnect from \(controller.request.displayName)?",
                                     isPresented: $confirmDisconnect,

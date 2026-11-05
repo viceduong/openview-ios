@@ -1,8 +1,7 @@
 import SwiftUI
 
 /// The session toolbar: a collapsible pill (.ultraThinMaterial capsule,
-/// 44 pt targets) — Keyboard, Menu, Chat (unread
-/// badge), Disconnect, Collapse. Always a vertical pill docked on the
+/// 44 pt targets) — Keyboard, Menu, Send file, Disconnect, Collapse. Always a vertical pill docked on the
 /// trailing edge (TeamViewer layout, the remote screen at the top): in
 /// portrait at the bottom-trailing corner when that leaves it below the
 /// fitted remote image, else (and in landscape) vertically centred. When
@@ -14,7 +13,7 @@ import SwiftUI
 /// off) — purely visual: every tap acts immediately, faded or not.
 /// Cmd+Shift+Space toggles it (SessionHostingController). While the soft
 /// keyboard or the key accessory bar is up (`input.keyInputActive`) the
-/// pill / handle slide out and come back when it hides.
+/// toolbar collapses to its handle (tap to expand over the keyboard).
 ///
 /// The pill / handle report their frames (`reportsChromeFrame`) so the
 /// remote surface underneath never takes touches meant for them.
@@ -23,15 +22,16 @@ struct FloatingToolbar: View {
     /// Publishes where the remote image sits at fit (`fitImageFrame`).
     @ObservedObject var input: RemoteInputController
     let isLandscape: Bool
-    let unread: Int
     let onKeyboard: () -> Void
     let onMenu: () -> Void
-    let onChat: () -> Void
+    let onSendFile: () -> Void
     let onDisconnect: () -> Void
 
     @AppStorage(SettingsKey.toolbarHandleEdge) private var handleEdge = "trailing"
     @AppStorage(SettingsKey.toolbarHandleY) private var handleY: Double = 0.7
     @State private var dragOffset: CGSize = .zero
+    /// Expanded by the user while the keyboard is up (reset per keyboard).
+    @State private var expandedOverKeyboard = false
 
     private static let target: CGFloat = 44
     private static let handleHeight: CGFloat = 64
@@ -47,34 +47,38 @@ struct FloatingToolbar: View {
 
     var body: some View {
         GeometryReader { geo in
-            // Hidden while the soft keyboard / key bar is up (the bar's
-            // hide-keyboard key brings it back). Removed from the hierarchy,
-            // so it reports no chrome frame: the whole screen takes touches.
-            if !input.keyInputActive {
-                // A ZStack (not a Group): the transition applies to the
-                // toolbar as a whole, the collapse / expand swap inside it
-                // keeps its own (default) transition.
-                ZStack {
-                    if chrome.toolbarCollapsed {
-                        handle(in: geo.size)
-                    } else {
-                        expanded(in: geo)
-                    }
+            ZStack {
+                if isCollapsed {
+                    handle(in: geo.size)
+                } else {
+                    expanded(in: geo)
                 }
-                .frame(width: geo.size.width, height: geo.size.height)
-                .transition(.move(edge: slideEdge).combined(with: .opacity))
             }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .opacity(chrome.toolbarFaded ? SessionChrome.fadedOpacity : 1)
         .animation(.easeInOut(duration: 0.3), value: chrome.toolbarFaded)
-        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: chrome.toolbarCollapsed)
-        .animation(.easeInOut(duration: 0.25), value: input.keyInputActive)
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isCollapsed)
+        .onChange(of: input.keyInputActive) { _ in
+            // Each keyboard appearance starts collapsed again.
+            expandedOverKeyboard = false
+        }
     }
 
-    /// The side the toolbar slides out to / in from when the keyboard
-    /// hides / shows it: its own edge.
-    private var slideEdge: Edge {
-        chrome.toolbarCollapsed && handleEdge == "leading" ? .leading : .trailing
+    /// While the soft keyboard / key bar is up the toolbar collapses to its
+    /// normal handle (the user's own collapsed setting is untouched and
+    /// applies again when the keyboard hides). Tapping the handle expands
+    /// it over the keyboard until the keyboard goes away.
+    private var isCollapsed: Bool {
+        chrome.toolbarCollapsed || (input.keyInputActive && !expandedOverKeyboard)
+    }
+
+    private func setCollapsed(_ collapsed: Bool) {
+        if input.keyInputActive {
+            expandedOverKeyboard = !collapsed
+        } else {
+            chrome.toolbarCollapsed = collapsed
+        }
     }
 
     // MARK: Expanded pill
@@ -136,22 +140,10 @@ struct FloatingToolbar: View {
     private var buttons: some View {
         toolButton("keyboard", label: "Keyboard", action: onKeyboard)
         toolButton("ellipsis.circle", label: "Session menu", action: onMenu)
-        toolButton("bubble.left.and.bubble.right", label: "Chat", action: onChat)
-            .overlay(alignment: .topTrailing) {
-                if unread > 0 {
-                    Text(unread > 99 ? "99+" : "\(unread)")
-                        .font(.caption2.weight(.bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(Color.red))
-                        .offset(x: -1, y: 3)
-                        .allowsHitTesting(false)
-                }
-            }
+        toolButton("doc.badge.arrow.up", label: "Send file", action: onSendFile)
         toolButton("xmark", label: "Disconnect", tint: Color(red: 1, green: 0.42, blue: 0.4), action: onDisconnect)
         toolButton("chevron.right", label: "Collapse toolbar") {
-            chrome.toolbarCollapsed = true
+            setCollapsed(true)
         }
     }
 
@@ -194,7 +186,7 @@ struct FloatingToolbar: View {
             .onTapGesture {
                 chrome.logTouchRouting("toolbar: Show toolbar (handle)")
                 chrome.poke()
-                chrome.toolbarCollapsed = false
+                setCollapsed(false)
             }
             // Global coordinates: the handle moves with the finger, so a
             // local-space translation would feed back on itself.
