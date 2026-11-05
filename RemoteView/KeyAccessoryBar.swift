@@ -227,6 +227,9 @@ final class KeyAccessoryBar: UIView {
         return v
     }
 
+    /// Uniform key width (TeamViewer-style even ribbon).
+    private static let keyWidth: CGFloat = 54
+
     /// The Windows 11 logo: four equal squares in a 2 x 2 grid, as a
     /// template image so it takes the button's tint in every state.
     private static let windowsLogo: UIImage = {
@@ -256,11 +259,11 @@ final class KeyAccessoryBar: UIView {
         case .locked: cfg = .filled()
         }
         cfg.cornerStyle = .medium
-        cfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10)
+        cfg.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 4, bottom: 6, trailing: 4)
         let locked = style == .locked
         cfg.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
             var out = incoming
-            out.font = UIFont.systemFont(ofSize: 15, weight: locked ? .bold : .medium)
+            out.font = UIFont.systemFont(ofSize: 14, weight: locked ? .bold : .medium)
             return out
         }
         return cfg
@@ -273,6 +276,11 @@ final class KeyAccessoryBar: UIView {
         if let symbol { cfg.image = UIImage(systemName: symbol) }
         let b = UIButton(configuration: cfg, primaryAction: UIAction { _ in action() })
         b.accessibilityLabel = label
+        // Every key the same width (fits the longest label, "PrtScn").
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.widthAnchor.constraint(equalToConstant: Self.keyWidth).isActive = true
+        b.titleLabel?.adjustsFontSizeToFitWidth = true
+        b.titleLabel?.minimumScaleFactor = 0.8
         return b
     }
 

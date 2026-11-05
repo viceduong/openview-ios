@@ -78,7 +78,7 @@ struct FloatingToolbar: View {
     /// notification drives this, so the collapse starts together with the
     /// keyboard animation (the same spring as a manual collapse).
     private var keyboardUp: Bool {
-        keyboard.height > 0
+        keyboard.up
     }
 
     /// Keyboard top edge in this view's local coordinates (the view ignores
@@ -284,8 +284,13 @@ extension View {
 /// duration so views tracking it move in step with the keyboard. Includes
 /// an input accessory view (the key bar), also when it is shown alone.
 final class KeyboardTracker: ObservableObject {
+    /// The keyboard is (coming) up. Set before `height` animates, so a
+    /// view switching on it (the toolbar handle) is inserted at the bottom
+    /// and then rides up with the keyboard; cleared after it went down.
+    @Published private(set) var up = false
     @Published private(set) var height: CGFloat = 0
     private var observers: [NSObjectProtocol] = []
+    private var hideWork: DispatchWorkItem?
 
     init() {
         let center = NotificationCenter.default
@@ -303,14 +308,40 @@ final class KeyboardTracker: ObservableObject {
         observers.forEach(NotificationCenter.default.removeObserver)
     }
 
+    /// iOS's keyboard animation (curve 7) is close to this ease-out.
+    private static func keyboardAnimation(_ duration: Double) -> Animation {
+        .timingCurve(0.38, 0.7, 0.125, 1.0, duration: max(duration, 0.1))
+    }
+
     private func update(_ note: Notification, hiding: Bool = false) {
         let info = note.userInfo ?? [:]
         let end = (info[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue ?? .zero
         let screen = UIScreen.main.bounds
         let newHeight = hiding ? 0 : max(screen.maxY - end.minY, 0)
         let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
-        withAnimation(.easeOut(duration: max(duration, 0.1))) {
-            height = newHeight
+        let animation = Self.keyboardAnimation(duration)
+        hideWork?.cancel()
+        hideWork = nil
+        if newHeight > 0 {
+            if !up {
+                // Insert the handle at the bottom first (height still 0),
+                // then animate it up together with the keyboard.
+                up = true
+                DispatchQueue.main.async { [weak self] in
+                    withAnimation(animation) { self?.height = newHeight }
+                }
+            } else {
+                withAnimation(animation) { height = newHeight }
+            }
+        } else if up {
+            // Slide the handle down with the keyboard, then restore the
+            // normal toolbar once it is gone.
+            withAnimation(animation) { height = 0 }
+            let work = DispatchWorkItem { [weak self] in
+                self?.up = false
+            }
+            hideWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(duration, 0.1), execute: work)
         }
     }
 }
