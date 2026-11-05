@@ -1489,7 +1489,12 @@ final class SessionController: ObservableObject {
             markLiveIfNeeded()
         }
         if let gen = p.hideVideoGen {
-            model.video.hide(generation: gen)
+            if p.frame != nil {
+                // Hidden by the surface once this frame is presented.
+                model.video.requestHide(generation: gen)
+            } else {
+                model.video.hide(generation: gen)
+            }
         }
         if let pos = p.cursorPos {
             model.cursorPos = pos

@@ -113,6 +113,9 @@ final class MetalScreenRenderer {
     private var tmpScaled: MTLTexture?
     /// The last submitted draw (uploads wait for it: no torn reads).
     private var lastCommandBuffer: MTLCommandBuffer?
+    /// A taken update could not be applied: the next sync uploads the
+    /// whole frame.
+    private var needsFullUpload = false
 
     /// nil when Metal (or the compiled shaders) is unavailable — the
     /// surface then keeps its CGImage layer.
@@ -161,8 +164,14 @@ final class MetalScreenRenderer {
     func sync(from store: FramePixelStore) -> Bool {
         let update = store.take()
         guard let frame = update?.frame ?? (frameTexture == nil ? store.latest : nil),
-              frame.isValid else { return false }
-        var rects = update?.dirty
+              frame.isValid else {
+            // The rects just taken would be lost: re-upload everything
+            // next time instead of leaving stale regions.
+            if update != nil { needsFullUpload = true }
+            return false
+        }
+        var rects = needsFullUpload ? nil : update?.dirty
+        needsFullUpload = false
         let texture: MTLTexture
         if let t = frameTexture, t.width == frame.width, t.height == frame.height {
             texture = t
@@ -173,7 +182,10 @@ final class MetalScreenRenderer {
                                                              mipmapped: false)
             d.usage = [.shaderRead]
             d.storageMode = .shared
-            guard let t = device.makeTexture(descriptor: d) else { return false }
+            guard let t = device.makeTexture(descriptor: d) else {
+                needsFullUpload = true
+                return false
+            }
             texture = t
             frameTexture = t
             rects = nil
@@ -227,7 +239,10 @@ final class MetalScreenRenderer {
     /// Draw the frame at `scale` (view points per remote pixel) with its
     /// top-left at `offset` (view points). Only the visible part is scaled,
     /// at device-pixel resolution.
-    func render(scale: CGFloat, offset: CGPoint, sharpenOn: Bool) {
+    /// `onPresented` runs (any thread) once this drawable is on screen;
+    /// it is dropped when nothing could be drawn (the caller's fallback
+    /// covers that).
+    func render(scale: CGFloat, offset: CGPoint, sharpenOn: Bool, onPresented: (() -> Void)? = nil) {
         let ds = layer.drawableSize
         let cs = layer.contentsScale
         let dw = Int(ds.width), dh = Int(ds.height)
@@ -293,6 +308,9 @@ final class MetalScreenRenderer {
             rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
             rp.colorAttachments[0].storeAction = .store
             cb.makeRenderCommandEncoder(descriptor: rp)?.endEncoding()
+        }
+        if let onPresented {
+            drawable.addPresentedHandler { _ in onPresented() }
         }
         cb.present(drawable)
         cb.commit()

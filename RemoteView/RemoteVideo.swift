@@ -265,6 +265,8 @@ final class VideoOverlay {
             layer.flush()
             generation = gen
         }
+        // A newer motion period supersedes a hide still waiting.
+        if let p = pendingHide, p != gen { pendingHide = nil }
         if layer.status == .failed {
             layer.flush()
             onFailure?()
@@ -283,9 +285,38 @@ final class VideoOverlay {
         }
     }
 
+    /// A hide waiting until the frame that carries the lossless refresh is
+    /// actually on screen (see `requestHide`).
+    private(set) var pendingHide: Int?
+
+    /// Motion of generation `gen` is over and the frame carrying the
+    /// lossless refresh was just published. The surface hides the overlay
+    /// once that frame is presented (the Metal path draws at the next
+    /// display refresh and presents asynchronously; hiding at once — v0.41
+    /// — showed the region's pre-motion tiles for a frame or more: the
+    /// stale / white flash at the end of scrolling or video). A safety
+    /// timer hides it anyway if no presentation reports back.
+    func requestHide(generation gen: Int) {
+        guard gen == generation, !layer.isHidden else { return }
+        pendingHide = gen
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.pendingHide == gen else { return }
+            self.hide(generation: gen)
+        }
+    }
+
+    /// The pending hide (cleared), for the surface to perform in step with
+    /// presenting the refreshed frame.
+    func takePendingHide() -> Int? {
+        let g = pendingHide
+        pendingHide = nil
+        return g
+    }
+
     /// Motion of generation `gen` is over and the lossless refresh is on
     /// screen: drop the overlay.
     func hide(generation gen: Int) {
+        if pendingHide == gen { pendingHide = nil }
         guard gen == generation, !layer.isHidden else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)

@@ -2,6 +2,7 @@ import Combine
 import QuartzCore
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 // The remote screen surface (section 2): frame + H.264 overlay inside one
 // zoom/pan-transformed container layer, a locally drawn cursor, the touch /
@@ -24,21 +25,40 @@ import UIKit
 //                         "ov.cursorAccel", off). Zoomed in, the viewport
 //                         keeps the cursor centred (TeamViewer; setting
 //                         "ov.viewportFollow" = "edge" restores edge-push)
-//     tap                 left click at the cursor (2nd tap = double click)
-//     tap, then hold/drag left drag (DOWN at 0.15 s, UP on lift) + ring
-//     long-press 0.30 s   right click (10 pt cancel radius)
+//     v0.42 (TeamViewer parity): one custom recognizer
+//                         (TrackpadTouchRecognizer, the MouseGestureRecognizer
+//                         model) moves the cursor from the very first
+//                         touchesMoved (no pan slop, no waiting for a tap to
+//                         fail); tap / drag / long press are decided
+//                         afterwards, see "Mouse-mode trackpad". Cursor
+//                         inertia (ov.cursorFling) default off.
+//     tap                 a touch that never travelled 10 pt: counted; 0.3 s
+//                         after the last tap lifts, 1 tap = left click, 2 =
+//                         double click, at the cursor (the tapped pixel:
+//                         sub-slop jitter is undone). "Immediate clicks"
+//                         (ov.immediateClicks, off): click on lift instead
+//     double-tap and drag second touch-down < 0.3 s after a tap, then move
+//                         10 pt (or hold 0.3 s) = left drag, DOWN at the
+//                         tapped pixel (haptic), UP on lift, + ring
+//     long-press 0.30 s   right click at the cursor (10 pt cancel radius)
 //     2-finger tap        right click (instant: no double tap to wait for);
-//                         3-finger tap: middle click
-//     2-finger pan        wheel (natural direction) + inertia (T = 250 ms)
+//                         3-finger tap: middle click. Any second finger
+//                         cancels pending taps / the long press
+//     2-finger pan        wheel at the cursor: one notch (120) per 10 pt,
+//                         natural direction, both axes; inertia only with
+//                         "Scroll inertia" (ov.scrollInertia, off)
 //     pinch               zoom around the cursor; snaps to fit / fill / 1:1
 //                         within +-20% on release. Zoom range (TeamViewer):
 //                         fit inside the safe area ... max(2 pt/px, fit)
 //   TOUCH (direct) mode
-//     tap                 left click at the finger (+ ripple)
-//     long-press          loupe; lift = right click, drag = left drag
-//     1-finger pan        pan the zoomed view
-//     2-finger pan        wheel at the fingers (scaled by zoom)
+//     tap                 cursor to the finger + left click there (+ ripple)
+//     long tap 0.4 s      loupe; lift = right click at the finger, drag
+//                         without lifting = left drag-select
+//     1-finger pan        wheel at the finger, one notch per 10 pt
+//     2-finger pan        pan the zoomed view (with the pinch)
 //     pinch               zoom at the fingers (and pan with them)
+//     "Classic touch gestures" (ov.classicTouchGestures, off): 1 finger
+//     pans the view, 2 fingers = wheel at the fingers, long tap 0.3 s
 //   LOCK LOCAL ZOOM (setting "ov.lockLocalZoom"): pinch becomes Ctrl+wheel
 //   on the host and the touch-mode 1-finger pan becomes a left drag.
 //   After a multi-finger gesture the remaining finger is ignored until
@@ -162,6 +182,148 @@ struct FlingTracker {
     }
 }
 
+// MARK: - Trackpad touch source
+
+/// Mouse mode's one-finger input (TeamViewer's MouseGestureRecognizer):
+/// reports the tracked finger from touch-down and on every touchesMoved —
+/// there is no recognition slop and no dependency on other recognizers, so
+/// cursor motion starts with the first movement event. It never leaves
+/// `.possible` while tracking (it neither blocks nor delays any other
+/// recognizer) and fails when the finger lifts, the touch is cancelled or
+/// a second finger lands; what a touch means (move / tap / drag / long
+/// press) is decided by the owner from these reports.
+final class TrackpadTouchRecognizer: UIGestureRecognizer {
+    enum Phase {
+        case began
+        case moved
+        case ended
+        case cancelled
+    }
+
+    /// (phase, location in the view, touch timestamp).
+    var onTouch: ((Phase, CGPoint, TimeInterval) -> Void)?
+
+    private var tracked: UITouch?
+    private var lastLocation: CGPoint = .zero
+    private var lastTime: TimeInterval = 0
+
+    /// Fingers (not pointer touches) currently down on the view.
+    private func activeFingers(_ event: UIEvent) -> Int {
+        guard let v = view else { return 0 }
+        let touches = event.touches(for: v) ?? []
+        return touches.filter {
+            $0.type != .indirectPointer && $0.phase != .ended && $0.phase != .cancelled
+        }.count
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        if tracked != nil {
+            // A second finger: this is a two-finger gesture now.
+            cancelTracking()
+            state = .failed
+            return
+        }
+        guard touches.count == 1, let t = touches.first, activeFingers(event) <= 1 else {
+            state = .failed
+            return
+        }
+        tracked = t
+        lastLocation = t.location(in: view)
+        lastTime = t.timestamp
+        onTouch?(.began, lastLocation, lastTime)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesMoved(touches, with: event)
+        guard let t = tracked, touches.contains(t) else { return }
+        let p = t.location(in: view)
+        guard p != lastLocation else { return }
+        lastLocation = p
+        lastTime = t.timestamp
+        onTouch?(.moved, p, lastTime)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesEnded(touches, with: event)
+        guard let t = tracked, touches.contains(t) else { return }
+        let p = t.location(in: view)
+        tracked = nil
+        onTouch?(.ended, p, t.timestamp)
+        state = .failed
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesCancelled(touches, with: event)
+        guard let t = tracked, touches.contains(t) else { return }
+        cancelTracking()
+        state = .failed
+    }
+
+    /// Forced out by the system (another recognizer, mode switch, ...):
+    /// the owner releases whatever the touch pressed.
+    override func reset() {
+        super.reset()
+        cancelTracking()
+    }
+
+    private func cancelTracking() {
+        guard tracked != nil else { return }
+        tracked = nil
+        onTouch?(.cancelled, lastLocation, lastTime)
+    }
+}
+
+/// Recent finger samples -> release / acceleration velocity (points per
+/// second) over the last 100 ms.
+struct TouchVelocity {
+    private var samples: [(t: TimeInterval, p: CGPoint)] = []
+    private static let window: TimeInterval = 0.1
+
+    mutating func reset(_ p: CGPoint, at t: TimeInterval) {
+        samples.removeAll(keepingCapacity: true)
+        samples.append((t: t, p: p))
+    }
+
+    mutating func add(_ p: CGPoint, at t: TimeInterval) {
+        samples.append((t: t, p: p))
+        while samples.count > 2, let first = samples.first, t - first.t > Self.window {
+            samples.removeFirst()
+        }
+    }
+
+    /// The velocity at `now` (zero when the finger rested > 50 ms).
+    func velocity(now: TimeInterval) -> CGPoint {
+        guard let last = samples.last, let first = samples.first, now - last.t <= 0.05 else { return .zero }
+        let dt = last.t - first.t
+        guard dt >= 0.004 else { return .zero }
+        return CGPoint(x: (last.p.x - first.p.x) / CGFloat(dt), y: (last.p.y - first.p.y) / CGFloat(dt))
+    }
+}
+
+/// One mouse-mode trackpad touch (owned by RemoteSurfaceView).
+struct TrackpadTouch {
+    /// A tracked finger is down (false: idle, or ignored to its end).
+    var active = false
+    var downLocation: CGPoint = .zero
+    var lastLocation: CGPoint = .zero
+    /// Where a tap / long press of this touch clicks: the predicted
+    /// cursor at touch-down (or the previous tap's pixel for a second tap).
+    var downCursor: CGPoint = .zero
+    /// Travelled more than the tap slop: not a tap / long press any more.
+    var moved = false
+    /// The long press fired (right click): the lift is not a tap.
+    var longPressed = false
+    /// Began within the tap window after a tap: lift = double click, hold
+    /// 0.15 s or move past the slop = left drag.
+    var pendingDrag = false
+    /// pendingDrag: the taps counted before this touch.
+    var priorTaps = 0
+    /// pendingDrag: cursor travel held back until the drag has started.
+    var heldTravel: CGPoint = .zero
+    var velocity = TouchVelocity()
+}
+
 // MARK: - Surface view
 
 final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCommandTarget {
@@ -182,6 +344,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     /// A redraw is wanted at the next display refresh.
     private var needsRender = false
     private var idleRenderTicks = 0
+    /// Hide the H.264 overlay of this generation once the next drawable
+    /// (which holds the lossless refresh) has been presented.
+    private var hideVideoAfterPresent: Int?
     private lazy var renderTicker = FrameTicker { [weak self] _ in
         self?.renderTick()
     }
@@ -218,7 +383,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private let pan2 = UIPanGestureRecognizer(target: nil, action: nil)
     private let pinch = UIPinchGestureRecognizer(target: nil, action: nil)
     private let longPress = UILongPressGestureRecognizer(target: nil, action: nil)
-    private let holdDrag = UILongPressGestureRecognizer(target: nil, action: nil)
+    /// Mouse mode's one-finger trackpad (moves, taps, drags, long press).
+    private let trackpad = TrackpadTouchRecognizer(target: nil, action: nil)
     private let hover = UIHoverGestureRecognizer(target: nil, action: nil)
     private let scrollContinuous = UIPanGestureRecognizer(target: nil, action: nil)
     private let scrollDiscrete = UIPanGestureRecognizer(target: nil, action: nil)
@@ -230,7 +396,20 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     /// Mouse mode: a tap-then-hold drag holds the left button.
     private var dragActive = false
-    private var lastDragEnd: CFTimeInterval = 0
+    /// Mouse-mode trackpad touch (TrackpadTouchRecognizer) state.
+    private var tp = TrackpadTouch()
+    /// Mouse-mode taps not yet answered: how many, the cursor pixel they
+    /// click, and when the last one lifted. A touch starting within
+    /// `tapWindow` of that is a further tap or a double-tap-and-drag.
+    private var lastTap: (count: Int, cursor: CGPoint, time: CFTimeInterval)?
+    /// TeamViewer tap timer: fires `tapWindow` after the last tap lifted
+    /// and sends the counted clicks (not used with "Immediate clicks").
+    private var tapTimer: DispatchWorkItem?
+    /// Long-press (right click) / tap-then-hold (drag) timer of the touch.
+    private var tpTimer: DispatchWorkItem?
+    /// Two-finger / one-finger wheel scrolling: finger travel (points)
+    /// not yet emitted as whole 10 pt wheel steps.
+    private var scrollStepAcc: CGPoint = .zero
     /// Touch mode long-press state.
     private var lpActive = false
     private var lpDragging = false
@@ -249,9 +428,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var multiTouchEnd: CFTimeInterval = 0
     /// The current one-finger pan started inside a multi-finger sequence.
     private var pan1Suppressed = false
-    /// Where the latest finger touched down (TeamViewer measures trackpad
-    /// travel from touch-down: the pan's recognition slop is not lost).
-    private var fingerDownLocation: CGPoint?
     /// Lock local zoom: touch-mode one-finger drag holding the left button.
     private var touchDragActive = false
     /// Lock local zoom: Ctrl held on the host for a pinch (Ctrl+wheel).
@@ -261,6 +437,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var cursorFling = FlingTracker(timeConstant: 180)
     private var scrollFling = FlingTracker(timeConstant: 250)
     private var scrollFlingFactor: CGFloat = 0
+    /// The scroll fling emits 10 pt wheel steps (finger scrolling).
+    private var scrollFlingStepped = false
     /// Mouse mode, zoomed in: the cursor-centred offset the viewport is
     /// easing towards (nil = not animating).
     private var followTarget: CGPoint?
@@ -403,16 +581,18 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         pan2.maximumNumberOfTouches = 2
         pinch.addTarget(self, action: #selector(handlePinch(_:)))
         longPress.addTarget(self, action: #selector(handleLongPress(_:)))
-        longPress.minimumPressDuration = 0.30
+        longPress.minimumPressDuration = 0.40 // touch mode long tap; see shouldReceive
         longPress.allowableMovement = 10
-        // Tap, then touch again and hold 0.15 s (moving or not) = drag.
-        holdDrag.addTarget(self, action: #selector(handleHoldDrag(_:)))
-        holdDrag.numberOfTapsRequired = 1
-        holdDrag.minimumPressDuration = 0.15
-        holdDrag.allowableMovement = 10_000
+        // Mouse mode, one finger: moves from the first touchesMoved; taps,
+        // tap-then-hold drags and long presses are decided by the
+        // trackpad handlers (TeamViewer's MouseGestureRecognizer model).
+        trackpad.onTouch = { [weak self] phase, location, time in
+            self?.handleTrackpad(phase, location, time)
+        }
+        trackpad.delaysTouchesEnded = false
 
         let touchRecognizers: [UIGestureRecognizer] = [
-            tap1, tap2, tap3, pan1, pan2, pinch, longPress, holdDrag,
+            tap1, tap2, tap3, pan1, pan2, pinch, longPress, trackpad,
         ]
         for g in touchRecognizers {
             g.delegate = self
@@ -423,10 +603,14 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
         // Recognizer wiring (CRD): single tap waits for the two-finger tap
         // to fail, two-finger tap for the three-finger tap; pinch and the
-        // one-finger pan wait for the single tap (a tap fails as soon as the
-        // finger moves, so pans are not delayed noticeably). There is no
-        // two-finger double tap any more, so a two-finger tap right-clicks
-        // without waiting for a second tap.
+        // one-finger pan wait for the single tap. There is no two-finger
+        // double tap any more, so a two-finger tap right-clicks without
+        // waiting for a second tap. Mouse mode's one-finger input (the
+        // trackpad recognizer) depends on nothing: before v0.42 the cursor
+        // pan had to wait for the single tap to fail (~10 pt of travel,
+        // plus the pan's own slop) before the cursor moved at all; pan1 and
+        // the long press are touch-mode only now (applyMode), and tap1 is
+        // ignored in mouse mode.
         tap1.require(toFail: tap2)
         tap2.require(toFail: tap3)
         pinch.require(toFail: tap1)
@@ -540,8 +724,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     private func applyMode(_ mode: InputMode) {
         // Disabling an active recognizer cancels it (its handler releases
-        // whatever it pressed).
-        holdDrag.isEnabled = mode == .mouse
+        // whatever it pressed). One finger: the trackpad recognizer in
+        // mouse mode, pan / long press (loupe) in touch mode.
+        trackpad.isEnabled = mode == .mouse
+        pan1.isEnabled = mode == .touch
+        longPress.isEnabled = mode == .touch
         endLocalGestures()
         cursorFling.stop()
         scrollFling.stop()
@@ -555,6 +742,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     /// Drop transient gesture UI / held buttons (mode switch, teardown).
     private func endLocalGestures() {
+        cancelTrackpadTimer()
+        cancelPendingTaps()
+        tp = TrackpadTouch()
         if dragActive {
             dragActive = false
             input.buttonUp(.left)
@@ -630,6 +820,19 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         } else if let metal, !metal.hasFrame, metal.sync(from: pixels) {
             setNeedsRender()
         }
+        // The frame that carries the lossless refresh after VIDEO_END is
+        // now in the texture / layer: drop the H.264 overlay together with
+        // showing it — with Metal only once the drawable holding it is
+        // presented (renderNow), with the CGImage layer in this same
+        // Core Animation commit.
+        if let gen = video?.takePendingHide() {
+            if metal != nil {
+                hideVideoAfterPresent = gen
+                setNeedsRender()
+            } else {
+                video?.hide(generation: gen)
+            }
+        }
     }
 
     // MARK: Metal rendering (Section 4)
@@ -665,7 +868,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         if !metal.hasFrame, let store = pixelStore {
             metal.sync(from: store)
         }
-        metal.render(scale: scale, offset: offset, sharpenOn: AppSettings.sharpen)
+        var presented: (() -> Void)?
+        if let gen = hideVideoAfterPresent, let overlay = video {
+            hideVideoAfterPresent = nil
+            presented = { [weak overlay] in
+                DispatchQueue.main.async {
+                    overlay?.hide(generation: gen)
+                }
+            }
+        }
+        metal.render(scale: scale, offset: offset, sharpenOn: AppSettings.sharpen, onPresented: presented)
     }
 
     func setCursorShape(_ img: CGImage?, hotspot: CGSize, size: CGSize) {
@@ -1115,7 +1327,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
 
     /// Trackpad motion of `d` screen points (finger travel in this view,
     /// which is never transformed: the zoom lives on the container layer;
-    /// already multiplied by `cursorGain`, 1.0 by default) -> TeamViewer's
+    /// already multiplied by `trackpadGain`, 1.0 by default) -> TeamViewer's
     /// pct += d / (R * z): `scale` is view POINTS per remote pixel (not
     /// device pixels), so frameSize * scale is the displayed image size in
     /// points. The controller sends the resulting absolute position.
@@ -1228,7 +1440,11 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
         if let d = scrollFling.step(now: now) {
             running = true
-            sendWheel(byViewPoints: d, factor: scrollFlingFactor)
+            if scrollFlingStepped {
+                stepWheel(byViewPoints: d)
+            } else {
+                sendWheel(byViewPoints: d, factor: scrollFlingFactor)
+            }
         }
         if stepFollow(now) {
             running = true
@@ -1307,6 +1523,12 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         input.touching = !active.isEmpty
         // Multi-finger lift debounce bookkeeping.
         if active.count >= 2 {
+            if !multiTouchSequence {
+                // Any multi-finger touch cancels pending taps and the
+                // long press (a two-finger tap is a right click instead).
+                cancelPendingTaps()
+                cancelTrackpadTimer()
+            }
             multiTouchSequence = true
         } else if active.isEmpty && multiTouchSequence {
             multiTouchSequence = false
@@ -1344,7 +1566,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
                 pointerTouchBegan(t, event: event)
             } else {
                 finger = true
-                fingerDownLocation = t.location(in: self)
             }
         }
         if finger {
@@ -1413,9 +1634,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         if now - multiTouchEnd < Self.multiFingerLiftDebounce { return }
         switch input.mode {
         case .mouse:
-            // The tap that ends a tap-hold drag is not a click.
-            if dragActive || now - lastDragEnd < Self.tapWindow { return }
-            input.click(.left)
+            // Mouse-mode taps are the trackpad recognizer's (on lift).
+            return
         case .touch:
             let loc = g.location(in: self)
             var p = viewToFrame(loc)
@@ -1454,60 +1674,356 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         updateCursorLayer()
     }
 
+    /// Touch mode, one finger (mouse mode: disabled — the trackpad
+    /// recognizer owns one-finger input there). Default: scroll at the
+    /// finger, one wheel notch per 10 pt ("One finger to scroll"); classic
+    /// touch gestures: pan the zoomed view; lock local zoom: left drag.
     @objc private func handlePan1(_ g: UIPanGestureRecognizer) {
-        if input.mode == .touch && (input.lockLocalZoom || touchDragActive) {
+        guard input.mode == .touch else { return }
+        if input.lockLocalZoom || touchDragActive {
             handleTouchDrag(g)
             return
         }
+        let classic = input.classicTouchGestures
         switch g.state {
         case .began:
             cursorFling.stop()
+            scrollFling.stop()
+            scrollStepAcc = .zero
             pan1Suppressed = inMultiFingerAftermath
-            // Mouse mode: count the travel since touch-down (TeamViewer's
-            // P - P_prev with P_prev reset at touch-down), whatever part of
-            // it UIKit's translation leaves out; .changed continues from
-            // here.
-            guard input.mode == .mouse, let down = fingerDownLocation else { return }
-            fingerDownLocation = nil
-            let loc = g.location(in: self)
-            g.setTranslation(.zero, in: self)
-            if isPinching || pan1Suppressed || multiTouchSequence { return }
-            let gain = cursorGain(g)
-            moveCursor(byViewPoints: CGPoint(x: (loc.x - down.x) * gain, y: (loc.y - down.y) * gain))
+            if !classic && !pan1Suppressed && !lpActive {
+                // Scroll where the finger went down.
+                let loc = g.location(in: self)
+                let t = g.translation(in: self)
+                input.moveCursorAbsolute(to: viewToFrame(CGPoint(x: loc.x - t.x, y: loc.y - t.y)))
+                updateCursorLayer()
+            }
         case .changed:
             let t = g.translation(in: self)
             g.setTranslation(.zero, in: self)
-            if isPinching || pan1Suppressed || multiTouchSequence { return }
-            switch input.mode {
-            case .mouse:
-                let gain = cursorGain(g)
-                moveCursor(byViewPoints: CGPoint(x: t.x * gain, y: t.y * gain))
-            case .touch:
-                if lpActive { return }
+            if isPinching || pan1Suppressed || multiTouchSequence || lpActive { return }
+            if classic {
                 panViewport(by: t)
+            } else {
+                stepWheel(byViewPoints: t)
             }
         case .ended:
             let suppressed = pan1Suppressed
             pan1Suppressed = false
-            guard input.mode == .mouse, input.cursorFlingEnabled, !dragActive, !suppressed else { return }
-            let v = g.velocity(in: self)
-            let gain = cursorGain(g)
-            cursorFling.start(velocity: CGPoint(x: v.x * gain, y: v.y * gain), now: CACurrentMediaTime())
-            if cursorFling.isActive { animTicker.start() }
+            guard !classic, !suppressed, !lpActive, input.input2, input.scrollInertiaEnabled else { return }
+            startScrollFling(velocity: g.velocity(in: self), stepped: true, factor: 0)
         default:
             pan1Suppressed = false
         }
     }
 
+    /// Touch mode, two fingers (default): pan the view with the fingers
+    /// ("Two fingers to pan"); while pinching the pinch pans itself.
+    private func handleTwoFingerPan(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began:
+            scrollFling.stop()
+        case .changed:
+            let t = g.translation(in: self)
+            g.setTranslation(.zero, in: self)
+            if isPinching { return }
+            panViewport(by: t)
+        default:
+            break
+        }
+    }
+
+    // MARK: Mouse-mode trackpad
+
+    // TeamViewer's MouseGestureRecognizer model: the cursor follows the
+    // finger from its first movement (delta from the previous location;
+    // the previous location is reset at touch-down, no slop, no
+    // acceleration by default), and what the touch meant is decided
+    // afterwards:
+    //   lift, never moved 10 pt, no long press   a tap: the tap count goes
+    //                                             up and a 0.3 s timer starts;
+    //                                             when it fires, 1 tap = click,
+    //                                             2 = double click (3 = triple)
+    //                                             at the cursor pixel of the
+    //                                             first tap's touch-down
+    //   held 0.3 s, not moved 10 pt               right click (haptic)
+    //   touch-down < 0.3 s after a tap, then      left drag: DOWN at the
+    //     move 10 pt (or hold 0.3 s)               tapped pixel (haptic), UP
+    //                                             on lift ("Double-tap and
+    //                                             drag to select")
+    //   a second finger anywhere                  cancels pending taps / the
+    //                                             long press
+    // "Immediate clicks" (setting, pre-v0.42): a tap clicks on lift (the
+    // second one at the first one's pixel = double click) and tap, then
+    // hold 0.15 s also drags.
+    // Sub-slop jitter moves the cursor (zero latency), but taps / long
+    // presses click at the touch-down pixel, so double clicks stay exact.
+
+    /// Finger travel (points) that makes a touch a move instead of a tap.
+    private static let tapSlop: CGFloat = 10
+    private static let longPressDelay: TimeInterval = 0.30
+    /// "Immediate clicks": tap, then touch and hold this long = drag.
+    private static let immediateHoldDragDelay: TimeInterval = 0.15
+    /// TeamViewer scrolling: one wheel notch (120 units) per 10 pt.
+    private static let scrollStepPoints: CGFloat = 10
+
+    private func handleTrackpad(_ phase: TrackpadTouchRecognizer.Phase, _ loc: CGPoint, _ time: TimeInterval) {
+        switch phase {
+        case .began:
+            trackpadBegan(loc, time)
+        case .moved:
+            trackpadMoved(loc, time)
+        case .ended:
+            trackpadEnded(loc, time)
+        case .cancelled:
+            trackpadCancelled()
+        }
+    }
+
+    private func trackpadBegan(_ loc: CGPoint, _ time: TimeInterval) {
+        cancelTrackpadTimer()
+        cursorFling.stop()
+        tp = TrackpadTouch()
+        // A finger left over from (or right after) a multi-finger gesture
+        // is ignored to its end.
+        guard input.mode == .mouse, input.hasCursor, !inMultiFingerAftermath, !isPinching else {
+            cancelPendingTaps()
+            return
+        }
+        tp.active = true
+        tp.downLocation = loc
+        tp.lastLocation = loc
+        tp.downCursor = input.cursor
+        tp.velocity.reset(loc, at: time)
+        let now = CACurrentMediaTime()
+        if let last = lastTap, now - last.time < Self.tapWindow, !dragActive {
+            // A further tap, or a double-tap-and-drag: the counted clicks
+            // wait for this touch's outcome.
+            tapTimer?.cancel()
+            tapTimer = nil
+            tp.pendingDrag = true
+            tp.priorTaps = last.count
+            tp.downCursor = last.cursor
+            let hold = input.immediateClicks ? Self.immediateHoldDragDelay : Self.longPressDelay
+            scheduleTrackpadTimer(after: hold) { [weak self] in
+                self?.beginTrackpadDrag()
+            }
+        } else {
+            // Taps whose window just closed but whose timer has not run
+            // yet go out now (never dropped); this touch starts afresh.
+            if lastTap != nil, tapTimer != nil {
+                tapTimer?.cancel()
+                fireCountedTaps()
+            }
+            cancelPendingTaps()
+            scheduleTrackpadTimer(after: Self.longPressDelay) { [weak self] in
+                self?.trackpadLongPress()
+            }
+        }
+    }
+
+    private func trackpadMoved(_ loc: CGPoint, _ time: TimeInterval) {
+        guard tp.active, input.mode == .mouse else { return }
+        let d = CGPoint(x: loc.x - tp.lastLocation.x, y: loc.y - tp.lastLocation.y)
+        tp.lastLocation = loc
+        tp.velocity.add(loc, at: time)
+        if !tp.moved && hypot(loc.x - tp.downLocation.x, loc.y - tp.downLocation.y) > Self.tapSlop {
+            tp.moved = true
+            if !tp.pendingDrag {
+                cancelTrackpadTimer() // no long press any more
+            }
+        }
+        if isPinching || multiTouchSequence { return }
+        let gain = trackpadGain(tp.velocity.velocity(now: time))
+        let step = CGPoint(x: d.x * gain, y: d.y * gain)
+        if tp.pendingDrag && !dragActive {
+            // A touch right after a tap: either one more tap (keep the
+            // cursor on the tapped pixel) or a drag (starts once it
+            // travelled past the slop; the held travel is applied then).
+            tp.heldTravel.x += step.x
+            tp.heldTravel.y += step.y
+            if tp.moved {
+                beginTrackpadDrag()
+            }
+            return
+        }
+        moveCursor(byViewPoints: step)
+    }
+
+    private func trackpadEnded(_ loc: CGPoint, _ time: TimeInterval) {
+        cancelTrackpadTimer()
+        var t = tp
+        tp = TrackpadTouch()
+        guard t.active else { return }
+        if hypot(loc.x - t.downLocation.x, loc.y - t.downLocation.y) > Self.tapSlop {
+            t.moved = true
+        }
+        if dragActive {
+            endTrackpadDrag()
+            return
+        }
+        if t.moved || t.longPressed {
+            cancelPendingTaps()
+            if t.moved, input.cursorFlingEnabled, !multiTouchSequence {
+                let v = t.velocity.velocity(now: time)
+                let gain = trackpadGain(v)
+                cursorFling.start(velocity: CGPoint(x: v.x * gain, y: v.y * gain), now: CACurrentMediaTime())
+                if cursorFling.isActive { animTicker.start() }
+            }
+            return
+        }
+        let now = CACurrentMediaTime()
+        guard !multiTouchSequence, now - multiTouchEnd >= Self.multiFingerLiftDebounce else {
+            cancelPendingTaps()
+            return
+        }
+        if input.immediateClicks {
+            // Pre-v0.42: click now; a second tap clicks the same pixel.
+            input.click(.left, at: trackpadClickPoint(t))
+            if t.pendingDrag {
+                lastTap = nil
+            } else {
+                lastTap = (count: 1, cursor: input.cursor, time: now)
+            }
+            updateCursorLayer()
+            return
+        }
+        // TeamViewer: count the tap and answer when no further tap
+        // follows within the tap window. The cursor goes back to the
+        // tapped pixel at once (it is where the click will land).
+        let count = min(t.priorTaps + 1, 3)
+        if input.cursor != t.downCursor {
+            input.moveCursorAbsolute(to: t.downCursor)
+            updateCursorLayer()
+        }
+        lastTap = (count: count, cursor: t.downCursor, time: now)
+        let work = DispatchWorkItem { [weak self] in
+            self?.fireCountedTaps()
+        }
+        tapTimer?.cancel()
+        tapTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tapWindow, execute: work)
+    }
+
+    /// The tap timer fired: send the counted clicks at the tapped pixel
+    /// (Windows sees a double click: two clicks at the same pixel well
+    /// within its double-click time).
+    private func fireCountedTaps() {
+        tapTimer = nil
+        guard let taps = lastTap else { return }
+        lastTap = nil
+        guard input.mode == .mouse, !dragActive, !multiTouchSequence else { return }
+        for _ in 0..<max(1, min(taps.count, 3)) {
+            input.click(.left, at: taps.cursor)
+        }
+        updateCursorLayer()
+    }
+
+    /// Drop taps not yet answered (and the TeamViewer tap timer): a second
+    /// finger, a move, a long press or a mode switch.
+    private func cancelPendingTaps() {
+        tapTimer?.cancel()
+        tapTimer = nil
+        lastTap = nil
+    }
+
+    private func trackpadCancelled() {
+        cancelTrackpadTimer()
+        cancelPendingTaps()
+        tp = TrackpadTouch()
+        endTrackpadDrag()
+    }
+
+    /// Hold timer (0.3 s, not moved): right click at the cursor.
+    private func trackpadLongPress() {
+        tpTimer = nil
+        guard tp.active, !tp.moved, !tp.pendingDrag, !tp.longPressed, input.mode == .mouse,
+              !multiTouchSequence, !isPinching else { return }
+        tp.longPressed = true
+        cancelPendingTaps()
+        haptic.impactOccurred()
+        input.click(.right, at: trackpadClickPoint(tp))
+        updateCursorLayer()
+    }
+
+    /// Double-tap and drag: left button down at the tapped pixel (haptic);
+    /// the travel held back meanwhile is applied at once.
+    private func beginTrackpadDrag() {
+        cancelTrackpadTimer()
+        guard tp.active, tp.pendingDrag, !dragActive, input.mode == .mouse,
+              !multiTouchSequence, !isPinching else { return }
+        cancelPendingTaps()
+        dragActive = true
+        haptic.impactOccurred()
+        input.buttonDown(.left, at: tp.downCursor)
+        setDragRingVisible(true)
+        let held = tp.heldTravel
+        tp.heldTravel = .zero
+        if held != .zero {
+            moveCursor(byViewPoints: held)
+        } else {
+            updateCursorLayer()
+        }
+    }
+
+    private func endTrackpadDrag() {
+        guard dragActive else { return }
+        dragActive = false
+        input.buttonUp(.left)
+        setDragRingVisible(false)
+        updateCursorLayer()
+    }
+
+    /// Where a tap / long press of `t` clicks: its touch-down pixel when
+    /// the cursor has moved since (sub-slop jitter), else nil (the cursor).
+    private func trackpadClickPoint(_ t: TrackpadTouch) -> CGPoint? {
+        input.cursor == t.downCursor ? nil : t.downCursor
+    }
+
+    private func scheduleTrackpadTimer(after delay: TimeInterval, _ action: @escaping () -> Void) {
+        cancelTrackpadTimer()
+        let work = DispatchWorkItem(block: action)
+        tpTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func cancelTrackpadTimer() {
+        tpTimer?.cancel()
+        tpTimer = nil
+    }
+
     /// Trackpad gain: the Cursor speed setting (0.5x...3x, linear, default
-    /// 1x = TeamViewer), times the
-    /// acceleration curve when that setting is on (evaluated on the finger's
-    /// own speed). Used for pan steps and the fling velocity alike.
-    private func cursorGain(_ g: UIPanGestureRecognizer) -> CGFloat {
+    /// 1x = TeamViewer), times the acceleration curve when that setting is
+    /// on (evaluated on the finger's own speed `v`, points per second).
+    /// Used for move steps and the fling velocity alike.
+    private func trackpadGain(_ v: CGPoint) -> CGFloat {
         let speed = input.cursorSpeed
         guard input.cursorAccelEnabled else { return speed }
-        let v = g.velocity(in: self)
         return speed * Self.pointerGain(speedPtPerMs: hypot(v.x, v.y) / 1000)
+    }
+
+    /// TeamViewer scrolling: finger travel accumulates and every whole
+    /// 10 pt is one wheel notch (120 units), natural direction (content
+    /// follows the finger), horizontal too.
+    private func stepWheel(byViewPoints t: CGPoint) {
+        guard t.x.isFinite, t.y.isFinite else { return }
+        scrollStepAcc.x += t.x
+        scrollStepAcc.y += t.y
+        let sx = (scrollStepAcc.x / Self.scrollStepPoints).rounded(.towardZero)
+        let sy = (scrollStepAcc.y / Self.scrollStepPoints).rounded(.towardZero)
+        guard sx != 0 || sy != 0 else { return }
+        scrollStepAcc.x -= sx * Self.scrollStepPoints
+        scrollStepAcc.y -= sy * Self.scrollStepPoints
+        // Fingers down / right = content down / right = wheel up / left.
+        input.wheel(dx: Double(-sx * 120), dy: Double(sy * 120))
+    }
+
+    /// Scroll inertia: glide on after a scrolling release.
+    private func startScrollFling(velocity v: CGPoint, stepped: Bool, factor: CGFloat) {
+        scrollFlingStepped = stepped
+        scrollFlingFactor = factor
+        scrollFling.start(velocity: v, now: CACurrentMediaTime())
+        if scrollFling.isActive { animTicker.start() }
     }
 
     /// Lock local zoom, touch mode: a one-finger drag is a left-button drag
@@ -1541,12 +2057,22 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Two-finger pan and iPad trackpad / wheel scrolling -> WHEEL.
+    /// Two-finger pan and iPad trackpad / wheel scrolling -> WHEEL. Mouse
+    /// mode two-finger pan: at the cursor, one notch per 10 pt (TeamViewer);
+    /// touch mode two-finger pan pans the view (classic touch gestures:
+    /// wheel at the fingers); iPad pointer scrolling stays continuous.
     @objc private func handleScroll(_ g: UIPanGestureRecognizer) {
+        let touchPan = g === pan2
+        if touchPan && input.mode == .touch && !input.classicTouchGestures {
+            handleTwoFingerPan(g)
+            return
+        }
+        let stepped = touchPan && input.mode == .mouse
         switch g.state {
         case .began:
             scrollFling.stop()
-            if g === pan2 && input.mode == .touch {
+            scrollStepAcc = .zero
+            if touchPan && input.mode == .touch {
                 // Scroll where the fingers are.
                 input.moveCursorAbsolute(to: viewToFrame(g.location(in: self)))
                 updateCursorLayer()
@@ -1554,12 +2080,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         case .changed:
             let t = g.translation(in: self)
             g.setTranslation(.zero, in: self)
-            sendWheel(byViewPoints: t, factor: wheelFactor(for: g))
+            if stepped {
+                stepWheel(byViewPoints: t)
+            } else {
+                sendWheel(byViewPoints: t, factor: wheelFactor(for: g))
+            }
         case .ended:
             guard g !== scrollDiscrete, input.input2 else { return }
-            scrollFlingFactor = wheelFactor(for: g)
-            scrollFling.start(velocity: g.velocity(in: self), now: CACurrentMediaTime())
-            if scrollFling.isActive { animTicker.start() }
+            // Finger scrolling glides on only with "Scroll inertia".
+            if touchPan && !input.scrollInertiaEnabled { return }
+            startScrollFling(velocity: g.velocity(in: self), stepped: stepped, factor: wheelFactor(for: g))
         default:
             break
         }
@@ -1651,16 +2181,12 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
+    /// Touch mode long tap (0.4 s; classic 0.3 s; 10 pt): loupe; lift =
+    /// right click at the finger, drag without lifting = left drag-select.
+    /// (Mouse mode: disabled — the trackpad's long press right-clicks.)
     @objc private func handleLongPress(_ g: UILongPressGestureRecognizer) {
         let loc = g.location(in: self)
-        if input.mode == .mouse {
-            // Right click at the cursor.
-            if g.state == .began {
-                haptic.impactOccurred()
-                input.click(.right)
-            }
-            return
-        }
+        guard input.mode == .touch || lpActive else { return }
         switch g.state {
         case .began:
             lpActive = true
@@ -1702,27 +2228,6 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    /// Mouse mode: tap, then touch-and-hold = left drag (pan1 moves the
-    /// cursor meanwhile).
-    @objc private func handleHoldDrag(_ g: UILongPressGestureRecognizer) {
-        switch g.state {
-        case .began:
-            guard input.mode == .mouse, !dragActive else { return }
-            dragActive = true
-            haptic.impactOccurred()
-            input.buttonDown(.left)
-            setDragRingVisible(true)
-        case .ended, .cancelled, .failed:
-            guard dragActive else { return }
-            dragActive = false
-            input.buttonUp(.left)
-            setDragRingVisible(false)
-            lastDragEnd = CACurrentMediaTime()
-        default:
-            break
-        }
-    }
-
     @objc private func handleHover(_ g: UIHoverGestureRecognizer) {
         guard g.state == .began || g.state == .changed, !pointerLocked else { return }
         input.moveCursorAbsolute(to: viewToFrame(g.location(in: self)))
@@ -1732,7 +2237,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     // MARK: UIGestureRecognizerDelegate
 
     /// CRD pairs: pinch + pan, long-press + pan, two-finger tap +
-    /// long-press; plus tap-hold drag + pan / tap. Pointer recognizers
+    /// long-press; touch mode pinch + two-finger pan (pan the view while
+    /// zooming); the trackpad recognizer is simultaneous with everything
+    /// (it never recognizes; others must not force it out). Pointer recognizers
     /// (hover, scroll) never block anything. Recognizers of ancestor views
     /// (SwiftUI's hosting-view gesture recognizer, the touch-routing
     /// logger) are never blocked either: by default a surface recognizer
@@ -1746,16 +2253,31 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             return true
         }
         let g = gestureRecognizer
+        if g === trackpad || other === trackpad { return true }
         if g === hover || other === hover { return true }
         if g === scrollContinuous || other === scrollContinuous { return true }
         if g === scrollDiscrete || other === scrollDiscrete { return true }
         func pair(_ a: UIGestureRecognizer, _ b: UIGestureRecognizer) -> Bool {
             (g === a && other === b) || (g === b && other === a)
         }
+        if pair(pinch, pan2) {
+            return input.mode == .touch && !input.classicTouchGestures && !input.lockLocalZoom
+        }
         return pair(pinch, pan1)
             || pair(longPress, pan1)
-            || pair(holdDrag, pan1)
-            || pair(holdDrag, tap1)
             || pair(tap2, longPress)
+    }
+
+    /// Touch mode long tap: 0.4 s (TeamViewer), 0.3 s with the classic
+    /// touch gestures — read when each touch arrives, so the setting
+    /// applies live.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if gestureRecognizer === longPress {
+            let d: TimeInterval = input.classicTouchGestures ? 0.30 : 0.40
+            if longPress.minimumPressDuration != d {
+                longPress.minimumPressDuration = d
+            }
+        }
+        return true
     }
 }

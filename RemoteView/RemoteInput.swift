@@ -346,7 +346,8 @@ final class FrameTicker {
 /// Turns input intents into channel-0 commands. Main thread only.
 ///
 /// Pointer moves are coalesced: callers update the predicted cursor and the
-/// pending delta; a display-rate ticker flushes once per frame (and any
+/// pending delta; the first one after a display tick goes out at once, the
+/// rest of that frame is flushed by a display-rate ticker (and any
 /// button / key / wheel command flushes pending moves first, so ordering is
 /// preserved). Every button or key we press on the host is tracked, so
 /// `releaseAll()` can always undo it.
@@ -372,6 +373,16 @@ final class RemoteInputController: ObservableObject {
     static let viewportFollowDefaultsKey = "ov.viewportFollow"
     /// "Lock local zoom": every gesture, pinch included, goes to the host.
     static let lockLocalZoomDefaultsKey = "ov.lockLocalZoom"
+    /// v0.42 A/B switches for the pre-v0.42 gesture behaviours (all
+    /// default off = the TeamViewer-parity defaults):
+    /// mouse-mode taps click on lift instead of after the 0.3 s tap timer
+    /// (and tap-then-hold 0.15 s drags),
+    static let immediateClicksDefaultsKey = "ov.immediateClicks"
+    /// two-finger scroll keeps gliding after release,
+    static let scrollInertiaDefaultsKey = "ov.scrollInertia"
+    /// touch mode: one finger pans the view, two fingers scroll, long
+    /// press 0.3 s (instead of one finger = scroll, two = pan, 0.4 s).
+    static let classicTouchDefaultsKey = "ov.classicTouchGestures"
 
     /// Sends one channel-0 command (SessionController.sendCommand).
     var send: ((Data) -> Void)?
@@ -444,6 +455,9 @@ final class RemoteInputController: ObservableObject {
     private var rawRemainder = CGPoint.zero
     private var wheelAcc = CGPoint.zero
     private var idleTicks = 0
+    /// Pointer / wheel output already went out since the last display
+    /// tick (later motion in the same frame is coalesced into the tick).
+    private var sentSinceTick = false
     private lazy var ticker = FrameTicker { [weak self] _ in self?.tick() }
 
     // ---- what we hold on the host ----
@@ -528,6 +542,22 @@ final class RemoteInputController: ObservableObject {
     /// mode drags go to the host (default off).
     var lockLocalZoom: Bool {
         UserDefaults.standard.bool(forKey: Self.lockLocalZoomDefaultsKey)
+    }
+
+    /// Mouse-mode taps click at once on lift (pre-v0.42; default off:
+    /// TeamViewer's 0.3 s tap timer with a tap count).
+    var immediateClicks: Bool {
+        UserDefaults.standard.bool(forKey: Self.immediateClicksDefaultsKey)
+    }
+
+    /// Two-finger scroll inertia (default off).
+    var scrollInertiaEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.scrollInertiaDefaultsKey)
+    }
+
+    /// Touch mode with the pre-v0.42 gestures (default off).
+    var classicTouchGestures: Bool {
+        UserDefaults.standard.bool(forKey: Self.classicTouchDefaultsKey)
     }
 
     /// Ask the surface to apply a zoom preset (session menu).
@@ -721,8 +751,18 @@ final class RemoteInputController: ObservableObject {
         ensureTicking()
     }
 
+    /// Pending pointer / wheel output: leading edge — when nothing went
+    /// out since the last display tick it is sent at once (the first move
+    /// after idle never waits for the ticker to start or for the next
+    /// frame); motion that follows within the same frame is coalesced and
+    /// flushed by the tick (at most ~2 sends per display frame).
     private func ensureTicking() {
         idleTicks = 0
+        if !sentSinceTick {
+            sentSinceTick = true
+            flushPointer()
+            flushWheel()
+        }
         if !ticker.isRunning { ticker.start() }
     }
 
@@ -730,6 +770,7 @@ final class RemoteInputController: ObservableObject {
         let busy = hasPendingPointer || abs(wheelAcc.x) >= 1 || abs(wheelAcc.y) >= 1
         flushPointer()
         flushWheel()
+        sentSinceTick = false
         if busy {
             idleTicks = 0
         } else {

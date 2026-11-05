@@ -22,6 +22,9 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.cursorSpeed) private var cursorSpeed = RemoteInputController.defaultCursorSpeed
     @AppStorage(SettingsKey.viewportFollow) private var viewportFollow = ViewportFollow.center.rawValue
     @AppStorage(RemoteInputController.pointerLockDefaultsKey) private var pointerLock = false
+    @AppStorage(RemoteInputController.immediateClicksDefaultsKey) private var immediateClicks = false
+    @AppStorage(RemoteInputController.scrollInertiaDefaultsKey) private var scrollInertia = false
+    @AppStorage(RemoteInputController.classicTouchDefaultsKey) private var classicTouch = false
     // Session
     @AppStorage(SettingsKey.keepAwake) private var keepAwake = true
     @AppStorage(SettingsKey.orientation) private var orientation = "auto"
@@ -147,6 +150,23 @@ struct SettingsView: View {
             CursorSpeedRow(speed: $cursorSpeed)
             Toggle("Cursor inertia (fling)", isOn: $cursorFling)
             Toggle("Cursor acceleration", isOn: $cursorAccel)
+            Toggle(isOn: $immediateClicks) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Immediate clicks")
+                    Text("Mouse mode: click as the finger lifts (tap, then hold 0.15 s to drag) instead of TeamViewer's 0.3 s tap timer.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            Toggle("Scroll inertia", isOn: $scrollInertia)
+            Toggle(isOn: $classicTouch) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Classic touch gestures")
+                    Text("Touch mode: one finger pans the view, two fingers scroll (instead of one finger to scroll, two to pan).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
             Picker("Zoomed view follows cursor", selection: $viewportFollow) {
                 Text("Centre (TeamViewer)").tag(ViewportFollow.center.rawValue)
                 Text("At edges").tag(ViewportFollow.edge.rawValue)
