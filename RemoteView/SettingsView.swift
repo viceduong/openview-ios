@@ -20,6 +20,7 @@ struct SettingsView: View {
     @AppStorage(RemoteInputController.pointerLockDefaultsKey) private var pointerLock = false
     // Session
     @AppStorage(SettingsKey.keepAwake) private var keepAwake = true
+    @AppStorage(SettingsKey.playPCSound) private var playPCSound = true
     @AppStorage(SettingsKey.orientation) private var orientation = "auto"
     @AppStorage(SettingsKey.showStats) private var showStats = true
     @AppStorage(SettingsKey.toolbarFade) private var toolbarFade = false
@@ -158,6 +159,14 @@ struct SettingsView: View {
     private var session: some View {
         Section(header: Text("Session")) {
             Toggle("Keep screen awake", isOn: $keepAwake)
+            Toggle(isOn: $playPCSound) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Play PC sound")
+                    Text("Plays the remote PC's audio here, mixed with other apps.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
             Picker("Orientation", selection: $orientation) {
                 Text("Automatic").tag("auto")
                 Text("Lock to landscape").tag("landscape")

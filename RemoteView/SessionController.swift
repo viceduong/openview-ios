@@ -915,15 +915,21 @@ final class SessionController: ObservableObject {
         }
         // Remote audio (v0.21): each tick is 960 s16le samples; converted to
         // Float32 and scheduled on the player node, here off main.
+        // "Play PC sound" off: drop audio and release the audio session
+        // (stop() is a no-op once stopped); applies live mid-session.
         screen.onAudio = { [weak self] data in
-            self?.audioPlayer.playTick(data)
+            guard let self else { return }
+            guard AppSettings.playPCSound else { self.audioPlayer.stop(); return }
+            self.audioPlayer.playTick(data)
         }
         // Phase 4: Opus packets (only after we advertise CAP_OPUS, which
         // `enableOpus` does — and only when AVAudioConverter can decode
         // Opus here; otherwise the host keeps sending raw PCM above).
         if RemoteAudioPlayer.opusDecodeAvailable {
             screen.onOpus = { [weak self] packet, samples in
-                self?.audioPlayer.playOpus(packet, samples: samples)
+                guard let self else { return }
+                guard AppSettings.playPCSound else { self.audioPlayer.stop(); return }
+                self.audioPlayer.playOpus(packet, samples: samples)
             }
             screen.enableOpus()
         }

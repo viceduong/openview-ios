@@ -30,6 +30,9 @@ enum SettingsKey {
     static let lockLocalZoom = RemoteInputController.lockLocalZoomDefaultsKey
     // Session
     static let keepAwake = "ov.keepAwake"
+    /// Play the PC's sound on the phone (default on). Off drops incoming
+    /// audio without starting the audio engine, so other apps are untouched.
+    static let playPCSound = "ov.playPCSound"
     /// "auto" or "landscape".
     static let orientation = "ov.orientation"
     static let showStats = "ov.showStats"
@@ -79,6 +82,7 @@ enum AppSettings {
     static var hideWallpaper: Bool { bool(SettingsKey.hideWallpaper, default: true) }
     static var disableAnimations: Bool { bool(SettingsKey.disableAnimations, default: false) }
     static var keepAwake: Bool { bool(SettingsKey.keepAwake, default: true) }
+    static var playPCSound: Bool { bool(SettingsKey.playPCSound, default: true) }
     static var toolbarFade: Bool { bool(SettingsKey.toolbarFade, default: false) }
     static var logTouchRouting: Bool { bool(SettingsKey.logTouchRouting, default: false) }
     static var pinBiometric: Bool { bool(SettingsKey.pinBiometric, default: false) }
