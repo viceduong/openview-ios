@@ -720,6 +720,13 @@ final class SessionController: ObservableObject {
             }
             ws.onClose = { [weak self] closeError in
                 guard let self, !self.halted, let session = self.session else { return }
+                // Diagnostics: who/what closed the relay socket (URLSession
+                // error domain + code, or a clean close) and the path state.
+                let why = closeError.map { e -> String in
+                    let ns = e as NSError
+                    return "\(ns.domain) \(ns.code): \(ns.localizedDescription)"
+                } ?? "clean close"
+                self.log("Relay WebSocket closed (\(why)); direct state \(session.directState)")
                 session.relayEOF()
                 // Drain whatever arrived before the close; the relay then
                 // reports closed (-5), which ends the session below —
