@@ -279,11 +279,75 @@ enum InputWire {
     }
 }
 
+// MARK: - Thermal / Low Power governor
+
+/// Wave 1: watches the thermal state and Low Power Mode. While the device
+/// is `.serious` / `.critical` hot or in Low Power Mode, display links cap
+/// at 60 Hz (FrameTicker) and sessions ask the host for at most
+/// `constrainedHostFps` (SessionController, QUALITY_SET); both restore once
+/// it is back to normal. `didChange` is posted on main. Main thread only.
+final class PowerGovernor {
+    static let shared = PowerGovernor()
+    /// Posted (main) when `constrained` flips.
+    static let didChange = Notification.Name("ov.powerGovernor.didChange")
+    /// Display-link ceiling while constrained.
+    static let constrainedDisplayHz: Float = 60
+    /// Frame rate asked of the host while constrained.
+    static let constrainedHostFps: UInt16 = 30
+
+    /// Hot (`.serious` / `.critical`) or Low Power Mode on.
+    private(set) var constrained: Bool
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        constrained = PowerGovernor.evaluate()
+        let nc = NotificationCenter.default
+        // Both notifications may be posted on any thread: hop to main.
+        observers.append(nc.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
+                                        object: nil, queue: .main) { [weak self] _ in
+            self?.update()
+        })
+        observers.append(nc.addObserver(forName: .NSProcessInfoPowerStateDidChange,
+                                        object: nil, queue: .main) { [weak self] _ in
+            self?.update()
+        })
+    }
+
+    private static func evaluate() -> Bool {
+        let info = ProcessInfo.processInfo
+        switch info.thermalState {
+        case .serious, .critical:
+            return true
+        default:
+            return info.isLowPowerModeEnabled
+        }
+    }
+
+    /// Short reason for the session log.
+    var reason: String {
+        let info = ProcessInfo.processInfo
+        switch info.thermalState {
+        case .serious, .critical:
+            return "the device is hot"
+        default:
+            return info.isLowPowerModeEnabled ? "Low Power Mode is on" : "normal"
+        }
+    }
+
+    private func update() {
+        let now = PowerGovernor.evaluate()
+        guard now != constrained else { return }
+        constrained = now
+        NotificationCenter.default.post(name: PowerGovernor.didChange, object: self)
+    }
+}
+
 // MARK: - Display-rate ticker
 
 /// A CADisplayLink wrapper with a closure. The link retains only a small
 /// proxy (not the owner), so owners can deinit; `stop()` / deinit
-/// invalidate the link.
+/// invalidate the link. Wave 1: capped at 60 Hz while `PowerGovernor` says
+/// the device is hot / in Low Power Mode (re-applied live).
 final class FrameTicker {
     private final class Proxy: NSObject {
         var handler: ((CFTimeInterval) -> Void)?
@@ -294,13 +358,21 @@ final class FrameTicker {
 
     private let proxy = Proxy()
     private var link: CADisplayLink?
+    private var powerObserver: NSObjectProtocol?
 
     init(_ handler: @escaping (CFTimeInterval) -> Void) {
         proxy.handler = handler
+        powerObserver = NotificationCenter.default.addObserver(forName: PowerGovernor.didChange,
+                                                               object: nil, queue: .main) { [weak self] _ in
+            self?.applyRate()
+        }
     }
 
     deinit {
         link?.invalidate()
+        if let powerObserver {
+            NotificationCenter.default.removeObserver(powerObserver)
+        }
     }
 
     var isRunning: Bool { link != nil }
@@ -308,11 +380,17 @@ final class FrameTicker {
     func start() {
         guard link == nil else { return }
         let l = CADisplayLink(target: proxy, selector: #selector(Proxy.tick(_:)))
-        // ProMotion devices may go up to 120 Hz (iOS 15+ API; the target is
-        // 15.6 so no availability check is needed).
-        l.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 120)
-        l.add(to: .main, forMode: .common)
         link = l
+        applyRate()
+        l.add(to: .main, forMode: .common)
+    }
+
+    /// ProMotion devices may go up to 120 Hz (iOS 15+ API; the target is
+    /// 15.6 so no availability check is needed) — 60 Hz while constrained.
+    private func applyRate() {
+        guard let l = link else { return }
+        let maxHz: Float = PowerGovernor.shared.constrained ? PowerGovernor.constrainedDisplayHz : 120
+        l.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: maxHz, preferred: maxHz)
     }
 
     func stop() {

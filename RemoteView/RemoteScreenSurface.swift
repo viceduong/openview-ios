@@ -75,9 +75,14 @@ import UIKit.UIGestureRecognizerSubclass
 
 /// SwiftUI wrapper. The parent observes ScreenModel and passes values in.
 struct RemoteScreenSurface: UIViewRepresentable {
-    let image: CGImage
-    /// Section 4: the frame's BGRA bytes + dirty rects for the Metal path.
-    let pixels: FramePixelStore
+    /// The frame as a CGImage — only on the CGImage fallback path (no
+    /// Metal); nil when frames go straight to the Metal texture.
+    let image: CGImage?
+    /// Bumped for every published frame (both paths).
+    let frameTick: UInt64
+    /// Wave 1: the frame uploads staged for the Metal renderer (nil = no
+    /// Metal).
+    let uploads: FrameUploadQueue?
     let frameSize: CGSize
     let video: VideoOverlay
     let cursorPos: CGPoint?
@@ -94,7 +99,7 @@ struct RemoteScreenSurface: UIViewRepresentable {
 
     func updateUIView(_ uiView: RemoteSurfaceView, context: Context) {
         uiView.attachVideo(video)
-        uiView.setFrame(image, size: frameSize, pixels: pixels)
+        uiView.setFrame(image, tick: frameTick, size: frameSize, uploads: uploads)
         uiView.setCursorShape(cursorImage, hotspot: cursorHotspot, size: cursorSize)
         if let p = cursorPos {
             uiView.hostCursorMoved(to: p)
@@ -308,7 +313,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private let frameLayer = CALayer()
     /// Section 4: TeamViewer-style scaler (nil = no Metal: CGImage path).
     private let metal = MetalScreenRenderer()
-    private weak var pixelStore: FramePixelStore?
+    /// Wave 1: staged dirty-rect uploads the renderer drains every redraw.
+    private var uploads: FrameUploadQueue?
+    /// The last frame tick shown.
+    private var frameTick: UInt64 = 0
     /// A redraw is wanted at the next display refresh.
     private var needsRender = false
     private var idleRenderTicks = 0
@@ -699,8 +707,8 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         }
     }
 
-    func setFrame(_ img: CGImage, size: CGSize, pixels: FramePixelStore) {
-        pixelStore = pixels
+    func setFrame(_ img: CGImage?, tick: UInt64, size: CGSize, uploads: FrameUploadQueue?) {
+        self.uploads = uploads
         if size != frameSize && size.width > 0 && size.height > 0 {
             frameSize = size
             CATransaction.begin()
@@ -713,19 +721,24 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             if followPreset == nil { followPreset = .fit }
             refit()
         }
-        if img !== image {
-            image = img
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
+        if tick != frameTick {
+            frameTick = tick
             if metal == nil {
-                frameLayer.contents = img
-            }
-            CATransaction.commit()
-            // Metal: upload what changed, redraw at the next refresh.
-            if let metal, metal.sync(from: pixels) {
+                // CGImage fallback: show the new image.
+                if let img, img !== image {
+                    image = img
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    frameLayer.contents = img
+                    CATransaction.commit()
+                }
+            } else {
+                // Metal: the redraw blits the staged dirty rects first.
                 setNeedsRender()
             }
-        } else if let metal, !metal.hasFrame, metal.sync(from: pixels) {
+        } else if let metal, !metal.hasFrame {
+            // A new surface over an existing session: the redraw asks the
+            // session to stage the whole frame again.
             setNeedsRender()
         }
         // The frame that carries the lossless refresh after VIDEO_END is
@@ -773,11 +786,9 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private func renderNow() {
         guard let metal, window != nil, scale > 0, bounds.width > 0, bounds.height > 0,
               UIApplication.shared.applicationState != .background else { return }
-        if !metal.hasFrame, let store = pixelStore {
-            metal.sync(from: store)
-        }
         var presented: (() -> Void)?
-        if let gen = hideVideoAfterPresent, let overlay = video {
+        let hideGen = hideVideoAfterPresent
+        if let gen = hideGen, let overlay = video {
             hideVideoAfterPresent = nil
             presented = { [weak overlay] in
                 DispatchQueue.main.async {
@@ -785,7 +796,16 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
                 }
             }
         }
-        metal.render(scale: scale, offset: offset, sharpenOn: AppSettings.sharpen, onPresented: presented)
+        let done = metal.render(scale: scale, offset: offset, sharpenOn: AppSettings.sharpen,
+                                uploads: uploads, onPresented: presented)
+        if !done {
+            // The GPU still has the previous frame: retry at the next
+            // refresh (keeps the display link running), nothing lost.
+            if presented != nil {
+                hideVideoAfterPresent = hideGen
+            }
+            needsRender = true
+        }
     }
 
     func setCursorShape(_ img: CGImage?, hotspot: CGSize, size: CGSize) {

@@ -294,9 +294,10 @@ private struct RemoteScreenView: View {
     let input: RemoteInputController
 
     var body: some View {
-        if let img = model.image {
-            RemoteScreenSurface(image: img,
-                                pixels: model.pixels,
+        if model.frameTick > 0 {
+            RemoteScreenSurface(image: model.image,
+                                frameTick: model.frameTick,
+                                uploads: model.uploads,
                                 frameSize: model.frameSize,
                                 video: model.video,
                                 cursorPos: model.cursorPos,

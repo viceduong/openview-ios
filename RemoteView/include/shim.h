@@ -71,6 +71,20 @@ typedef void (*OvDirectSendSink)(void *user, uint32_t path_id, const uint8_t *da
 // Section 5: the host offered candidate `addr` ("ip:port" or "[v6]:port",
 // NUL-terminated, valid only during the call); open a UDP path for it.
 typedef void (*OvDirectPathSink)(void *user, uint32_t path_id, const char *addr);
+// Wave 1 event-driven relay receive: the Rust-owned TCP relay socket has
+// inbound bytes — dispatch an ov_session_pump_relay onto the session queue.
+// Fires on a Rust watcher thread (NOT the pump thread): only dispatch,
+// never call into the session synchronously, never block. Coalesced: the
+// next wake comes only after a pump drained the socket.
+typedef void (*ov_wake_sink)(void *user);
+// Wave 1 zero-copy frames: `pixels` = the assembler's framebuffer (`len`
+// bytes, `height` rows of `stride` bytes, format 0 = BGRA / 1 = BGR),
+// `rects` = `rect_count` packed u16 quadruples x, y, w, h the last frame
+// changed (rect_count 0 = the whole frame). Valid only during the call.
+typedef void (*ov_framebuffer_visitor)(void *user, const uint8_t *pixels, size_t len,
+                                       uint32_t width, uint32_t height, uint32_t stride,
+                                       uint8_t format, uint64_t seq,
+                                       const uint16_t *rects, size_t rect_count);
 
 // Opaque handle types: Swift imports `void *` as UnsafeMutableRawPointer
 // but the app stores OpaquePointer, so declare the handles as pointers to
@@ -109,6 +123,12 @@ int32_t ov_session_relay_connect_stream(OvSession *s, void *user, ov_datagram_si
 int32_t ov_session_relay_feed(OvSession *s, const uint8_t *data, size_t len);
 int32_t ov_session_relay_eof(OvSession *s);
 int32_t ov_relay_session_id(const char *code, uint8_t *out /*4*/);
+// Wave 1: wake the shell as soon as the TCP relay socket has bytes (the
+// watcher starts with ov_session_relay_connect, before or after this call).
+// Returns 1 = socket watched, 0 = stored but nothing to watch (no relay yet /
+// WebSocket bridge), -1 null session, -4 watcher thread failed. NULL sink =
+// stop watching. Keep a slow timer pump as the fallback.
+int32_t ov_session_set_wake_sink(OvSession *s, void *user, ov_wake_sink sink);
 
 // Section 5: direct (UDP) path next to a relay session. Installing the sinks
 // makes the session direct-capable (pair with ov_screen_set_direct_capable);
@@ -163,6 +183,12 @@ int32_t ov_screen_set_direct_capable(OvScreen *s, int32_t on);
 // Returns the rect count (may exceed max_rects), 0 before any frame, -1 on
 // a null handle. Session queue only, never from inside a sink.
 int32_t ov_screen_last_dirty_rects(OvScreen *s, uint16_t *out, size_t max_rects);
+// Wave 1 zero-copy frames: call `visit` once, synchronously, with the
+// framebuffer pointer + the last frame's dirty rects (full != 0: no rects,
+// upload everything). Session queue only, right after the ov_screen_feed
+// whose frame sink fired (or any time for a full refresh), never from
+// inside a sink. 0 visited, -2 no framebuffer yet, -1 null handle/visitor.
+int32_t ov_screen_visit_framebuffer(OvScreen *s, void *user, ov_framebuffer_visitor visit, int32_t full);
 
 // liveness (v0.16): keepalive pacing + RTT + dead-peer detection
 int32_t ov_screen_set_liveness_sink(OvScreen *screen, void *user, ov_liveness_sink sink);

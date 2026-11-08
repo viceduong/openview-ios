@@ -125,9 +125,12 @@ enum SessionPhase: Equatable {
 /// Remote screen state, observed only by the screen view so frame / cursor
 /// updates never re-evaluate the whole session body. Main thread only.
 final class ScreenModel: ObservableObject {
-    // Reassembled remote screen (nil until the first frame completes; kept
-    // across reconnects so overlays dim the last frame).
+    // Reassembled remote screen as a CGImage — CGImage fallback path only
+    // (no Metal). Kept across reconnects so overlays dim the last frame.
     @Published var image: CGImage?
+    // Bumped for every published frame, on both paths (0 = no frame yet:
+    // the surface appears with the first one).
+    @Published var frameTick: UInt64 = 0
     // The last frame's geometry — the space pointer coordinates normalize to.
     @Published var frameSize: CGSize = .zero
     // Remote cursor overlay (v0.15): position in frame pixel space, and the
@@ -136,10 +139,11 @@ final class ScreenModel: ObservableObject {
     @Published var cursorImage: CGImage?
     @Published var cursorHotspot: CGSize = .zero
     @Published var cursorSize: CGSize = .zero
-    // Section 4: the latest frame's BGRA bytes + the rects changed since
-    // the Metal renderer last uploaded (not published: the surface pulls
-    // them whenever `image` changes).
-    let pixels = FramePixelStore()
+    // Wave 1: with Metal, frames skip CGImage entirely — the session queue
+    // stages each frame's dirty rects straight from the Rust framebuffer
+    // and the renderer blits them (not published: the surface drains it on
+    // every redraw). nil = no Metal: the CGImage path above.
+    let uploads: FrameUploadQueue? = MetalContext.shared.map { FrameUploadQueue(context: $0) }
     // Phase 5: the H.264 overlay for high-motion regions (not published —
     // the frame view hosts its layer; samples are enqueued directly).
     let video = VideoOverlay()
@@ -159,7 +163,8 @@ final class LivenessModel: ObservableObject {
 /// Screen updates accumulated on the session queue and applied to
 /// `ScreenModel` in one main-thread hop (latest wins).
 private struct PendingScreen {
-    var frame: (image: CGImage, size: CGSize, pixels: FramePixels)?
+    /// A new frame (`image` only on the CGImage fallback path).
+    var frame: (image: CGImage?, size: CGSize)?
     var cursorPos: CGPoint?
     var cursorShape: (image: CGImage?, hotspot: CGSize, size: CGSize)?
     /// Phase 5: this frame is the lossless refresh after VIDEO_END of that
@@ -364,6 +369,13 @@ final class SessionController: ObservableObject {
                 self.screen.requestVideoIdr()
             }
         }
+        // Wave 1: a new Metal surface (or lost staging) needs the whole
+        // frame again; re-stage it from the Rust framebuffer.
+        screenModel.uploads?.requestFull = { [weak self] in
+            self?.queue.async { [weak self] in
+                self?.restageFullFrame()
+            }
+        }
         observeAppLifecycle()
         beginAttempt()
     }
@@ -495,9 +507,10 @@ final class SessionController: ObservableObject {
             phase = .waitingForFirstFrame
         }
         // Re-apply this session's quality (a reconnected host starts at
-        // its default).
-        if targetFps != 0 {
-            sendQuality(targetFps: targetFps)
+        // its default) — capped while the device is hot / in Low Power Mode.
+        let fps = effectiveFps
+        if fps != 0 {
+            sendQuality(targetFps: fps)
         }
         if let expected = request.pinnedFingerprint, !expected.isEmpty, expected != pine {
             log("Host identity changed: expected \(expected), got \(pine)")
@@ -541,6 +554,36 @@ final class SessionController: ObservableObject {
                                         object: nil, queue: .main) { [weak self] _ in
             self?.willEnterForeground()
         })
+        // Wave 1: thermal state / Low Power Mode changes re-apply the
+        // requested host frame rate.
+        observers.append(nc.addObserver(forName: PowerGovernor.didChange,
+                                        object: nil, queue: .main) { [weak self] _ in
+            self?.powerStateChanged()
+        })
+        if PowerGovernor.shared.constrained {
+            log("Power: \(PowerGovernor.shared.reason) — limiting to 60 Hz / \(PowerGovernor.constrainedHostFps) fps")
+        }
+    }
+
+    /// The frame rate actually requested from the host: the user's choice
+    /// (0 = Auto), capped at `PowerGovernor.constrainedHostFps` while the
+    /// device is hot or in Low Power Mode (Auto then means the cap).
+    private var effectiveFps: UInt16 {
+        guard PowerGovernor.shared.constrained else { return targetFps }
+        let cap = PowerGovernor.constrainedHostFps
+        return targetFps == 0 ? cap : min(targetFps, cap)
+    }
+
+    /// Main: the device got hot / cooled down / Low Power Mode toggled.
+    private func powerStateChanged() {
+        if PowerGovernor.shared.constrained {
+            log("Power: \(PowerGovernor.shared.reason) — limiting to 60 Hz / \(PowerGovernor.constrainedHostFps) fps")
+        } else {
+            log("Power: back to normal — full frame rate restored")
+        }
+        guard attemptEstablished, !stopped else { return }
+        // 0 restores the host's Auto governor.
+        sendQuality(targetFps: effectiveFps)
     }
 
     private func removeLifecycleObservers() {
@@ -714,6 +757,22 @@ final class SessionController: ObservableObject {
             break
         }
 
+        // Wave 1: the Rust-owned TCP relay is event driven too — a watcher
+        // thread wakes us as soon as relay bytes arrive (one wake per
+        // drain), so frames and PINGs no longer wait for the 50 ms tick.
+        // (WebSocket relay and direct UDP deliver per message already.)
+        if case .relay = mode {
+            let q = queue
+            let watched = session.setWakeHandler { [weak self] in
+                q.async { [weak self] in
+                    self?.relayWakePump()
+                }
+            }
+            if !watched {
+                log("Relay: event-driven receive unavailable — polling every 50 ms")
+            }
+        }
+
         do {
             try session.pump()
             if let fp = session.peerFingerprint() {
@@ -778,29 +837,40 @@ final class SessionController: ObservableObject {
     }
 
     private func installScreenSinks() {
-        // Frames: build the CGImage here, off main, then publish only the
-        // finished image (coalesced — if main is behind, the newest wins).
-        screen.onFrame = { [weak self] _, width, height, stride, format, pixels, dirty in
-            guard let self,
-                  let made = FrameImage.make(width: width, height: height, stride: stride,
-                                             format: format, pixels: pixels) else { return }
-            let img = made.image
-            let size = CGSize(width: CGFloat(img.width), height: CGFloat(img.height))
-            // Phase 5: the first frame after VIDEO_END carries the lossless
-            // refresh of the region; the overlay goes away with it.
-            let hide = self.pendingHideGen
-            self.pendingHideGen = nil
-            var fp = FramePixels(bytes: made.bytes, rowBytes: made.rowBytes,
-                                 width: img.width, height: img.height, dirty: dirty)
-            self.postScreen {
-                // Section 4: a frame main has not shown yet is replaced;
-                // its dirty rects carry over so the texture upload covers
-                // both.
-                if let older = $0.frame?.pixels {
-                    fp.dirty = FramePixels.merged(older, fp)
+        if let uploads = screenModel.uploads {
+            // Wave 1 (Metal): no 8 MB copy, no CGImage per update — stage
+            // only the dirty rects, straight from the Rust framebuffer, for
+            // the renderer's next redraw. Staged deltas accumulate until
+            // main draws, so a coalesced (skipped) tick loses nothing.
+            screen.onFramePixels = { [weak self] view in
+                guard let self else { return }
+                uploads.stage(view)
+                let size = CGSize(width: CGFloat(view.width), height: CGFloat(view.height))
+                // Phase 5: the first frame after VIDEO_END carries the
+                // lossless refresh of the region; the overlay goes with it.
+                let hide = self.pendingHideGen
+                self.pendingHideGen = nil
+                self.postScreen {
+                    $0.frame = (image: nil, size: size)
+                    if let hide { $0.hideVideoGen = hide }
                 }
-                $0.frame = (image: img, size: size, pixels: fp)
-                if let hide { $0.hideVideoGen = hide }
+            }
+        } else {
+            // CGImage fallback (no Metal): build the CGImage here, off main,
+            // then publish only the finished image (coalesced — if main is
+            // behind, the newest wins).
+            screen.onFrame = { [weak self] _, width, height, stride, format, pixels, _ in
+                guard let self,
+                      let made = FrameImage.make(width: width, height: height, stride: stride,
+                                                 format: format, pixels: pixels) else { return }
+                let img = made.image
+                let size = CGSize(width: CGFloat(img.width), height: CGFloat(img.height))
+                let hide = self.pendingHideGen
+                self.pendingHideGen = nil
+                self.postScreen {
+                    $0.frame = (image: img, size: size)
+                    if let hide { $0.hideVideoGen = hide }
+                }
             }
         }
         // Phase 5: H.264 for high-motion regions, only when VideoToolbox can
@@ -898,6 +968,22 @@ final class SessionController: ObservableObject {
             sendCaptureRegion(monitorAt: want)
         } else {
             monitorIndex = 0
+        }
+    }
+
+    /// Wave 1 (session queue): the renderer has no texture to apply deltas
+    /// to (new surface, lost staging) — stage the whole current frame from
+    /// the Rust framebuffer and trigger a redraw. No frame yet: the first
+    /// one is staged whole anyway.
+    private func restageFullFrame() {
+        guard let uploads = screenModel.uploads else { return }
+        var size: CGSize?
+        screen.visitFramebuffer(full: true) { view in
+            uploads.stage(view, forceFull: true)
+            size = CGSize(width: CGFloat(view.width), height: CGFloat(view.height))
+        }
+        if let size {
+            postScreen { $0.frame = (image: nil, size: size) }
         }
     }
 
@@ -1068,6 +1154,13 @@ final class SessionController: ObservableObject {
                 self.p2pPump()
             }
         }
+    }
+
+    /// Wave 1: the TCP relay socket has bytes (wake sink): pump now. Stale
+    /// wakes of an earlier attempt just pump the current session once.
+    private func relayWakePump() {
+        guard relayMode, !halted, session != nil else { return }
+        p2pPump()
     }
 
     /// Pump the relay session (relay frames + queued direct datagrams +
@@ -1308,7 +1401,7 @@ final class SessionController: ObservableObject {
     func setQuality(_ fps: UInt16) {
         guard fps != targetFps else { return }
         targetFps = fps
-        sendQuality(targetFps: fps)
+        sendQuality(targetFps: effectiveFps)
     }
 
     /// Send one CAPTURE_REGION command (v0.18): i32-BE x, i32-BE y,
@@ -1478,10 +1571,12 @@ final class SessionController: ObservableObject {
         guard !p.isEmpty else { return }
         let model = screenModel
         if let frame = p.frame {
-            // Pixels first: setting `image` re-renders the surface, which
-            // pulls them for the Metal texture upload.
-            model.pixels.publish(frame.pixels)
-            model.image = frame.image
+            // Metal: the pixels are already staged (FrameUploadQueue); the
+            // tick re-renders the surface, whose redraw blits them.
+            if let img = frame.image {
+                model.image = img
+            }
+            model.frameTick &+= 1
             if model.frameSize != frame.size { model.frameSize = frame.size }
             markLiveIfNeeded()
         }
@@ -1541,9 +1636,13 @@ final class SessionController: ObservableObject {
 // queue; only the queued-buffer counter is shared with the audio render
 // thread (completion handlers), so it is lock-guarded.
 //
-// Jitter handling mirrors the desktop JitterBuffer: playback starts only
-// once `prefillTicks` (60 ms) are queued, a starved player pauses and
-// re-prefills, and more than `maxQueued` (120 ms) queued drops new ticks.
+// Jitter handling (Wave 1, low latency): the queue is measured in audio
+// time, not buffers, so 10 ms and 20 ms Opus packets (duration from the
+// Opus TOC byte) and PCM ticks mix freely. Playback starts once the
+// prefill (30 ms) is queued, a starved player pauses and re-prefills, and
+// audio beyond the cap (60 ms) is dropped. Both adapt: every underrun adds
+// 10 ms of prefill (up to 50 ms, cap = prefill + 30 ms, so at most 80 ms),
+// and 10 s without one gives 10 ms back.
 final class RemoteAudioPlayer {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -1554,27 +1653,37 @@ final class RemoteAudioPlayer {
     private var started = false
     /// The player node is running (false while prefilling).
     private var playing = false
-    /// Buffers scheduled but not yet consumed by the player.
+    /// Frames (48 kHz samples) scheduled but not yet consumed by the player.
     private var queued = 0
     private let queuedLock = NSLock()
-    /// Max ticks (20 ms each) allowed in flight; beyond that new ticks are
-    /// dropped so network bursts cannot ratchet the latency up.
-    private static let maxQueued = 6
-    /// Ticks queued before playback (re)starts: the jitter cushion.
-    private static let prefillTicks = 3
-    /// Opus decoder state (Phase 4), created on the first packet.
+    /// Frames queued before playback (re)starts: the jitter cushion.
+    /// Adaptive between `minPrefill` and `maxPrefill`.
+    private var prefill = RemoteAudioPlayer.minPrefill
+    private static let minPrefill = 1_440 // 30 ms
+    private static let maxPrefill = 2_400 // 50 ms
+    private static let prefillStep = 480 // 10 ms
+    /// Audio beyond the prefill allowed in flight (cap = prefill + this,
+    /// i.e. 60..80 ms); more is dropped so bursts cannot ratchet latency.
+    private static let headroom = 1_440 // 30 ms
+    /// When the last underrun happened (prefill decays 10 s later).
+    private var lastUnderrun: DispatchTime?
+    private static let decayAfterNs: UInt64 = 10_000_000_000
+    /// Opus decoder state (Phase 4), created on the first packet; rebuilt
+    /// when the packet duration changes (10 ms vs 20 ms frames).
     private var opusConverter: AVAudioConverter?
     private var opusFormat: AVAudioFormat?
+    private var opusFramesPerPacket: UInt32 = 0
     /// Largest Opus packet (RFC 6716).
     private static let maxOpusPacket = 1275
 
-    /// The Opus stream format: 48 kHz mono, 960-frame (20 ms) packets.
-    private static func makeOpusFormat() -> AVAudioFormat? {
+    /// The Opus stream format: 48 kHz mono, `framesPerPacket` (960 = 20 ms,
+    /// 480 = 10 ms) per packet.
+    private static func makeOpusFormat(framesPerPacket: UInt32 = 960) -> AVAudioFormat? {
         var desc = AudioStreamBasicDescription(mSampleRate: 48_000,
                                                mFormatID: kAudioFormatOpus,
                                                mFormatFlags: 0,
                                                mBytesPerPacket: 0,
-                                               mFramesPerPacket: 960,
+                                               mFramesPerPacket: framesPerPacket,
                                                mBytesPerFrame: 0,
                                                mChannelsPerFrame: 1,
                                                mBitsPerChannel: 0,
@@ -1621,11 +1730,15 @@ final class RemoteAudioPlayer {
     /// Malformed packets are dropped silently.
     func playOpus(_ packet: Data, samples: UInt32) {
         guard let format, !packet.isEmpty, packet.count <= Self.maxOpusPacket else { return }
-        if opusConverter == nil {
-            guard let opus = Self.makeOpusFormat(),
+        // Wave 1: the packet's own duration (TOC byte) is authoritative —
+        // a host may send 10 ms frames; the header count is the fallback.
+        let perPacket = Self.opusPacketFrames(packet) ?? (samples > 0 ? samples : 960)
+        if opusConverter == nil || perPacket != opusFramesPerPacket {
+            guard let opus = Self.makeOpusFormat(framesPerPacket: perPacket),
                   let conv = AVAudioConverter(from: opus, to: format) else { return }
             opusFormat = opus
             opusConverter = conv
+            opusFramesPerPacket = perPacket
         }
         guard let conv = opusConverter, let opusFormat else { return }
         let compressed = AVAudioCompressedBuffer(format: opusFormat,
@@ -1643,7 +1756,7 @@ final class RemoteAudioPlayer {
                                                     mVariableFramesInPacket: 0,
                                                     mDataByteSize: UInt32(size))
         }
-        let frames = AVAudioFrameCount(max(samples, 960))
+        let frames = AVAudioFrameCount(max(perPacket, samples, 480))
         guard let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
         var supplied = false
         var error: NSError?
@@ -1660,34 +1773,75 @@ final class RemoteAudioPlayer {
         schedule(pcm)
     }
 
+    /// Samples (48 kHz) in one Opus packet, from its TOC byte (RFC 6716
+    /// 3.1): frame duration by config, times the frame count by code. nil
+    /// when the packet is malformed.
+    static func opusPacketFrames(_ packet: Data) -> UInt32? {
+        guard let toc = packet.first else { return nil }
+        let config = Int(toc >> 3)
+        // Frame size in 48 kHz samples (2.5 ms = 120).
+        let silk: [UInt32] = [480, 960, 1_920, 2_880] // 10/20/40/60 ms
+        let celt: [UInt32] = [120, 240, 480, 960] // 2.5/5/10/20 ms
+        let size: UInt32
+        switch config {
+        case 0...11: size = silk[config % 4]
+        case 12...15: size = config % 2 == 0 ? 480 : 960 // Hybrid 10/20 ms
+        default: size = celt[config % 4]
+        }
+        let count: UInt32
+        switch toc & 0x03 {
+        case 0: count = 1
+        case 1, 2: count = 2
+        default:
+            guard packet.count >= 2 else { return nil }
+            count = UInt32(packet[packet.startIndex + 1] & 0x3F)
+        }
+        let total = size * count
+        // At most 120 ms per packet (RFC 6716).
+        guard total > 0, total <= 5_760 else { return nil }
+        return total
+    }
+
     /// Queue one decoded buffer, applying the prefill / underrun / ceiling
-    /// rules described above.
+    /// rules described above (all in frames of audio time).
     private func schedule(_ buf: AVAudioPCMBuffer) {
         guard let format else { return }
         if !started {
             guard startEngine(format: format) else { return }
         }
+        let n = Int(buf.frameLength)
+        guard n > 0 else { return }
+        let now = DispatchTime.now()
+        if let t = lastUnderrun, now.uptimeNanoseconds &- t.uptimeNanoseconds > Self.decayAfterNs,
+           prefill > Self.minPrefill {
+            // A quiet stretch: give a step of cushion back.
+            prefill -= Self.prefillStep
+            lastUnderrun = now
+        }
         queuedLock.lock()
         let depth = queued
         queuedLock.unlock()
-        guard depth < Self.maxQueued else { return }
+        guard depth + n <= prefill + Self.headroom else { return }
         if playing && depth == 0 {
             // Underrun: pause and re-prefill so playback resumes with a
-            // cushion instead of stuttering tick by tick.
+            // cushion instead of stuttering packet by packet; the network
+            // is jittery, so keep a little more cushion for a while.
             player.pause()
             playing = false
+            prefill = min(Self.maxPrefill, prefill + Self.prefillStep)
+            lastUnderrun = now
         }
         queuedLock.lock()
-        queued += 1
-        let now = queued
+        queued += n
+        let queuedNow = queued
         queuedLock.unlock()
         player.scheduleBuffer(buf, completionHandler: { [weak self] in
             guard let self else { return }
             self.queuedLock.lock()
-            self.queued = max(0, self.queued - 1)
+            self.queued = max(0, self.queued - n)
             self.queuedLock.unlock()
         })
-        if !playing && now >= Self.prefillTicks {
+        if !playing && queuedNow >= prefill {
             player.play()
             playing = true
         }
@@ -1698,6 +1852,9 @@ final class RemoteAudioPlayer {
         // audio; mixWithOthers so we do not stop the user's music.
         let audioSession = AVAudioSession.sharedInstance()
         try? audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        // Wave 1: a short hardware I/O buffer (10 ms) — the jitter cushion
+        // above is the latency budget, not the output buffer.
+        try? audioSession.setPreferredIOBufferDuration(0.010)
         try? audioSession.setActive(true)
         do {
             if player.engine == nil {
@@ -1721,6 +1878,8 @@ final class RemoteAudioPlayer {
         started = false
         playing = false
         opusConverter?.reset()
+        prefill = Self.minPrefill
+        lastUnderrun = nil
         queuedLock.lock()
         queued = 0
         queuedLock.unlock()

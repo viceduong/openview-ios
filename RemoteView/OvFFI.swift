@@ -17,6 +17,28 @@ enum OvQueues {
     static let session = DispatchQueue(label: "ov.session", qos: .userInteractive)
 }
 
+/// Wave 1: the target of the relay wake sink. The Rust watcher thread calls
+/// `fire()` (never the pump thread), so the handler is lock-guarded; it is a
+/// separate object (owned by the session box) so it is still alive while
+/// `ov_session_free` stops the watcher during the box's deinit.
+final class OvWakeTarget {
+    private let lock = NSLock()
+    private var handler: (() -> Void)?
+
+    func set(_ h: (() -> Void)?) {
+        lock.lock()
+        handler = h
+        lock.unlock()
+    }
+
+    func fire() {
+        lock.lock()
+        let h = handler
+        lock.unlock()
+        h?()
+    }
+}
+
 final class OvSessionBox {
     /// Marshals C callback user pointers back to this object.
     var onDatagramOut: ((Data) -> Void)?
@@ -30,6 +52,8 @@ final class OvSessionBox {
     }
 
     private let ptr: OpaquePointer
+    /// Wave 1 relay wake sink target (see `setWakeHandler`).
+    private let wakeTarget = OvWakeTarget()
 
     /// Create a session. `isServer` selects the handshake role; `pairingCode`
     /// is our own code on the server side, the peer's code on the client side.
@@ -153,6 +177,24 @@ final class OvSessionBox {
         _ = ov_session_relay_eof(ptr)
     }
 
+    /// Wave 1 event-driven relay receive: `handler` runs on a Rust watcher
+    /// thread as soon as the TCP relay socket has bytes — it must only
+    /// dispatch a `pumpRelay()` onto the session queue (never call into this
+    /// box synchronously, never block). Wakes are coalesced until the next
+    /// pump. Returns true when the relay socket is watched (TCP relay
+    /// connected); the WebSocket relay and direct UDP are event driven
+    /// already. Keep the timer pump as the fallback either way.
+    @discardableResult
+    func setWakeHandler(_ handler: @escaping () -> Void) -> Bool {
+        wakeTarget.set(handler)
+        let target = Unmanaged.passUnretained(wakeTarget).toOpaque()
+        let rc = ov_session_set_wake_sink(ptr, target, { user in
+            guard let user else { return }
+            Unmanaged<OvWakeTarget>.fromOpaque(user).takeUnretainedValue().fire()
+        })
+        return rc == 1
+    }
+
     /// Poll the Rust-owned relay transport (use instead of `pump()`). Drains
     /// every available tunnel frame per call; throws `.closed` once the
     /// relay connection has reached EOF.
@@ -226,6 +268,9 @@ final class OvSessionBox {
         onRelayBytesOut = nil
         onDirectSend = nil
         onDirectOpen = nil
+        // Stop the relay watcher thread (Rust) and drop its handler.
+        wakeTarget.set(nil)
+        _ = ov_session_set_wake_sink(ptr, nil, nil)
     }
 
     /// Section 4: one SESSION_OPTION payload (channel 0). `key` 1 = hide
@@ -270,6 +315,32 @@ final class OvSessionBox {
 // `OvScreen` is NOT internally locked: call every method (feed, ticks,
 // takePongReply) from `OvQueues.session` only.
 final class OvScreenBox {
+    /// Wave 1 zero-copy frame: the Rust framebuffer and the rects the frame
+    /// changed. Every pointer is valid only during the callback.
+    struct FrameView {
+        let pixels: UnsafeRawPointer
+        let count: Int
+        let width: Int
+        let height: Int
+        /// Row pitch in bytes.
+        let stride: Int
+        /// 0 = BGRA (4 bytes/px), 1 = BGR (3 bytes/px).
+        let format: UInt8
+        let seq: UInt64
+        /// Packed x, y, w, h quadruples (frame pixels); empty = everything.
+        let rects: UnsafeBufferPointer<UInt16>
+    }
+
+    /// Wave 1: fired right after the `feed` that completed a frame, with a
+    /// zero-copy view of the framebuffer + dirty rects (the Metal path
+    /// uploads only those). While set, `onFrame` is not used (no 8 MB copy
+    /// per update).
+    var onFramePixels: ((FrameView) -> Void)?
+    /// The frame sink fired during the current `feed` (zero-copy path).
+    private var frameReady = false
+    /// The body of the running `visitFramebuffer` call.
+    private var visitBody: ((FrameView) -> Void)?
+
     /// Fired with (seq, width, height, stride, formatTag, pixels, dirty) on
     /// a complete frame, right after the `feed` that completed it. `dirty`
     /// = the rects (frame pixels) the frame changed, nil = treat as full.
@@ -317,6 +388,11 @@ final class OvScreenBox {
         ov_screen_set_frame_sink(ptr, unmanaged.toOpaque(), { user, seq, width, height, stride, format, pixels, len in
             guard let user, let pixels else { return }
             let me = Unmanaged<OvScreenBox>.fromOpaque(user).takeUnretainedValue()
+            if me.onFramePixels != nil {
+                // Zero-copy path: read the framebuffer once `feed` returned.
+                me.frameReady = true
+                return
+            }
             guard me.onFrame != nil else { return }
             let data = Data(bytes: pixels, count: Int(len))
             me.deliveredFrame = (seq, width, height, stride, format, data)
@@ -435,6 +511,7 @@ final class OvScreenBox {
     func clearCallbacks() {
         onVideo = nil
         onFrame = nil
+        onFramePixels = nil
         onCursor = nil
         onCursorShape = nil
         onLiveness = nil
@@ -478,10 +555,40 @@ final class OvScreenBox {
             guard let base = raw.baseAddress else { return }
             ov_screen_feed(ptr, base.assumingMemoryBound(to: UInt8.self), raw.count)
         }
+        if frameReady {
+            frameReady = false
+            if let body = onFramePixels {
+                visitFramebuffer(full: false, body)
+            }
+        }
         if let f = deliveredFrame {
             deliveredFrame = nil
             onFrame?(f.0, f.1, f.2, f.3, f.4, f.5, dirtyRects())
         }
+    }
+
+    /// Wave 1: run `body` synchronously with a zero-copy view of the current
+    /// framebuffer (`full`: no rect list — upload everything, e.g. for a new
+    /// texture). Returns false when there is no frame yet. Session queue
+    /// only, never from inside a sink.
+    @discardableResult
+    func visitFramebuffer(full: Bool, _ body: @escaping (FrameView) -> Void) -> Bool {
+        visitBody = body
+        defer { visitBody = nil }
+        let rc = ov_screen_visit_framebuffer(ptr, Unmanaged.passUnretained(self).toOpaque(), { user, pixels, len, width, height, stride, format, seq, rects, count in
+            guard let user, let pixels else { return }
+            let me = Unmanaged<OvScreenBox>.fromOpaque(user).takeUnretainedValue()
+            let view = FrameView(pixels: UnsafeRawPointer(pixels),
+                                 count: len,
+                                 width: Int(width),
+                                 height: Int(height),
+                                 stride: Int(stride),
+                                 format: format,
+                                 seq: seq,
+                                 rects: UnsafeBufferPointer(start: rects, count: rects == nil ? 0 : count * 4))
+            me.visitBody?(view)
+        }, full ? 1 : 0)
+        return rc == 0
     }
 
     /// Section 5: advertise CAP_DIRECT (before the first `feed`).
