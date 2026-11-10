@@ -37,11 +37,14 @@ final class DirectPathSet {
         var dead = false
         /// Datagrams sent before `.ready` (bounded: probes are resent).
         var pending: [Data] = []
+        /// How many times this path's socket was re-created after failing.
+        let reopens: Int
 
-        init(connection: NWConnection, address: String, kind: Kind) {
+        init(connection: NWConnection, address: String, kind: Kind, reopens: Int) {
             self.connection = connection
             self.address = address
             self.kind = kind
+            self.reopens = reopens
         }
     }
 
@@ -52,6 +55,11 @@ final class DirectPathSet {
     private static let maxPending = 64
     /// A host offers a handful of candidates; cap the sockets anyway.
     private static let maxPaths = 32
+    /// A failed path socket is re-created (new source port; the engine's
+    /// REBIND moves the host's link to it) at most this often in a row.
+    private static let maxReopens = 40
+    /// Path events for the session log (on `queue`).
+    var onEvent: ((String) -> Void)?
 
     init(queue: DispatchQueue, onReceive: @escaping (UInt32, Data) -> Void) {
         self.queue = queue
@@ -66,11 +74,15 @@ final class DirectPathSet {
         guard !closed, paths[pathID] == nil, paths.count < Self.maxPaths,
               let parsed = Self.parse(address),
               let nwPort = NWEndpoint.Port(rawValue: parsed.port) else { return false }
-        let host = parsed.host
+        start(pathID: pathID, address: address, host: parsed.host, port: nwPort, reopens: 0)
+        return true
+    }
+
+    private func start(pathID: UInt32, address: String, host: String, port nwPort: NWEndpoint.Port, reopens: Int) {
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)
         let params = NWParameters.udp
         let connection = NWConnection(to: endpoint, using: params)
-        let path = Path(connection: connection, address: address, kind: Self.classify(host: host))
+        let path = Path(connection: connection, address: address, kind: Self.classify(host: host), reopens: reopens)
         paths[pathID] = path
         connection.stateUpdateHandler = { [weak self, weak path] state in
             // Already on `queue` (the connection's queue).
@@ -78,7 +90,24 @@ final class DirectPathSet {
             self.handleState(state, path: path, id: pathID)
         }
         connection.start(queue: queue)
-        return true
+    }
+
+    /// The path's socket failed (VPN reconnect, network change): re-create
+    /// it shortly, keeping the path id, so the engine's sends - and its
+    /// REBIND - go out again. Datagrams from the new socket carry a new
+    /// source port; the host follows it once the REBIND authenticates.
+    private func scheduleReopen(_ path: Path, id: UInt32, why: String) {
+        guard !closed, path.reopens < Self.maxReopens,
+              let parsed = Self.parse(path.address),
+              let nwPort = NWEndpoint.Port(rawValue: parsed.port) else { return }
+        onEvent?("Direct path \(path.address): \(why) — reopening the socket")
+        let delay = min(0.25 * Double(path.reopens + 1), 2.0)
+        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak path] in
+            guard let self, !self.closed, let path, self.paths[id] === path else { return }
+            path.connection.stateUpdateHandler = nil
+            path.connection.cancel()
+            self.start(pathID: id, address: path.address, host: parsed.host, port: nwPort, reopens: path.reopens + 1)
+        }
     }
 
     /// Put one datagram on path `pathID` (buffered until it is ready).
@@ -144,9 +173,15 @@ final class DirectPathSet {
                 }
             }
             receiveLoop(path, id: id)
-        case .failed, .cancelled:
-            // The engine notices the silence (probe timeout / path loss)
-            // and falls back to the relay; nothing to report here.
+        case .failed(let error):
+            // Re-create the socket: once the relay is gone this path is the
+            // session's only link (the engine falls back to the relay by
+            // itself while there is one).
+            path.ready = false
+            path.dead = true
+            path.pending.removeAll()
+            scheduleReopen(path, id: id, why: "failed (\(error))")
+        case .cancelled:
             path.ready = false
             path.dead = true
             path.pending.removeAll()
@@ -157,7 +192,15 @@ final class DirectPathSet {
 
     private func receiveLoop(_ path: Path, id: UInt32) {
         path.connection.receiveMessage { [weak self, weak path] content, _, _, error in
-            guard let self, let path, !self.closed, !path.dead, error == nil else { return }
+            guard let self, let path, !self.closed, !path.dead else { return }
+            if let error {
+                // A receive error used to end this loop for good, leaving the
+                // path deaf (and, once the relay closed, the session silent).
+                path.ready = false
+                path.dead = true
+                self.scheduleReopen(path, id: id, why: "receive error (\(error))")
+                return
+            }
             // Re-arm first so the next datagram is already being received.
             self.receiveLoop(path, id: id)
             if let content, !content.isEmpty {

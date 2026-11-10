@@ -194,6 +194,8 @@ int32_t ov_screen_visit_framebuffer(OvScreen *s, void *user, ov_framebuffer_visi
 int32_t ov_screen_set_liveness_sink(OvScreen *screen, void *user, ov_liveness_sink sink);
 int64_t ov_screen_keepalive_tick(OvScreen *screen, int64_t now_ms);
 int32_t ov_screen_liveness_tick(OvScreen *screen, int64_t now_ms);
+// Watchdog: ms since the last inbound record (same clock as liveness_tick).
+int64_t ov_screen_inbound_age_ms(OvScreen *screen, int64_t now_ms);
 int32_t ov_screen_take_pong_reply(OvScreen *screen, uint8_t *out, size_t cap);
 
 #endif

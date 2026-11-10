@@ -535,6 +535,11 @@ final class OvScreenBox {
         ov_screen_liveness_tick(ptr, nowMs)
     }
 
+    /// Watchdog: ms since the last inbound record (-1 = no screen).
+    func inboundAgeMs(nowMs: Int64) -> Int64 {
+        ov_screen_inbound_age_ms(ptr, nowMs)
+    }
+
     /// The host's CAPS bits (0 until the host answered; old hosts never
     /// do). Session queue only.
     func peerCaps() -> UInt32 {

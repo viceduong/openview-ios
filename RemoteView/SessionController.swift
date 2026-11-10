@@ -178,6 +178,9 @@ private struct PendingScreen {
 
 final class SessionController: ObservableObject {
     static let maxReconnectAttempts = 3
+    /// Watchdog: inbound silence (ms) after which an established session is
+    /// declared dead and reconnected (the host keepalive is 5 s).
+    static let watchdogMs: Int64 = 8_000
     /// No secure session after this long = host not responding.
     static let handshakeTimeout: TimeInterval = 15
 
@@ -304,6 +307,9 @@ final class SessionController: ObservableObject {
     /// Last direct state / path published (UI + log only on change).
     private var lastDirectState: Int32 = -1
     private var lastDirectPath: Int64 = -1
+    /// Watchdog: when it was armed (first tick after the secure session came
+    /// up), so a slow first frame never counts as silence.
+    private var watchdogArmedMs: Int64?
     private static let p2pMaxIntervalMs: Int64 = 20
 
     // Screen updates coalesced across threads (guarded by `screenLock`).
@@ -726,7 +732,8 @@ final class SessionController: ObservableObject {
                     let ns = e as NSError
                     return "\(ns.domain) \(ns.code): \(ns.localizedDescription)"
                 } ?? "clean close"
-                self.log("Relay WebSocket closed (\(why)); direct state \(session.directState)")
+                let info = self.relaySocket?.closeInfo ?? "n/a"
+                self.log("Relay WebSocket closed (\(why); \(info)); direct state \(session.directState)")
                 session.relayEOF()
                 // Drain whatever arrived before the close; the relay then
                 // reports closed (-5), which ends the session below —
@@ -832,6 +839,7 @@ final class SessionController: ObservableObject {
         p2pTimerDue = nil
         lastDirectState = -1
         lastDirectPath = -1
+        watchdogArmedMs = nil
     }
 
     /// The secure session is up: publish the host fingerprint once.
@@ -1059,6 +1067,21 @@ final class SessionController: ObservableObject {
             }
             try sendPongIfOwed()
             screen.livenessTick(nowMs: nowMs)
+            // Watchdog: the host sends at least a keepalive every 5 s. A
+            // session that heard nothing for longer is dead even if no
+            // transport said so (e.g. a VPN dropped the relay and the UDP
+            // flow at once) — end the attempt so the reconnect flow runs
+            // instead of sitting on a frozen screen with input going nowhere.
+            if established {
+                let since = watchdogArmedMs ?? nowMs
+                watchdogArmedMs = since
+                let age = min(screen.inboundAgeMs(nowMs: nowMs), nowMs - since)
+                if age > Self.watchdogMs {
+                    log("Watchdog: nothing from the host for \(age / 1000) s (direct state \(session.directState))")
+                    failOnQueue(.disconnected("no data from the host for \(age / 1000) s"))
+                    return
+                }
+            }
             // Section 2: publish CAP_INPUT2 once the host's CAPS arrive.
             let caps = screen.peerCaps()
             if caps != lastPeerCaps {
@@ -1133,6 +1156,9 @@ final class SessionController: ObservableObject {
             paths.closeAll()
             log("Direct path unavailable: \(error)")
             return
+        }
+        paths.onEvent = { [weak self] line in
+            self?.log(line)
         }
         p2pPaths = paths
         p2pEnabled = true
