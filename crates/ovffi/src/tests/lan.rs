@@ -209,13 +209,19 @@ fn ios_datagram_mode_survives_a_lossy_lan_to_a_host_lan_port() {
             let rc = unsafe { ov_session_pump(s) };
             assert_eq!(rc, 0, "viewer pump failed");
         }
-        got_big = viewer
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(ch, d)| *ch == 0 && *d == big);
-        if got_big && !sent_reply {
+        let (big_seen, after_seen) = {
+            let recs = viewer.records.lock().unwrap();
+            (
+                recs.iter().any(|(ch, d)| *ch == 0 && *d == big),
+                recs.iter()
+                    .any(|(ch, d)| *ch == 1 && d == b"after-the-big-one"),
+            )
+        };
+        got_big = big_seen;
+        // Reply only once everything the host sent has arrived: the host
+        // stops retransmitting when it sees the reply, so replying earlier
+        // could strand a lost trailing record.
+        if big_seen && after_seen && !sent_reply {
             let msg = b"viewer-hello";
             let rc = unsafe { ov_session_send_record(s, 1, msg.as_ptr(), msg.len()) };
             assert_eq!(rc, 0);

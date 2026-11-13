@@ -34,7 +34,9 @@ written in Rust (Swift for the iOS UI) and end-to-end encrypted.
 > [Reaching the PC from anywhere](#reaching-the-pc-from-anywhere).
 
 <p align="center">
-  <img src="docs/images/remote-control-dark.png" alt="OpenView for Windows: the Remote Control page with this PC's ID and PIN" width="720">
+  <img src="docs/images/remote-control-dark.png" alt="OpenView for Windows: the Remote Control page with this PC's ID, PIN and the computers on this network" width="620">
+  &nbsp;
+  <img src="docs/images/ios-home.png" alt="OpenView for iOS: saved computers, quick connect and pairing" width="200">
 </p>
 
 ## Features

@@ -288,6 +288,11 @@ final class KeyboardTracker: ObservableObject {
     @Published private(set) var height: CGFloat = 0
     private var observers: [NSObjectProtocol] = []
     private var hideWork: DispatchWorkItem?
+    /// The latest keyboard height iOS reported. The deferred first slide
+    /// reads this, not the value captured when it was scheduled: iOS often
+    /// sends a second frame change right away (the key row joining the
+    /// keyboard), and a stale capture would leave the handle below the row.
+    private var targetHeight: CGFloat = 0
 
     init() {
         let center = NotificationCenter.default
@@ -322,16 +327,16 @@ final class KeyboardTracker: ObservableObject {
         let animation = Self.keyboardAnimation(duration)
         hideWork?.cancel()
         hideWork = nil
+        targetHeight = newHeight
         if newHeight > 0 {
             if !up {
-                // Insert the handle at the bottom first (height still 0),
-                // then animate it up together with the keyboard.
                 // Insert the handle at the bottom first (a newly inserted
                 // view appears at its final layout), then slide it up with
                 // the keyboard's spring on the next frame.
                 up = true
                 DispatchQueue.main.async { [weak self] in
-                    withAnimation(animation) { self?.height = newHeight }
+                    guard let self, self.up else { return }
+                    withAnimation(animation) { self.height = self.targetHeight }
                 }
             } else {
                 withAnimation(animation) { height = newHeight }
