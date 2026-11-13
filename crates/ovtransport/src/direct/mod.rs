@@ -32,7 +32,7 @@
 //! # Wire formats
 //!
 //! ```text
-//! probe (raw UDP):  "\xB7DP1" | type u8 (1 REQ, 2 RESP, 3 COMMIT) | nonce [16]
+//! probe (raw UDP):  "\xB7DP1" | type u8 (1 REQ, 2 RESP, 3 COMMIT, 4 REBIND) | nonce [16]
 //!                   | t_us u64 BE | mac [16]   (HMAC-SHA256(key, all before)[..16])
 //! relay marker:     FF FF FF FF FF FF FF FF "OVDX" | kind u8 | n u64 BE
 //!                   (kind 1 SYNC_UP, 3 SYNC_DOWN, 2 NOP keepalive)

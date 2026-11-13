@@ -84,7 +84,7 @@ fn host_and_viewer_handshake_over_websocket_relay() {
 
     let host_id = Identity::generate();
     let viewer_id = Identity::generate();
-    let code = host_id.pairing_code();
+    let code = host_id.short_code();
     let mut hs_v = Handshake::new(
         Role::Client,
         0xAA,

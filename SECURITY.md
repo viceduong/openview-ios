@@ -15,8 +15,10 @@ take security reports seriously and appreciate responsible disclosure.
 **Please do not open a public issue for security problems.**
 
 Report privately through GitHub:
-[**Report a vulnerability**](https://github.com/OWNER/openview/security/advisories/new)
+[**Report a vulnerability**](https://github.com/viceduong/openview/security/advisories/new)
 (repository *Security* tab > *Advisories* > *Report a vulnerability*).
+If you cannot use GitHub advisories, email **viceduong@gmail.com** instead
+(subject line starting with `[openview security]`).
 
 Include what you found, the affected component (host, viewer, relay, Windows
 app, iOS app, protocol), the version, and steps or a proof of concept. Do

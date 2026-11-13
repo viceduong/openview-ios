@@ -1098,7 +1098,4 @@ its files, usually a `tests.rs` or `tests/` next to `mod.rs`):
 | `audio_duplex_over_relay.rs` | AUDIO in both directions concurrently |
 | `input_over_relay.rs` | POINTER down/move/up + KEY down/up arrive in order with exact fields |
 | `file_transfer.rs` | file-id-keyed `send_file_xfer` in both directions concurrently over the relay |
-| `unattended_over_relay.rs` | PIN-authenticated unattended access via device id: correct PIN establishes, wrong PIN rejected with `PIN proof mismatch` |
-
-No `TODO`/`FIXME`/`todo!()`/`unimplemented!()` markers exist in `src/` or
-`tests/`.
+| `unattended_over_relay.rs` | PIN-authenticated unattended access via device id: correct PIN establishes, a wrong PIN never establishes (SPAKE2 key confirmation fails) |

@@ -29,5 +29,5 @@ first start ("More info" > "Run anyway"). Verify downloads with SHA256SUMS.
 
 Command-line help: ovhost.exe --help, ovview.exe --help, ovrelay.exe --help
 
-Documentation, source code and issues: https://github.com/OWNER/openview
+Documentation, source code and issues: https://github.com/viceduong/openview
 License: MIT (LICENSE). Third-party notices: THIRD_PARTY_LICENSES.txt.

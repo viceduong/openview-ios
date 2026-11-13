@@ -10,7 +10,7 @@ liveness, file transfer) lives in Rust. Swift only moves bytes and renders.
 |---|---|
 | Source | `crates/ovffi/src/` (module map below; `lib.rs` holds the crate doc and the module list) |
 | C header | `ios/OvFFI/include/shim.h` (+ `module.modulemap`, module `OvFFI`, shipped inside the XCFramework; Swift uses `import OvFFI`) |
-| Swift wrapper | `ios/RemoteView/RemoteView/Transport/OvFFI.swift` (`OvSessionBox`, `OvScreenBox`) |
+| Swift wrapper | `ios/OpenView/OpenView/Transport/OvFFI.swift` (`OvSessionBox`, `OvScreenBox`) |
 | Tests | `src/tests/` (`ffi.rs`, `relay.rs`, `direct.rs`, `pin.rs`, `lan.rs`, `header.rs`) |
 | Dependencies | `ovcore`, `ovtransport` (without the `ws-client` feature: the app owns its WebSocket and uses the byte-stream bridge), `ovapp`; dev-dep `ovrelay` (`Cargo.toml`) |
 
@@ -176,7 +176,7 @@ transport call on one serial queue, `OvQueues.session` (`OvFFI.swift`).
 | `void ov_identity_free(OvIdentity *id)` | — | NULL-safe |
 | `int32_t ov_identity_fingerprint(const OvIdentity *id, uint8_t *out)` | `0` / `-1` | writes 16 bytes |
 | `int32_t ov_identity_fingerprint_pine(const OvIdentity *id, char *out, size_t cap)` | string length / `-1` | e.g. `"A1B2C3D4 E5F60718 ..."` |
-| `int32_t ov_identity_pairing_code(const OvIdentity *id, char *out, size_t cap)` | string length / `-1` | 6-digit **fingerprint short code** (public; not a pairing credential — attended hosts show a random one-time 10-digit code) |
+| `int32_t ov_identity_short_code(const OvIdentity *id, char *out, size_t cap)` | string length / `-1` | 6-digit **fingerprint short code** (public; not a pairing credential — attended hosts show a random one-time 10-digit code) |
 
 `ov_session_create` does **not** take an identity. Every session generates
 its own (`Identity::generate()` in `ov_session_create`). The identity API is
@@ -770,15 +770,14 @@ direct paths through the C sinks) against a desktop host (`TerminalSession`
 
 ---
 
-## 10. Known inconsistencies
-
-These are observed in the code; nothing was changed.
+## 10. Notes and limitations
 
 - **`OpusSink` gap signal is ignored on iOS.** The NULL-packet "audio lost"
   call is dropped by the Swift trampoline's `guard let packet` (also noted
-  in the `OpusSink` doc comment, `screen/sinks.rs`).
-- **Unused identity calls.** `ov_identity_fingerprint` and
-  `ov_identity_free` are exported but not called from Swift.
-- **`ov_session_set_wake_sink` nullability.** It takes `Option<WakeSink>`
-  in Rust, but the header declares a plain `ov_wake_sink`. NULL is
-  documented as "stop watching", and Swift passes `nil`.
+  in the `OpusSink` doc comment, `screen/sinks.rs`), so no packet-loss
+  concealment runs (KNOWN_ISSUES BUG-7).
+- **`ov_identity_fingerprint` and `ov_identity_free`** are exported for
+  completeness; the iOS app does not call them.
+- **`ov_session_set_wake_sink` accepts NULL** ("stop watching"): the Rust
+  side takes `Option<WakeSink>`; the header's plain function-pointer type
+  is nullable in C as well.

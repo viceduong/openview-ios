@@ -20,7 +20,10 @@ version = "0.1.0"
 edition = "2021"
 authors = ["OpenView contributors"]
 license = "MIT"
-repository = "https://github.com/OWNER/openview"
+repository = "https://github.com/viceduong/openview"
+readme = "README.md"
+keywords = ["remote-desktop", "screen-sharing", "relay", "e2ee", "self-hosted"]
+categories = ["network-programming", "cryptography", "gui"]
 rust-version = "1.92"
 
 [workspace.dependencies]
@@ -39,7 +42,11 @@ thiserror = "2"
 # Win32 bindings (host/viewer/GUI; Windows targets only).
 windows = "0.62"
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
 [workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = "thin"

@@ -183,7 +183,7 @@ final class PairingStateBox {
         identity = p
         // A failed identity allocation (returns null) degrades to empty
         // strings rather than crashing the app at launch.
-        code = p.map { OvSessionBox.pairingCode(of: $0) } ?? ""
+        code = p.map { OvSessionBox.shortCode(of: $0) } ?? ""
         pine = p.map { OvSessionBox.fingerprintPine(of: $0) } ?? ""
     }
 }

@@ -95,7 +95,7 @@ impl Identity {
     /// Not a secret and not a credential: anyone who sees this identity's
     /// public key can compute it. Attended sessions authenticate with a
     /// random one-time code from [`crate::pairing::generate`] instead.
-    pub fn pairing_code(&self) -> String {
+    pub fn short_code(&self) -> String {
         let f = self.fingerprint();
         let n = ((f[0] as u64) << 56)
             | ((f[1] as u64) << 48)
@@ -114,13 +114,13 @@ impl Identity {
     }
 
     /// Serialize the public identity (for QR / contact exchange / the PairingResponse).
-    /// Layout: [1B ver][32 x25519_pk][32 ed_pub][6 pairing][32 x25519_sig]
+    /// Layout: [1B ver][32 x25519_pk][32 ed_pub][6 short code][64 x25519_sig]
     pub fn to_blob(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(1 + 32 + 32 + 6 + 32);
         b.push(BLOB_VERSION);
         b.extend_from_slice(self.x().as_bytes());
         b.extend_from_slice(self.ed.verifying_key().as_bytes());
-        b.extend_from_slice(self.pairing_code().as_bytes());
+        b.extend_from_slice(self.short_code().as_bytes());
         b.extend_from_slice(&self.x25519_sig());
         b
     }
@@ -141,7 +141,7 @@ impl Identity {
         let pi = PublicIdentity {
             x25519_pk: x25519_dalek::PublicKey::from(bytes32(x_pk)?),
             ed_pub: ed25519_dalek::VerifyingKey::from_bytes(&bytes32(ed_pub)?).ok()?,
-            pairing_code: String::from_utf8_lossy(pairing).into_owned(),
+            short_code: String::from_utf8_lossy(pairing).into_owned(),
             sig: sig.to_vec(),
         };
         // verify the ed_pub actually signed the x25519 pk
@@ -169,8 +169,8 @@ pub struct PublicIdentity {
     pub x25519_pk: x25519_dalek::PublicKey,
     /// The peer's Ed25519 verifying key.
     pub ed_pub: ed25519_dalek::VerifyingKey,
-    /// The peer's advertised pairing code.
-    pub pairing_code: String,
+    /// The peer's advertised fingerprint short code (see [`Identity::short_code`]).
+    pub short_code: String,
     /// Ed25519 signature of `x25519_pk` by `ed_pub`.
     pub sig: Vec<u8>,
 }
@@ -240,9 +240,9 @@ mod tests {
             .unwrap_or(false));
     }
     #[test]
-    fn pairing_code_is_six_digits() {
+    fn short_code_is_six_digits() {
         let id = Identity::generate();
-        let c = id.pairing_code();
+        let c = id.short_code();
         assert_eq!(c.len(), 6);
         assert!(c.chars().all(|c| c.is_ascii_digit()));
     }

@@ -6,7 +6,8 @@ import UIKit
 /// full-screen presentation, and the remember-on-connect policy (save the
 /// device, pin its fingerprint, store the PIN). Main thread only.
 final class AppModel: ObservableObject {
-    let store = ConnectionStore()
+    /// Persisted saved connections (in-memory demo devices in screenshot mode).
+    let store = ScreenshotMode.makeStore()
     /// A session is presented.
     @Published private(set) var sessionActive = false
     /// The last session's log (Settings > About).

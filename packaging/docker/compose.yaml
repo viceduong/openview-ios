@@ -1,0 +1,26 @@
+# OpenView relay with Docker Compose. From the repository root:
+#
+#   docker compose -f packaging/docker/compose.yaml up -d --build
+#
+# See docs/INSTALL.md, "Run a relay on Linux/Docker".
+services:
+  ovrelay:
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    image: openview-relay:latest
+    container_name: ovrelay
+    restart: unless-stopped
+    init: true
+    ports:
+      - "4569:4569/tcp"
+    environment:
+      # Listen address; the image's health check probes the same address.
+      OVRELAY_BIND: "0.0.0.0:4569"
+    # Extra flags, e.g. ["--ws-path", "/", "--max-per-ip", "64"].
+    # command: []
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

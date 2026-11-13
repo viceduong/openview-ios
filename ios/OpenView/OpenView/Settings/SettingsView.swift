@@ -229,7 +229,7 @@ struct SettingsView: View {
     private var about: some View {
         Section(header: Text("About")) {
             valueRow("Version", version)
-            valueRow("This device's pairing code", PairingState.shared.code.isEmpty ? "—" : PairingState.shared.code)
+            valueRow("This device's short code", PairingState.shared.code.isEmpty ? "—" : PairingState.shared.code)
             VStack(alignment: .leading, spacing: 4) {
                 Text("This device's fingerprint")
                 Text(PairingState.shared.pine.isEmpty ? "—" : PairingState.shared.pine)

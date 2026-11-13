@@ -38,10 +38,8 @@ Examples of unacceptable behavior:
 
 ## Reporting and enforcement
 
-Report unacceptable behavior privately to the project maintainers (the
-owners of this repository on GitHub, for example through a private
-[security advisory](https://github.com/OWNER/openview/security/advisories/new)
-if no other private channel is listed). All complaints will be reviewed and
+Report unacceptable behavior privately to the project maintainers by email
+at **viceduong@gmail.com**. All complaints will be reviewed and
 investigated promptly and fairly, and the privacy of the reporter will be
 respected.
 

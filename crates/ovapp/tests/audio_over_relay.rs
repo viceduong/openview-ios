@@ -58,7 +58,7 @@ fn audio_stream_over_relay_byte_exact_with_video() {
     let client_id = Identity::generate();
     let server_id = Identity::generate();
     let (dev_c, dev_s) = (0x00CC_0001u64, 0x00DD_0002u64);
-    let code = server_id.pairing_code();
+    let code = server_id.short_code();
     let session_id = u32::from_be_bytes(code.as_bytes()[..4].try_into().expect("code >= 4"));
 
     let mut cc = RelayTunnelCarrier::connect(relay_addr, session_id, TunnelRole::Initiator)

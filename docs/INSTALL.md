@@ -3,7 +3,7 @@
 OpenView runs on **Windows 10 and Windows 11, x64**. The binaries link the C
 runtime statically, so no Visual C++ redistributable or other runtime is
 needed. Two packages are published on the
-[Releases](https://github.com/OWNER/openview/releases) page:
+[Releases](https://github.com/viceduong/openview/releases) page:
 
 | Package | Use it when |
 |---|---|
@@ -164,3 +164,137 @@ sign-in screen or UAC prompts (see [SECURITY.md](../SECURITY.md#known-limitation
 Starting `OpenView.exe` while it is already running brings the existing
 window to the front. Environment variables for development are listed in
 [USAGE.md](USAGE.md#openviewexe-ovgui).
+
+## Run a relay on Linux/Docker
+
+The relay (`ovrelay`) also runs on any Linux server, so viewers and hosts
+can meet on a machine that is always on. It is one static binary with no
+configuration file: it keeps no state on disk and logs to stderr. Pick one
+of the three ways below.
+
+### Release binary
+
+Each release has two Linux archives, built against musl (no glibc version
+requirement):
+
+| Archive | CPU |
+|---|---|
+| `ovrelay-<version>-linux-x86_64.tar.gz` | x86-64 |
+| `ovrelay-<version>-linux-aarch64.tar.gz` | 64-bit ARM (Raspberry Pi 4/5 with a 64-bit OS, Graviton, Ampere) |
+
+Each contains a folder of the same name with `ovrelay`, `LICENSE` and
+the systemd unit `ovrelay.service`.
+Download the archive and `SHA256SUMS` from the same release, then:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf ovrelay-0.1.0-linux-x86_64.tar.gz
+sudo install -m 0755 ovrelay-0.1.0-linux-x86_64/ovrelay /usr/local/bin/ovrelay
+ovrelay --version
+```
+
+Running `ovrelay` in a terminal starts it on `0.0.0.0:4569`; `ovrelay --help`
+lists the options (connection limits, park timeout, WebSocket paths).
+
+### systemd service
+
+[`packaging/linux/ovrelay.service`](../packaging/linux/ovrelay.service) runs
+the binary above as a sandboxed service: a throw-away user
+(`DynamicUser=yes`), a read-only file system, no capabilities and a system
+call filter.
+
+```sh
+sudo install -m 0644 ovrelay-0.1.0-linux-x86_64/ovrelay.service /etc/systemd/system/ovrelay.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ovrelay
+systemctl status ovrelay
+journalctl -u ovrelay -f
+```
+
+To pass other flags, run `sudo systemctl edit ovrelay` and add:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/ovrelay --bind 0.0.0.0:4569 --max-per-ip 64
+```
+
+### Docker
+
+The image is built from this repository
+([`packaging/docker/Dockerfile`](../packaging/docker/Dockerfile)): a static
+binary on a distroless base that runs as a non-root user. From the
+repository root:
+
+```sh
+docker build -f packaging/docker/Dockerfile -t openview-relay .
+docker run -d --name ovrelay --restart unless-stopped -p 4569:4569 \
+  --read-only --cap-drop ALL --security-opt no-new-privileges openview-relay
+docker logs -f ovrelay
+```
+
+Or with Compose ([`packaging/docker/compose.yaml`](../packaging/docker/compose.yaml)),
+which sets the same restrictions:
+
+```sh
+docker compose -f packaging/docker/compose.yaml up -d --build
+```
+
+Arguments after the image name are passed to `ovrelay` (for example
+`--max-per-ip 64`). Change the listen address with the `OVRELAY_BIND`
+environment variable rather than `--bind`: the image's `HEALTHCHECK` runs
+`ovrelay --healthcheck`, which reads the same variable and sends
+`GET /health` to that port (on loopback when it is `0.0.0.0`). `docker ps`
+shows the result as `healthy` / `unhealthy`.
+
+### Check that it works
+
+```sh
+curl http://127.0.0.1:4569/health    # prints "ovrelay"
+ovrelay --healthcheck                # exit status 0 when the relay answers
+```
+
+Then point a host and a viewer at it: **Settings > Relay** in OpenView,
+`--relay relay.example.com` for `ovhost` / `ovview`, or the relay setting of
+the iOS app.
+
+### Firewall
+
+Allow inbound **TCP 4569**. One port carries raw relay clients, WebSocket
+clients and the health check. For example:
+
+```sh
+sudo ufw allow 4569/tcp
+# or
+sudo firewall-cmd --permanent --add-port=4569/tcp && sudo firewall-cmd --reload
+```
+
+Also open the port in your cloud provider's security group if there is one.
+The relay does not need UDP; the direct path between viewer and host does
+not go through it.
+
+### TLS (`wss://`) through a reverse proxy
+
+`ovrelay` does not terminate TLS itself. Raw TCP clients connect to port 4569
+directly; for `wss://` (networks that only allow HTTPS, the iOS app behind
+strict Wi-Fi) put a reverse proxy in front that forwards the WebSocket path
+`/relay` with the upgrade headers. With [Caddy](https://caddyserver.com/),
+which gets a certificate automatically, the whole `Caddyfile` is:
+
+```text
+relay.example.com {
+    reverse_proxy /relay 127.0.0.1:4569
+}
+```
+
+Clients then use `wss://relay.example.com/relay`. With nginx, forward
+`location /relay` to `http://127.0.0.1:4569` with `proxy_http_version 1.1`,
+`proxy_set_header Upgrade $http_upgrade`, `proxy_set_header Connection "upgrade"`
+and a long `proxy_read_timeout` (the relay pings WebSocket clients every
+15 s). If the proxy forwards a different path, add it with `--ws-path`.
+
+Through a proxy on the same machine every WebSocket client appears to come
+from 127.0.0.1. Loopback is exempt from the per-IP limit (`--max-per-ip`),
+so only the total limits apply to them. The relay never sees decrypted
+traffic, with or without TLS: sessions are end-to-end encrypted between
+viewer and host.

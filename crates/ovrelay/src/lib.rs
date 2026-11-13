@@ -10,9 +10,12 @@
 //! ```text
 //! initiator --CONNECT(sid, 0x00)--> relay <--CONNECT(sid, 0x01)-- responder
 //!      <--O--                       |                       -->O--
-//!      <--A sid--                   |                    --A sid--
+//!      <--A sid peer--              |               --A sid peer-->
 //!      <======== opaque frames =====>        (thread-per-side pipe)
 //! ```
+//!
+//! `A` also carries the *other* side's relay-observed IPv4 address and port
+//! (6 bytes, zero for IPv6 / WebSocket peers; see `attach_line`).
 //!
 //! Sessions wait at most `timeout` seconds for their peer; afterwards the
 //! pending client gets `b"XT" || sid` and is torn down. std only — one OS

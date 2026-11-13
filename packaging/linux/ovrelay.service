@@ -1,0 +1,57 @@
+# systemd unit for the OpenView relay.
+#
+#   sudo install -m 0755 ovrelay /usr/local/bin/ovrelay
+#   sudo install -m 0644 ovrelay.service /etc/systemd/system/ovrelay.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ovrelay
+#
+# The relay keeps no state on disk and logs to stderr (the journal:
+# `journalctl -u ovrelay`). Extra flags: `systemctl edit ovrelay` and
+# override ExecStart= (clear it with an empty `ExecStart=` line first).
+# See docs/INSTALL.md, "Run a relay on Linux/Docker".
+
+[Unit]
+Description=OpenView relay server
+Documentation=https://github.com/viceduong/openview/blob/main/docs/INSTALL.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ovrelay --bind 0.0.0.0:4569
+Restart=on-failure
+RestartSec=2s
+# One thread per client: leave room above --max-connections (default 1024).
+LimitNOFILE=8192
+TasksMax=4096
+
+# Sandboxing. Port 4569 is unprivileged, so no capabilities at all.
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

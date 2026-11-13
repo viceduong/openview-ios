@@ -45,11 +45,11 @@ Identity::generate() / from_master_seed(&[u8;32]) / master_seed()
 Identity::x() -> X25519 PublicKey
 Identity::fingerprint() -> [u8;16]          // SHA-256(ed_pub)[..16]
 Identity::fingerprint_pine() -> String       // hex in groups of 4 chars, e.g. "a1b2 c3d4 …"
-Identity::pairing_code() -> String           // 6 digits: BE u64 of fingerprint[0..8] mod 1_000_000 — public, NOT the attended credential
+Identity::short_code() -> String           // 6 digits: BE u64 of fingerprint[0..8] mod 1_000_000 — public, NOT the attended credential
 Identity::x25519_sig() -> [u8;64]            // Ed25519 signature over the X25519 public key
 Identity::to_blob() / from_blob(&[u8]) -> Option<PublicIdentity>
 Identity::save(path) / load(path)
-pub struct PublicIdentity { x25519_pk, ed_pub, pairing_code, sig }  // .verify(), .fingerprint()
+pub struct PublicIdentity { x25519_pk, ed_pub, short_code, sig }  // .verify(), .fingerprint()
 ```
 
 Secrets are wiped on drop (`SigningKey` and `StaticSecret` zeroize themselves; a `Drop` impl wipes the master seed). `Debug` prints only the fingerprint.
@@ -68,7 +68,7 @@ How the keys are derived:
 | 0 | 1 | version = `1` |
 | 1 | 32 | X25519 public key |
 | 33 | 32 | Ed25519 public key |
-| 65 | 6 | pairing code, ASCII digits |
+| 65 | 6 | fingerprint short code (`Identity::short_code`), ASCII digits |
 | 71 | 64 | Ed25519 signature over the X25519 key |
 
 **Seed file** (`save`/`load`): `b"OVID1" || master_seed(32)`. Parent directories are created; no permission bits are set.
@@ -313,13 +313,12 @@ All tests are unit tests inside `src/`.
 | `error.rs` | reject-code round trip, `String` conversions |
 | `crypto.rs`, `identity.rs`, `pin.rs`, `commands.rs`, `clocksync.rs`, `record.rs` | primitives, blob and code, PIN KDF, envelope (incl. lying lengths), offset maths, re-exports |
 
-The handshake also runs over real carriers in `crates/ovtransport/tests/handshake_over_udp.rs`, `punch_loopback.rs`, `crates/ovrelay/tests/relay_handshake.rs` and `crates/ovapp/tests/unattended_over_relay.rs` (PIN mode, right and wrong PIN). `handshake_over_udp.rs` also sends records reversed and duplicated over raw UDP (all accepted once, the duplicate counted as a replay).
+The handshake also runs over real carriers in `crates/ovtransport/tests/handshake_over_udp.rs`, `crates/ovrelay/tests/relay_handshake.rs` and `crates/ovapp/tests/unattended_over_relay.rs` (PIN mode, right and wrong PIN). `handshake_over_udp.rs` also sends records reversed and duplicated over raw UDP (all accepted once, the duplicate counted as a replay).
 
 ## 8. Known limitations
 
 1. **`AuthMode::MutualTls` is unimplemented.**
 2. **The handshake does not retransmit.** Callers must repeat the HELLO on lossy paths.
-3. **The record layer cannot tolerate loss or reordering** (§4.4).
+3. **The record layer does not recover loss.** Reordering within the 2048-record window is accepted, but a lost record stays lost; callers rely on ordered, complete carriers (§4.4).
 4. **Pairing-code rendezvous digits are public.** The four leading digits of a pairing code name the relay slot (§3.3a); someone who sees them can occupy that slot (denial of service) and make one 10^-6 online guess before the host burns the code.
 5. **`spake2` does not zeroize its internal state** (password scalar, ephemeral scalar). OpenView drops the state immediately after use and zeroizes its own copies (PAKE key, IKM, PRK, finished keys, session keys, PIN key in `Auth`).
-6. **Unused code.** `commands.rs`, `clocksync.rs`, and `framing::Recorder` are not used by any other crate.

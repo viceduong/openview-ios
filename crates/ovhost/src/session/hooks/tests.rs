@@ -11,7 +11,7 @@ use crate::input::Region;
 fn term_pair() -> (TerminalSession, TerminalSession) {
     let (id_a, id_b) = (Identity::generate(), Identity::generate());
     let (mut cc, mut sc) = InMemoryCarrier::pair();
-    let code = id_b.pairing_code();
+    let code = id_b.short_code();
     let mut client = Handshake::new(Role::Client, 0x11, &id_a, Auth::PairingCode(code.clone()));
     client.expect_fingerprint(id_b.fingerprint());
     client.expect_device(0x22);

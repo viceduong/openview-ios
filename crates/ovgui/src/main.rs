@@ -135,7 +135,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // Platform BEFORE the first window and before any thread that touches
     // the environment.
     platform::init(&platform::WindowSpec {
-        title: if env.dev {
+        // Screenshot mode shows the normal title (no test-mode marker).
+        title: if env.dev && env.screenshot.is_none() {
             "OpenView (test mode)".into()
         } else {
             APP_NAME.into()
@@ -176,13 +177,21 @@ fn main() -> Result<(), slint::PlatformError> {
     app.set_connections(ModelRc::from(conn_model.clone()));
     app.set_lan_hosts(ModelRc::from(lan_model.clone()));
     app.set_version(env!("CARGO_PKG_VERSION").into());
-    app.set_dev_mode(env.dev);
+    app.set_dev_mode(env.dev && env.screenshot.is_none());
     app.set_default_relay(
         env.dev_outgoing_relay
             .clone()
+            .filter(|_| env.screenshot.is_none())
             .unwrap_or_else(|| "relay.example.com:4569".to_owned())
             .into(),
     );
+    if let Some(shot) = env.screenshot {
+        app.set_page(match shot.page {
+            env::ShotPage::Remote => generated::Page::Remote,
+            env::ShotPage::Settings => generated::Page::Settings,
+            env::ShotPage::About => generated::Page::About,
+        });
+    }
 
     let host = Host::new(env.clone());
     let st = Rc::new(RefCell::new(State {
@@ -206,7 +215,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let mut s = st.borrow_mut();
         load_settings_into_ui(&s, &ui);
-        apply_theme(&ui);
+        apply_theme(&s, &ui);
         let args = host_args(&s);
         let paused = s.settings.paused;
         s.host.boot(args, paused);
@@ -289,7 +298,7 @@ fn drain() {
             Event::TakeOverDone { err } => s.host.on_take_over_done(err),
             Event::Viewer { seq, out } => on_viewer(&mut s, &ui, seq, out),
             Event::Tray(cmd) => on_tray(&mut s, &ui, cmd),
-            Event::ThemeChanged => apply_theme(&ui),
+            Event::ThemeChanged => apply_theme(&s, &ui),
             Event::Shown => ui.window().request_redraw(),
             Event::ToastExpired(seq) => {
                 if seq == s.toast_seq {

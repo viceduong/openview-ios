@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
 description = "OpenView application layer: the command channel, screen / video / audio codecs, file transfer and chat over the AEAD record layer"
 
 [features]

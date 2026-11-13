@@ -1658,7 +1658,7 @@ mod tests {
             Role::Client,
             1,
             &client_id,
-            Auth::PairingCode(server_id.pairing_code()),
+            Auth::PairingCode(server_id.short_code()),
         );
         let mut server = Handshake::new(
             Role::Server,

@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
 description = "OpenView host: makes this PC reachable through a relay (and a direct UDP path) and streams its screen"
 
 [dependencies]

@@ -1,4 +1,4 @@
-# OpenView iOS app (RemoteView)
+# OpenView iOS app
 
 The OpenView iOS app is a viewer-only SwiftUI client. It controls a remote
 desktop running the OpenView host (`ovhost`). Every protocol detail lives in
@@ -11,13 +11,13 @@ and documented in
 - turns touch, pointer and keyboard input into wire commands,
 - provides the UI.
 
-Sources live in `ios/RemoteView/RemoteView/`, grouped in folders. All
+Sources live in `ios/OpenView/OpenView/`, grouped in folders. All
 paths below are relative to that folder unless noted.
 
 | | |
 |---|---|
-| Targets | `OpenView` (app) and `RemoteViewTests` (unit tests), XcodeGen spec `ios/RemoteView/project.yml` |
-| Bundle id | `$(OV_BUNDLE_ID_PREFIX).remoteview`, prefix `org.openview` by default (`ios/RemoteView/Config/Base.xcconfig`) |
+| Targets | `OpenView` (app) and `OpenViewTests` (unit tests), XcodeGen spec `ios/OpenView/project.yml` |
+| Bundle id | `$(OV_BUNDLE_ID_PREFIX).openview`, prefix `org.openview` by default (`ios/OpenView/Config/Base.xcconfig`) |
 | Deployment target | iOS **15.6**, iPhone and iPad (`TARGETED_DEVICE_FAMILY 1,2`); device arm64, simulator arm64 + x86_64 |
 | Swift | 5.9 |
 | Rust link | `ios/build/OvFFI.xcframework` (static library + `shim.h` + module map, built by `ios/build_ios.sh`); Swift uses `import OvFFI` |
@@ -35,6 +35,7 @@ paths below are relative to that folder unless noted.
 | `AppModel.swift` | `AppModel`: the single active session, full-screen presentation, remember-on-connect (save device, TOFU pin, Keychain PIN), the "no relay configured" check |
 | `HomeView.swift` | Home screen, `PinPromptView`, `PairView`, `ConnectionEditView`, `ReconnectCard`, rows, empty state |
 | `RelaySetupView.swift` | First-run "Relay server" sheet |
+| `ScreenshotMode.swift` | Debug-only `-OVScreenshotMode` launch mode for `scripts/ios_screenshots.sh`: in-memory demo devices, no relay sheet / app lock / LAN browse; `-OVScreenshotSettings` opens Settings |
 | `Info.plist`, `PrivacyInfo.xcprivacy`, `Assets.xcassets` | Bundle metadata, privacy manifest, icon and accent colour |
 | **Session/** | |
 | `SessionController.swift` | Session engine: published state, phases and reconnects, app lifecycle; the threading model is documented at the top |
@@ -83,7 +84,7 @@ paths below are relative to that folder unless noted.
 | `DiagLog.swift` | Persistent diagnostics log, `HangMonitor`, `Breadcrumb` (debug builds) |
 
 Outside the sources: `ios/OvFFI/include/` (C header + module map),
-`ios/RemoteView/Config/` (xcconfig), `ios/RemoteView/RemoteViewTests/`.
+`ios/OpenView/Config/` (xcconfig), `ios/OpenView/OpenViewTests/`.
 
 ---
 
@@ -645,7 +646,7 @@ bound with `@AppStorage` in `SettingsView`.
 | Security | Require Face ID to open (`ov.appLock`) | off |
 | | Require Face ID for saved PINs (`ov.pinBiometric`) | off |
 | Appearance | System / Light / Dark (`ov.appearance`) | system |
-| About | This device's pairing code and fingerprint, Last session log, Share diagnostic logs | — |
+| About | This device's short code and fingerprint, Last session log, Share diagnostic logs | — |
 
 Other persisted UI state:
 
@@ -707,7 +708,7 @@ Other persisted UI state:
 ## 10. Info.plist and capabilities
 
 The properties come from `project.yml` (`targets.OpenView.info.properties`).
-XcodeGen writes them to `RemoteView/App/Info.plist`.
+XcodeGen writes them to `OpenView/App/Info.plist`.
 
 | Key | Purpose |
 |---|---|
@@ -758,7 +759,7 @@ The script:
 3. Creates `ios/build/OvFFI.xcframework` with `xcodebuild -create-xcframework`
    (device + simulator libraries, each with `ios/OvFFI/include`: `shim.h` and
    the `OvFFI` module map).
-4. Runs `xcodegen generate` in `ios/RemoteView`.
+4. Runs `xcodegen generate` in `ios/OpenView`.
 5. Builds with a fixed derived-data folder (`ios/build/DerivedData`).
 
 ```bash
@@ -776,9 +777,27 @@ ios/build_ios.sh --xcframework  # only the XCFramework
   `org.openview`) and `OV_DEFAULT_RELAY_URL`; an optional, git-ignored
   `Config/Local.xcconfig` overrides them (and sets `DEVELOPMENT_TEAM`).
 
+### Screenshots (`scripts/ios_screenshots.sh`)
+
+On a Mac, `scripts/ios_screenshots.sh` writes `docs/images/ios-home.png`,
+`ios-settings.png` and `ios-home-dark.png`. It builds the XCFramework
+(`build_ios.sh --xcframework`; `--skip-rust` reuses an existing one), runs
+XcodeGen, builds **Debug** for the simulator into
+`ios/build/ScreenshotsDerivedData`, picks an available iPhone simulator
+(`--device NAME`, default "iPhone 15"), boots it, overrides the status bar
+(9:41, full battery), and launches the app with `-OVScreenshotMode`
+(plus `-OVScreenshotSettings` for the Settings shot).
+
+Screenshot mode (`App/ScreenshotMode.swift`) is compiled into Debug builds
+only. It shows demo devices from an in-memory `ConnectionStore` and a demo
+relay from the in-memory registration / argument domains of
+`UserDefaults`, so the real saved devices and settings are never read for
+display or overwritten. It skips the first-run relay sheet, the app lock,
+auto-connect and the Bonjour browse.
+
 ### Tests
 
-- `RemoteViewTests` (XCTest) covers pure logic: relay address parsing
+- `OpenViewTests` (XCTest) covers pure logic: relay address parsing
   (`RelayAddress`), direct-path candidate parsing and LAN classification
   (`DirectPathSet.parse` / `classify`), the zoom math (`ViewportMath`) and
   the hosts' TXT records (`LanTxtRecord`).
@@ -789,11 +808,11 @@ ios/build_ios.sh --xcframework  # only the XCFramework
 
 ---
 
-## 12. Known limitations and loose ends
+## 12. Limitations
 
-These are observed in code, as of this writing.
+Open items are also tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-**Unreachable UI**
+**Features without UI yet**
 
 - Chat UI is unreachable (§8).
 - Implemented but not reachable from any UI:
@@ -807,7 +826,7 @@ These are observed in code, as of this writing.
 **Client-only app**
 
 - The app never acts as a host (the pairing sheet therefore no longer
-  shows "Your pairing code"). Settings' "This device's pairing code" and
+  shows "Your pairing code"). Settings' "This device's short code" and
   fingerprint come from a throwaway per-launch identity
   (`PairingStateBox`, `ov_identity_create`). Each session generates its own
   identity in `ov_session_create`. The code shown is therefore not usable

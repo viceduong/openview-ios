@@ -100,7 +100,7 @@ fn session_pair() -> (TerminalSession, TerminalSession) {
     use ovtransport::{Carrier, InMemoryCarrier};
     let (id_v, id_h) = (Identity::generate(), Identity::generate());
     let (mut vc, mut hc) = InMemoryCarrier::pair();
-    let code = id_h.pairing_code();
+    let code = id_h.short_code();
     let mut client = Handshake::new(Role::Client, 0x11, &id_v, Auth::PairingCode(code.clone()));
     client.expect_fingerprint(id_h.fingerprint());
     let mut server = Handshake::new(Role::Server, 0x22, &id_h, Auth::PairingCode(code));

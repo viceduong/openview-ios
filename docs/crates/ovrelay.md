@@ -127,7 +127,11 @@ Closing a slot means: a WebSocket CLOSE (status 1000) if it is a WebSocket clien
 ```
 ovrelay [--bind HOST:PORT] [--timeout SECS] [--max-connections N] [--max-per-ip N]
         [--max-pending N] [--ws-path PATH]... [-v|-vv] [--log-level FILTER]
-  --bind HOST:PORT        listen address (default 0.0.0.0:4569, the clients' default)
+ovrelay --healthcheck [--bind HOST:PORT]
+  --bind HOST:PORT        listen address (default 0.0.0.0:4569, the clients' default;
+                          env OVRELAY_BIND)
+  --healthcheck           do not serve: GET /health on --bind (0.0.0.0 / :: probed
+                          on loopback), exit 0 on 200 OK, 1 otherwise (5 s timeouts)
   --timeout SECS          seconds an unmatched session waits (default 30)
   --max-connections N     simultaneous client connections (default 1024)
   --max-per-ip N          simultaneous connections per source IP, loopback exempt (default 32)
@@ -157,6 +161,8 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 ## 7. Deployment notes
 
 - **Port.** The binary and every client default to **4569**.
+- **Linux / Docker.** The relay and its dependencies are pure Rust and build as a static musl binary; it writes nothing to disk (logs go to stderr), so it runs unchanged under systemd `DynamicUser=` / `ProtectSystem=strict` and in a read-only container. A Dockerfile, a Compose file and a hardened systemd unit live in `packaging/docker/` and `packaging/linux/`; see [INSTALL.md](../INSTALL.md#run-a-relay-on-linuxdocker).
+- **Health check.** `GET /health` (or `GET /`) answers `200 OK` / `ovrelay` and closes, without touching the session table. `ovrelay --healthcheck` is the probe for images without `curl` (the Docker `HEALTHCHECK`); it reads `OVRELAY_BIND` like the server, so set the port there rather than with `--bind`.
 - **Firewall.** A single TCP port serves raw relay clients, WebSocket clients, and HTTP health checks. Put an HTTP-only front such as a Cloudflare tunnel in front of it for `wss://host/relay`. WebSocket peers then get no punch address, because the relay sees the proxy's socket address.
 - **Limits behind a proxy.** Loopback peers are exempt from the per-IP cap because a local reverse proxy / tunnel makes every client appear as 127.0.0.1; the total and pending caps still apply. If the proxy runs on another host, raise `--max-per-ip` accordingly.
 - **Threads.** Expect one thread per connected client while it is parked or pairing, two pipe threads per active session, and one pinger thread for sessions with a WebSocket side. `--max-connections` bounds them.
@@ -176,7 +182,7 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 |---|---|
 | `src/lib.rs` (unit) | `connect_line_roundtrip`; `reject_line_layout`; `frame_cursor_*` (every split point; DISCONNECT and bad frames); `connection_caps_total_and_per_ip_with_loopback_exempt`; `deadline_reader_stops_dribbling_clients`; `parser_entry_points_survive_noise` (3000 random inputs through the WebSocket deframer, frame cursor and CONNECT parser) |
 | `src/ws.rs` (unit) | deframing of masked messages incl. PING and CLOSE; unmasked / oversized frames rejected; the HTTP head deadline. The codec's own tests (accept key, SHA-1, length encodings, unmasking) live in `crates/ovtransport/src/ws.rs` |
-| `src/main.rs` (unit) | clap defaults and flags; `Command::debug_assert` |
+| `src/main.rs` (unit) | clap defaults and flags; `Command::debug_assert`; `--healthcheck` target (unspecified bind → loopback) and probe against a live relay, a closed port and a non-200 server |
 | `tests/relay_handshake.rs` | full `ovcore` pairing-code handshake plus AEAD records both ways through a live relay; an unmatched CONNECT times out; PING/PONG round trip |
 | `tests/relay_robustness.rs` | DISCONNECT relaying, abrupt close, re-park during an active session, park timeout never kills an active session, unmatched park gets `XT`, oversized WebSocket frame |
 | `crates/ovtransport/tests/ws_relay.rs` | WebSocket viewer ↔ TCP host pairing and data both ways, health check, raw TCP pairing with address learning, `#[ignore]` keepalive soak |
@@ -187,4 +193,3 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 
 1. **CONNECT is unauthenticated** and session IDs are low-entropy rendezvous names (a pairing code's four public digits, or the low 32 bits of the device ID). Someone who guesses an ID can park on it first (denial of service only; the handshake protects the session). Widening the ID to 64 bits was deferred — it changes every client and adds no secrecy (see WIRE_PROTOCOL §2.1).
 2. **A same-role duplicate CONNECT** is rejected after `'O'` (the capacity check now runs before `'O'`, the role check cannot without racing the pairing peer's `A` line).
-3. **Stale diagram.** The module-doc diagram in `src/lib.rs` shows the `A` line as `A sid` only; it also carries 6 address bytes (`attach_line`). See [../WIRE_PROTOCOL.md](../WIRE_PROTOCOL.md) §2.3.

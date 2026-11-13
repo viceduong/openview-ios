@@ -6,6 +6,8 @@ struct OpenViewApp: App {
     @StateObject private var app = AppModel()
 
     init() {
+        // Screenshot mode (Debug, -OVScreenshotMode): in-memory demo relay.
+        ScreenshotMode.registerDefaults()
         // Diagnostics: persistent log, network / lifecycle events, hang
         // monitor (see DiagLog.swift).
         DiagLog.shared.start()
@@ -27,7 +29,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(SettingsKey.appearance) private var appearance = "system"
     @AppStorage(SettingsKey.appLock) private var appLock = false
-    @State private var locked = UserDefaults.standard.bool(forKey: SettingsKey.appLock)
+    @State private var locked = !ScreenshotMode.isActive && UserDefaults.standard.bool(forKey: SettingsKey.appLock)
 
     var body: some View {
         ZStack {

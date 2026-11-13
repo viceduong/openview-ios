@@ -13,7 +13,7 @@ import os
 /// - developer detail (socket events, retries, power state, ...) goes to
 ///   these loggers at `.debug` level and nowhere else.
 enum Log {
-    static let subsystem = Bundle.main.bundleIdentifier ?? "org.openview.remoteview"
+    static let subsystem = Bundle.main.bundleIdentifier ?? "org.openview.openview"
 
     /// Session lifecycle and user-visible events.
     static let session = Logger(subsystem: subsystem, category: "session")

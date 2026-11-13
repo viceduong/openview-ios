@@ -27,7 +27,7 @@ fn sessions() -> (TerminalSession, TerminalSession) {
     let mut vc = UdpP2pCarrier::from_socket(a, ba);
     let mut hc = UdpP2pCarrier::from_socket(b, aa);
     let (vid, hid) = (Identity::generate(), Identity::generate());
-    let code = hid.pairing_code();
+    let code = hid.short_code();
     let mut v = Handshake::new(Role::Client, 0x11, &vid, Auth::PairingCode(code.clone()));
     v.expect_fingerprint(hid.fingerprint());
     let mut h = Handshake::new(Role::Server, 0x22, &hid, Auth::PairingCode(code));

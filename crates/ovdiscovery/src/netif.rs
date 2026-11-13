@@ -222,7 +222,9 @@ mod win {
         if p.is_null() {
             String::new()
         } else {
-            p.to_string().unwrap_or_default()
+            // SAFETY: `p` is non-null and, per this function's contract, a
+            // live NUL-terminated UTF-16 string.
+            unsafe { p.to_string() }.unwrap_or_default()
         }
     }
 }

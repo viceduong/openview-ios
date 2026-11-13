@@ -1,0 +1,11 @@
+# Build context for packaging/docker/Dockerfile (the repository root).
+# The image only needs Cargo.toml, Cargo.lock, crates/ and LICENSE.
+.git
+target/
+**/target/
+dist/
+ios/
+docs/images/
+fuzz/
+*.ovrec
+*.log

@@ -3,7 +3,7 @@
 //! Lossless dirty tiles ([`crate::tiles`]) stay the default. When a large
 //! region keeps changing (video, fast scrolling, games) the host's
 //! [`MotionDetector`] switches that **region** to H.264: the tile encoder
-//! masks it out (`crate::sendq::UpdateEncoder::submit_masked`) and a
+//! masks it out (`crate::sendq::UpdateEncoder::submit_ex`) and a
 //! [`VideoSession`] streams it as `VIDEO_BEGIN` access units composited over
 //! the viewer's tile framebuffer. Once the region has been still for
 //! [`MotionConfig::exit_after`] the host sends a `VIDEO_END` marker followed

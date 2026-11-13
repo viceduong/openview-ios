@@ -198,4 +198,4 @@ End to end: `crates/ovhost` `lan_viewer_resolves_by_mdns_and_completes_the_pin_h
 3. **Interface filtering is heuristic** (§3.1). A LAN without a default gateway that runs on a Hyper-V / VirtualBox / VMware adapter is skipped.
 4. **`stun::query` leaves the socket non-blocking** and swallows unrelated datagrams while it runs.
 5. **UPnP picks the interface by guessing.** It uses the route toward `8.8.8.8`, plus a unicast M-SEARCH to `x.y.z.1`, and handles IPv4 IGDs only.
-6. **`detect_symmetric` is not wired** into connection setup.
+6. **`detect_symmetric` is not wired** into connection setup yet.

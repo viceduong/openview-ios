@@ -42,7 +42,6 @@ pub mod cc;
 pub mod direct;
 mod inmem;
 pub mod media;
-mod punch;
 mod relay;
 pub mod rudp;
 mod tcp;
@@ -53,7 +52,6 @@ pub mod ws;
 pub use carrier::{Carrier, CarrierStats, RawSock, TransportError};
 pub use direct::{DirectCarrier, DirectSockets, DirectState};
 pub use inmem::InMemoryCarrier;
-pub use punch::{HolePunch, DEFAULT_PUNCH_COUNT, DEFAULT_PUNCH_INTERVAL, DEMOTE_AFTER, PUNCH_BYTE};
 #[cfg(feature = "ws-client")]
 pub use relay::WsEndpoint;
 pub use relay::{BridgeWriter, ReadWake, RelayTunnelCarrier, TunnelRole};

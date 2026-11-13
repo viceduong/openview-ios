@@ -40,10 +40,11 @@ pub struct VideoStats {
 /// [`FrameMailbox`] video FIFO.
 ///
 /// Per capture the host calls, in order:
-/// 1. `UpdateEncoder::submit_masked(.., mask = active_rect(), ..)`,
+/// 1. `UpdateEncoder::submit_ex` with `active_rect()` as the mask,
 /// 2. [`on_capture`](Self::on_capture) with the encoder's fresh-tile map,
-/// 3. when [`take_refresh`](Self::take_refresh) yields a rect, `submit_masked`
-///    again with it as the forced refresh (lossless, after `VIDEO_END`).
+/// 3. when [`take_refresh`](Self::take_refresh) yields a rect, hand it to
+///    `UpdateEncoder::queue_refresh` (a lossless backlog ordered after
+///    `VIDEO_END`, drained by the following submits).
 pub struct VideoSession {
     detector: MotionDetector,
     pub(super) factory: EncoderFactory,

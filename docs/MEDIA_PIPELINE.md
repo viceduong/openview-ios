@@ -528,17 +528,8 @@ The byte-level tables are in [`crates/ovapp.md` §3.3 and §4.3](crates/ovapp.md
 
 ---
 
-## 10. Known gaps and inconsistencies (as of this reading)
+## 10. Limitations
 
-- `candidate_kind` never yields `CAND_UPNP`, although the constant exists and
-  is documented.
-- Stale doc comments:
-  - the `OpCode::FrameBegin` comment in `terminal/command.rs` (old 25-byte
-    layout).
-  - `pacing::RATE_WINDOW` ("max-filter"; the code uses the median).
-  - `scroll::MIN_ROWS` ("tile rows"; actually pixels).
-  - `VideoSession` usage step 3.
-  - `OPUS_FEC_LOSS_PERC` ("records travel reliably today").
-  - `VideoRx::synced` ("waiting for a keyframe" describes `!synced`).
-- The clipboard spec says kind 0 is non-empty text, but the code uses empty
-  text as "clear".
+- `candidate_kind` never yields `CAND_UPNP`: UPnP-mapped candidates are
+  reported as STUN candidates (KNOWN_ISSUES BUG-9).
+- Recordings (`.ovrec`) store video frames only, no audio.

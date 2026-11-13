@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use slint::{ComponentHandle, SharedString};
 
+use crate::env::{DEMO_DEVICE_ID, DEMO_RELAY};
 use crate::events::{post, Event};
 use crate::generated::{App, Connection as UiConnection, HostStatus, MainWindow};
 use crate::host::{HostArgs, Phase};
@@ -62,13 +63,18 @@ pub(crate) fn load_settings_into_ui(s: &State, ui: &MainWindow) {
     a.set_fps_mode(st.fps.index());
     a.set_direct(st.direct);
     a.set_upnp(st.upnp);
-    a.set_relay_address(st.relay_address.clone().into());
+    if s.env.screenshot.is_some() {
+        a.set_relay_address(DEMO_RELAY.into());
+    } else {
+        a.set_relay_address(st.relay_address.clone().into());
+    }
     a.set_run_relay(st.run_relay);
     a.set_start_at_login(start_at_login_enabled(s));
 }
 
-pub(crate) fn apply_theme(ui: &MainWindow) {
-    let dark = win::system_dark_mode();
+pub(crate) fn apply_theme(s: &State, ui: &MainWindow) {
+    let forced = s.env.screenshot.and_then(|shot| shot.dark);
+    let dark = forced.unwrap_or_else(win::system_dark_mode);
     ui.global::<App>().set_dark_mode(dark);
     shell::set_dark_title(dark);
 }
@@ -112,6 +118,9 @@ pub(crate) fn refresh_connections(s: &State, ui: &MainWindow) {
 }
 
 fn direct_detail(s: &State) -> String {
+    if s.env.screenshot.is_some() {
+        return format!("Relay {DEMO_RELAY} · direct UDP 4570");
+    }
     let relay = s.host.relay().unwrap_or("?");
     if s.env.dev {
         return format!("Test mode · relay {relay} · input is simulated");
@@ -142,7 +151,11 @@ pub(crate) fn sync_ui(s: &mut State, ui: &MainWindow) {
         }
     }
     let a = ui.global::<App>();
-    let id = s.settings.last_device_id.clone();
+    let id = if s.env.screenshot.is_some() {
+        DEMO_DEVICE_ID.to_owned()
+    } else {
+        s.settings.last_device_id.clone()
+    };
     a.set_my_id(util::group_id(&id).into());
     a.set_pin(s.pin.clone().into());
     let (status, text, detail, busy) = match &s.host.phase {
@@ -206,7 +219,11 @@ pub(crate) fn sync_ui(s: &mut State, ui: &MainWindow) {
     a.set_status_detail(detail.into());
     a.set_busy(busy);
     a.set_session_active(s.host.session_active());
-    let relay = outgoing_relay(s);
+    let relay = if s.env.screenshot.is_some() {
+        Some(DEMO_RELAY.to_owned())
+    } else {
+        outgoing_relay(s)
+    };
     a.set_relay_missing(relay.is_none());
     a.set_outgoing_relay(relay.unwrap_or_default().into());
     a.set_settings_note(if s.host.restart_pending() {

@@ -6,18 +6,17 @@ Screenshots used by the README and the docs.
 |---|---|
 | `remote-control-dark.png` | `OpenView.exe` Remote Control page, dark theme (test mode, throwaway test ID) |
 
-Wanted (add them as PNG, about 1000-1300 px wide):
+Pending (reference them from the README once they exist):
 
-- `remote-control-light.png`: the same page in the light theme
-- `settings.png`: Settings page with the Relay card
-- `viewer.png`: an `ovview` session window with the HUD (F3)
-- `ios-home.png`, `ios-session.png`: the iOS app's device list and a session
+| File | How to produce it |
+|---|---|
+| `remote-control-light.png`, `settings.png`, `lan-discovery.png` | Windows app in screenshot mode: `OPENVIEW_DEV_PORTS=<port>` plus `OPENVIEW_SCREENSHOT=1` (`OPENVIEW_SCREENSHOT_PAGE=remote\|settings\|about`, `OPENVIEW_SCREENSHOT_THEME=light\|dark`); a scratch host named `DEMO-PC` populates *Computers on this network* |
+| `viewer.png` | `ovview` connected to a scratch host with a synthetic screen |
+| `ios-home.png`, `ios-home-dark.png`, `ios-settings.png` | `scripts/ios_screenshots.sh` on macOS (or the manual `screenshots` job of the iOS workflow) |
 
 Rules for screenshots:
 
-- Take them in **test mode** (`OPENVIEW_DEV_PORTS=<port>`, with
-  `LOCALAPPDATA` pointed at an empty folder for a fresh test identity) or on
-  a throwaway machine.
-- No real device IDs, PINs (keep the PIN masked), IP addresses, host names,
-  relay URLs, user names or personal desktop content.
-- Crop to the window; no other applications in the frame.
+- Take them in **test / screenshot mode** or on a throwaway machine.
+- No real device IDs, PINs, IP addresses, host names, relay URLs, user
+  names or personal desktop content.
+- Crop to the window, PNG, under 400 KB each.

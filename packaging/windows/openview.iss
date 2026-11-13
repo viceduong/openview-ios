@@ -34,7 +34,7 @@
 #define AppName "OpenView"
 #define AppExe "OpenView.exe"
 #define AppPublisher "OpenView contributors"
-#define AppUrl "https://github.com/OWNER/openview"
+#define AppUrl "https://github.com/viceduong/openview"
 #define RunKey "Software\Microsoft\Windows\CurrentVersion\Run"
 #define RunValue "OpenView"
 

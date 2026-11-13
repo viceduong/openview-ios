@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use ovdiscovery::mdns::{Browser, DiscoveredHost};
 use slint::{ComponentHandle, Model, SharedString};
 
+use crate::env::DEMO_LAN_PREFIX;
 use crate::generated::{App, LanHost as UiLanHost, MainWindow};
 use crate::{log, shell, util, State};
 
@@ -75,10 +76,13 @@ pub(crate) fn tick(s: &mut State, ui: &MainWindow) {
     ui.global::<App>().set_lan_browsing(s.lan.browser.is_some());
     let Some(b) = &s.lan.browser else { return };
     let own: Option<u64> = s.settings.last_device_id.parse().ok();
+    // Screenshot mode lists only the demo host (never a real machine).
+    let shot = s.env.screenshot.is_some();
     let hosts: Vec<DiscoveredHost> = b
         .hosts()
         .into_iter()
         .filter(|h| Some(h.device_id) != own)
+        .filter(|h| !shot || h.name.starts_with(DEMO_LAN_PREFIX))
         .collect();
     let same = hosts.len() == s.lan.hosts.len()
         && hosts.iter().zip(&s.lan.hosts).all(|(a, b)| {

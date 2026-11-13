@@ -340,9 +340,10 @@ final class OvSessionBox {
         return String(cString: buf)
     }
 
-    static func pairingCode(of identity: OpaquePointer) -> String {
+    /// Short code derived from the identity fingerprint (shown in Settings).
+    static func shortCode(of identity: OpaquePointer) -> String {
         var buf = [CChar](repeating: 0, count: 16)
-        guard ov_identity_pairing_code(identity, &buf, buf.count) >= 0 else { return "?" }
+        guard ov_identity_short_code(identity, &buf, buf.count) >= 0 else { return "?" }
         return String(cString: buf)
     }
 

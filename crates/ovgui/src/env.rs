@@ -18,6 +18,14 @@
 //! credentials, the Run key and the single-instance lock use a `-dev`
 //! namespace, and no process started outside this instance is ever adopted
 //! or stopped.
+//!
+//! **Screenshot mode** (`OPENVIEW_SCREENSHOT=1`, honoured only on top of test
+//! mode) renders neutral demo values for documentation screenshots: no
+//! "TEST MODE" badge or test-mode status text, the device id
+//! [`DEMO_DEVICE_ID`], the relay [`DEMO_RELAY`], and only LAN hosts named
+//! `DEMO-…`. `OPENVIEW_SCREENSHOT_PAGE=remote|settings|about` picks the
+//! start page and `OPENVIEW_SCREENSHOT_THEME=light|dark` forces the theme.
+//! Without `OPENVIEW_DEV_PORTS` these variables are ignored.
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +39,58 @@ pub const PROD_RELAY_PORT: u16 = 4569;
 pub const HOST_EXE: &str = "ovhost.exe";
 pub const RELAY_EXE: &str = "ovrelay.exe";
 pub const VIEWER_EXE: &str = "ovview.exe";
+
+/// Screenshot mode: the device id shown instead of the real one (digits).
+pub const DEMO_DEVICE_ID: &str = "123456789012";
+/// Screenshot mode: the relay shown instead of the real / test one.
+pub const DEMO_RELAY: &str = "wss://relay.example.com/relay";
+/// Screenshot mode: only LAN hosts whose name starts with this are listed
+/// (start the demo host with `COMPUTERNAME=DEMO-PC`).
+pub const DEMO_LAN_PREFIX: &str = "DEMO-";
+
+/// Page shown first in screenshot mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShotPage {
+    #[default]
+    Remote,
+    Settings,
+    About,
+}
+
+/// Screenshot mode options (see the module docs). Development only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Screenshot {
+    /// Page shown first.
+    pub page: ShotPage,
+    /// `Some(dark)` forces the theme; `None` follows Windows.
+    pub dark: Option<bool>,
+}
+
+impl Screenshot {
+    /// `Some` when `OPENVIEW_SCREENSHOT=1`. Called only in test mode.
+    fn detect() -> Option<Self> {
+        let var = |k: &str| {
+            std::env::var(k)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        };
+        if var("OPENVIEW_SCREENSHOT") != "1" {
+            return None;
+        }
+        let page = match var("OPENVIEW_SCREENSHOT_PAGE").as_str() {
+            "settings" => ShotPage::Settings,
+            "about" => ShotPage::About,
+            _ => ShotPage::Remote,
+        };
+        let dark = match var("OPENVIEW_SCREENSHOT_THEME").as_str() {
+            "dark" => Some(true),
+            "light" => Some(false),
+            _ => None,
+        };
+        Some(Self { page, dark })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -53,6 +113,8 @@ pub struct Env {
     pub bin_dir: PathBuf,
     /// Started by the Run key (`--minimized`): start hidden in the tray.
     pub minimized: bool,
+    /// Screenshot mode (test mode only, see the module docs).
+    pub screenshot: Option<Screenshot>,
 }
 
 impl Env {
@@ -79,6 +141,7 @@ impl Env {
                 run_key: r"Software\OpenView-dev\Run",
                 bin_dir,
                 minimized,
+                screenshot: Screenshot::detect(),
             },
             None => Self {
                 dev: false,
@@ -90,6 +153,7 @@ impl Env {
                 run_key: r"Software\Microsoft\Windows\CurrentVersion\Run",
                 bin_dir,
                 minimized,
+                screenshot: None,
             },
         }
     }

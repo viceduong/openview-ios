@@ -3,9 +3,9 @@
 //! in-memory. Both ends dial the relay; the host listens under its **stable
 //! device id** (relay session id = device id's low 32 bits) with a PIN, the
 //! viewer dials by that device id + the same PIN. On a PIN match the
-//! handshake completes with no pre-shared public keys and terminal traffic
-//! flows; on a PIN mismatch the server rejects with an explicit
-//! `PIN proof mismatch` and the client never establishes.
+//! SPAKE2 handshake completes with no pre-shared public keys and terminal
+//! traffic flows; on a PIN mismatch key confirmation fails, the server
+//! rejects (`AuthFailed`) and the client never establishes.
 
 use std::time::{Duration, Instant};
 

@@ -119,7 +119,7 @@ OvIdentity *ov_identity_create(void);
 void ov_identity_free(OvIdentity *id);
 int32_t ov_identity_fingerprint(const OvIdentity *id, uint8_t *out /*16*/);
 int32_t ov_identity_fingerprint_pine(const OvIdentity *id, char *out, size_t cap);
-int32_t ov_identity_pairing_code(const OvIdentity *id, char *out, size_t cap);
+int32_t ov_identity_short_code(const OvIdentity *id, char *out, size_t cap);
 
 // session
 OvSession *ov_session_create(int32_t is_server, const char *pairing_code);

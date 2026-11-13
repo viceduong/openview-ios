@@ -48,17 +48,21 @@ always hands the PIN over this way).
 
 ### `ovrelay`
 
-`ovrelay [--bind HOST:PORT] [--timeout SECS] [--max-connections N] [--max-per-ip N] [--max-pending N] [-v|-vv] [--log-level FILTER]`
+`ovrelay [--bind HOST:PORT] [--timeout SECS] [--max-connections N] [--max-per-ip N] [--max-pending N] [--ws-path PATH]... [-v|-vv] [--log-level FILTER]`
+
+`ovrelay --healthcheck [--bind HOST:PORT]`
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--bind HOST:PORT` | `0.0.0.0:4569` | Listen address (TCP). The same port also accepts WebSocket upgrades at `GET /relay`, plus plain HTTP requests (health checks, answered and closed). |
+| `--bind HOST:PORT` / env `OVRELAY_BIND` | `0.0.0.0:4569` | Listen address (TCP). The same port also accepts WebSocket upgrades at `GET /relay`, plus plain HTTP requests (`GET /health` answers `200 OK`, then closes). |
 | `--timeout SECS` | `30` | How long an unmatched (parked) session waits before the relay sends `XT` |
 | `--max-connections N` | `1024` | Simultaneous client connections; more are closed at accept |
 | `--max-per-ip N` | `32` | Simultaneous connections from one IP (loopback — a local reverse proxy or tunnel — is exempt) |
 | `--max-pending N` | `512` | Parked (unpaired) sessions; a CONNECT beyond it gets `XT` |
+| `--ws-path PATH` (repeatable) | `/relay` | Request paths that accept WebSocket upgrades (e.g. `--ws-path /` for a proxy that forwards the root); other paths get `404` |
 | `-v`, `-vv` | | Debug / trace logging |
 | `--log-level FILTER` | | `tracing` filter (e.g. `debug`, `info,ovrelay=trace`); overrides `-v` and `OPENVIEW_LOG` |
+| `--healthcheck` | | Do not serve: probe `GET /health` on the relay at `--bind` (loopback for `0.0.0.0`) and exit 0 when it answers `200 OK`, 1 otherwise. Used by the Docker image's `HEALTHCHECK`. |
 | `--help`, `-h` / `--version`, `-V` | | Print usage / version |
 
 Logs go to stderr. At the default `info` level the relay prints its listen

@@ -114,7 +114,7 @@ pub(crate) fn play(path: &Path, loop_forever: bool) -> Result<(), String> {
     }
     let pacing = ovapp::image::frame_pacing(&frames);
     info!(
-        "playing {} ({} frames, {:.1} s) — Escape or Ctrl-C stops",
+        "playing {} ({} frames, {:.1} s) — close the window or press Ctrl-C to stop",
         path.display(),
         frames.len(),
         summary.total_duration_ms as f64 / 1000.0,

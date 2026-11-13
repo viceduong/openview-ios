@@ -51,7 +51,7 @@ fn file_transfer_over_relay_both_directions() {
     let client_id = Identity::generate();
     let server_id = Identity::generate();
     let (dev_c, dev_s) = (0x00AA_0007u64, 0x00BB_0008u64);
-    let code = server_id.pairing_code();
+    let code = server_id.short_code();
     let session_id = u32::from_be_bytes(code.as_bytes()[..4].try_into().expect("code >= 4"));
 
     let mut cc = RelayTunnelCarrier::connect(relay_addr, session_id, TunnelRole::Initiator)

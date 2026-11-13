@@ -48,7 +48,7 @@ const PROBE_MASK: u64 = 0xFFFF_FF00_0000_0000;
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(20);
 /// Queueing delay we allow on top of the path's minimum RTT.
 pub const TARGET_QUEUE_DELAY: Duration = Duration::from_millis(15);
-/// Delivery-rate max-filter window.
+/// Delivery-rate filter window (median after start-up, max during it).
 pub const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// Min-RTT filter window.
 pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);

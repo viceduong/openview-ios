@@ -39,7 +39,7 @@ flowchart TB
     GUI["ovgui — OpenView.exe<br/>Slint + D3D11 WARP"]
     HOST["ovhost — capture, SendInput,<br/>WASAPI/WinMM, desktop FX"]
     VIEW["ovview — Direct2D window,<br/>input forward, audio, .ovrec"]
-    IOS["iOS RemoteView — SwiftUI,<br/>Metal, VideoToolbox, Network.framework"]
+    IOS["iOS app — SwiftUI,<br/>Metal, VideoToolbox, Network.framework"]
   end
   FFI["ovffi — C ABI staticlib (52 functions)"]
   APP["ovapp — command bus + CAPS, tiles/bands/MOVE/JPEG/H.264,<br/>sendq + pacing, Opus, clipboard, chat, files, liveness"]
@@ -171,7 +171,7 @@ and post events to the UI; Job Object ties children to the GUI's lifetime.
   ordered delivery from its carriers.
 - **iOS:** direct-path host keys pinned trust-on-first-use; PINs in Keychain.
 - **Windows GUI:** PINs in Credential Manager.
-- Open issues: [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#security).
+- Open issues and limitations: [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) and [`SECURITY.md`](../SECURITY.md#known-limitations).
 
 ## 7. Ports and files
 
@@ -193,7 +193,7 @@ and post events to the UI; Job Object ties children to the GUI's lifetime.
   crates/<crate>/       sources, tests/, examples/
   assets/               app icon (ico/svg) + winres.rs (icon, manifest, VERSIONINFO; included by build.rs)
   scripts/              e2e_relay.sh, e2e_lan.sh
-  ios/                  build_ios.sh, RemoteView/ (XcodeGen project, Swift, Metal)
+  ios/                  build_ios.sh, OpenView/ (XcodeGen project, Swift, Metal)
   docs/                 this documentation
   CHANGELOG.md README.md LICENSE
 ```

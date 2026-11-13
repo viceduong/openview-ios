@@ -64,9 +64,9 @@ pub const OPUS_BITRATE: i32 = 48_000;
 pub const OPUS10_SAMPLES: u32 = 480;
 
 /// Expected packet loss the Opus encoder provisions in-band FEC
-/// for (LBRR). Our records travel reliably today, so FEC only costs a few
-/// kbit/s; it pays off once audio rides an unreliable datagram path (a
-/// receiver then decodes the lost frame from the next packet with
+/// for (LBRR). On the reliable record path FEC only costs a few kbit/s; it
+/// pays off when audio rides the unreliable media channel of the direct
+/// path (the receiver then decodes a lost frame from the next packet with
 /// [`AudioDecoder::decode_fec`]).
 pub const OPUS_FEC_LOSS_PERC: i32 = 10;
 

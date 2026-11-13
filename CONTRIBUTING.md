@@ -15,7 +15,7 @@ Follow [docs/BUILDING.md](docs/BUILDING.md). In short, on Windows:
 ```powershell
 winget install Rustlang.Rustup Kitware.CMake Git.Git
 # plus Visual Studio 2022 Build Tools with "Desktop development with C++"
-git clone https://github.com/OWNER/openview
+git clone https://github.com/viceduong/openview
 cd openview
 cargo build
 cargo test --workspace
@@ -41,7 +41,7 @@ simulated input, separate data and credentials).
 | `crates/ovgui` | Windows app (`OpenView.exe`, Slint): supervises host and relay, launches the viewer |
 | `crates/ovcommon` | Shared by the Windows binaries: data directories, JSON status events, logging |
 | `crates/ovffi` | C ABI static library for the iOS app |
-| `ios/` | SwiftUI app (`RemoteView`), build script, C header |
+| `ios/` | SwiftUI app (`ios/OpenView`), build script, C header |
 | `fuzz/` | cargo-fuzz targets (nightly) |
 | `packaging/` | Installer script, portable-zip files, license templates |
 | `scripts/` | `package.ps1` (release artifacts), `e2e_relay.sh` (3-process end-to-end test), `e2e_lan.sh` (LAN session without a relay) |
@@ -58,9 +58,16 @@ CI runs these on every pull request; please run them locally first:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+$env:RUSTDOCFLAGS='-D warnings'; cargo doc --workspace --no-deps
 bash scripts/e2e_relay.sh
 bash scripts/e2e_lan.sh
+python scripts/check_links.py
+typos                      # cargo install typos-cli; false positives go in _typos.toml
 ```
+
+A Linux job also tests the portable crates (`ovcore`, `ovtransport`,
+`ovrelay`, `ovdiscovery`, `ovcommon`) and checks the fuzz harness. Every
+`unsafe` block needs a `// SAFETY:` comment (enforced by clippy).
 
 If you touch `ovffi`, `ovcore`, `ovtransport`, `ovapp` or `ios/`, the iOS
 workflow also runs `cargo test -p ovffi`, `ios/build_ios.sh --sim` and

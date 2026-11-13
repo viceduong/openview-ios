@@ -4,7 +4,7 @@
 
 # Build outputs / packaging
 /dist/
-ios/RemoteView/dist/
+ios/OpenView/dist/
 *.a
 *.lib
 *.xcframework
@@ -18,7 +18,7 @@ DerivedData/
 xcuserdata/
 build/
 # Per-developer iOS build overrides (signing team, bundle id prefix, relay)
-ios/RemoteView/Config/Local.xcconfig
+ios/OpenView/Config/Local.xcconfig
 
 # Python bytecode (scripts/)
 __pycache__/

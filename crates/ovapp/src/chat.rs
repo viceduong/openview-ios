@@ -2,8 +2,9 @@
 //!
 //! One chat line = one [`Command::Type`] record: the line's UTF-8 bytes ride
 //! in the TYPE payload with key code `0` and modifier bits `0` (a "synthetic"
-//! keystroke that is really a message). NUL bytes are trimmed on both ends so
-//! C-string-shaped peers interoperate.
+//! keystroke that is really a message). The sender strips trailing NULs and
+//! the receiver truncates at the first NUL, so C-string-shaped peers
+//! interoperate.
 
 use ovcore::session::Session;
 use ovtransport::{Carrier, TransportError};
@@ -14,7 +15,7 @@ use crate::terminal::{CmdHook, Command, TerminalSession};
 pub type LineHook = Box<dyn FnMut(&str)>;
 
 /// A thin chat wrapper around a [`TerminalSession`]: sends/receives text
-/// lines as TYPE commands (1 line = 1 record, UTF-8, NUL-trimmed).
+/// lines as TYPE commands (1 line = 1 record, UTF-8, cut at the first NUL).
 pub struct ChatSession {
     term: TerminalSession,
 }
@@ -76,7 +77,7 @@ impl ChatSession {
     }
 }
 
-/// Trim NULs and decode a TYPE payload as UTF-8 (lossy, so bad bytes never
+/// Truncate at the first NUL and decode a TYPE payload as UTF-8 (lossy, so bad bytes never
 /// kill the chat).
 fn line_from_payload(payload: &[u8]) -> String {
     let end = payload

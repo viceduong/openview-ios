@@ -1,0 +1,46 @@
+# Configuration for https://github.com/crate-ci/typos (run in CI).
+# Only genuine false positives belong here.
+
+[files]
+extend-exclude = [
+  "target/",
+  "fuzz/target/",
+  "dist/",
+  "*.lock",
+  "*.svg",
+  "*.png",
+]
+
+[default]
+extend-ignore-re = [
+  # Test byte strings such as b"abd".
+  'b"[a-z]{3}"',
+]
+
+[default.extend-identifiers]
+# Win32 tray notification constants (NIN_BALLOONUSERCLICK, ...).
+NIN_BALLOONUSERCLICK = "NIN_BALLOONUSERCLICK"
+
+[default.extend-words]
+# "UPnP" is split by the tokenizer into U / Pn / P.
+pn = "pn"
+# Exp-Golomb ue(v) in H.264 SPS parsing.
+ue = "ue"
+# Retransmission timeout.
+rto = "rto"
+# Apple simulator device id.
+udid = "udid"
+# Compressed length.
+clen = "clen"
+# Byte-array test bindings (`ba`, `bb`).
+ba = "ba"
+# Integer y coordinate (`ix`, `iy`) in the iOS input code.
+iy = "iy"
+# Additive-increase / multiplicative-decrease.
+aimd = "aimd"
+# Plurals of protocol keywords in code comments (CONNECTs, REQUESTs, INPUTs, PNGs).
+connec = "connec"
+reques = "reques"
+inpu = "inpu"
+# The `flate2` crate.
+flate = "flate"

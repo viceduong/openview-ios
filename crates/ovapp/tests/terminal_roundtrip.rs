@@ -35,7 +35,7 @@ fn establish_pair() -> (TerminalSession, TerminalSession) {
     let server_id = Identity::generate();
     let (dev_c, dev_s) = (0x00AA_0001u64, 0x00BB_0002u64);
 
-    let server_code = server_id.pairing_code();
+    let server_code = server_id.short_code();
     let mut client = Handshake::new(
         Role::Client,
         dev_c,
@@ -158,7 +158,7 @@ fn establish_pair_chat() -> (ChatSession, ChatSession) {
     let server_id = Identity::generate();
     let (dev_c, dev_s) = (0x00AA_0003u64, 0x00BB_0004u64);
 
-    let server_code = server_id.pairing_code();
+    let server_code = server_id.short_code();
     let mut client = Handshake::new(
         Role::Client,
         dev_c,

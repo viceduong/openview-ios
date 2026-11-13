@@ -108,7 +108,7 @@ fn handshake_over_relay_then_records_both_ways() {
     let server_id = Identity::generate();
     let (dev_c, dev_s) = (0x00AA_0001u64, 0x00BB_0002u64);
     let session_id: u32 = u32::from_be_bytes(
-        server_id.pairing_code().as_bytes()[..4]
+        server_id.short_code().as_bytes()[..4]
             .try_into()
             .expect("code >= 4 bytes"),
     );
@@ -130,7 +130,7 @@ fn handshake_over_relay_then_records_both_ways() {
     assert!(cc.is_attached(), "initiator never attached");
     assert!(sc.is_attached(), "responder never attached");
 
-    let server_code = server_id.pairing_code();
+    let server_code = server_id.short_code();
     let mut client = Handshake::new(
         Role::Client,
         dev_c,

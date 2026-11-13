@@ -200,6 +200,13 @@ final class ConnectionStore: ObservableObject {
         load()
     }
 
+    /// An in-memory store: nothing is loaded from or written to disk
+    /// (screenshot mode's demo devices, see ScreenshotMode).
+    init(inMemory connections: [SavedConnection]) {
+        fileURL = nil
+        self.connections = connections
+    }
+
     // MARK: Queries
 
     func connection(id: UUID) -> SavedConnection? {

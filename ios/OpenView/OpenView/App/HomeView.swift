@@ -115,11 +115,11 @@ struct HomeView: View {
         }
         .navigationViewStyle(.stack)
         .onAppear(perform: firstAppear)
-        .onAppear { if !app.sessionActive { lan.start() } }
+        .onAppear { if !app.sessionActive && !ScreenshotMode.isActive { lan.start() } }
         .onDisappear { lan.stop() }
         .onChange(of: app.sessionActive) { active in
-            // No browsing while a session runs.
-            if active { lan.stop() } else { lan.start() }
+            // No browsing while a session runs (nor in screenshot mode).
+            if active || ScreenshotMode.isActive { lan.stop() } else { lan.start() }
         }
         .sheet(item: $sheet) { which in
             sheetView(which)
@@ -319,6 +319,13 @@ struct HomeView: View {
     private func firstAppear() {
         guard !Self.didHandleFirstAppear else { return }
         Self.didHandleFirstAppear = true
+        // Screenshot mode: no relay setup / auto-connect; maybe Settings.
+        if ScreenshotMode.isActive {
+            if ScreenshotMode.opensSettings {
+                sheet = .settings
+            }
+            return
+        }
         if AppSettings.needsRelaySetup {
             sheet = .relaySetup
             return
@@ -659,7 +666,7 @@ struct PairView: View {
     @State private var code = ""
     @State private var useLan = false
     @State private var relayURL = AppSettings.defaultRelayURL
-    @State private var lanHost = "192.168.1.10"
+    @State private var lanHost = ""
     @State private var lanPort = String(ConnectionTransport.defaultLanPort)
 
     private var codeBinding: Binding<String> {
@@ -672,7 +679,7 @@ struct PairView: View {
     private var canConnect: Bool {
         guard code.count == Self.codeDigits else { return false }
         if useLan {
-            return UInt16(lanPort) != nil && !lanHost.isEmpty
+            return UInt16(lanPort) != nil && !lanHost.trimmingCharacters(in: .whitespaces).isEmpty
         }
         return RelayAddress.isValid(relayURL)
     }
@@ -693,7 +700,7 @@ struct PairView: View {
                     }
                     .pickerStyle(.segmented)
                     if useLan {
-                        TextField("Host IP address", text: $lanHost)
+                        TextField("Host IP, e.g. 192.168.1.10", text: $lanHost)
                             .keyboardType(.decimalPad)
                             .disableAutocorrection(true)
                             .textInputAutocapitalization(.never)
@@ -839,7 +846,7 @@ struct ConnectionEditView: View {
                 if useLan {
                     Section(header: Text("Advanced"),
                             footer: Text("Direct UDP to the host on your local network.")) {
-                        TextField("Host IP address", text: $lanHost)
+                        TextField("Host IP, e.g. 192.168.1.10", text: $lanHost)
                             .keyboardType(.decimalPad)
                             .disableAutocorrection(true)
                             .textInputAutocapitalization(.never)

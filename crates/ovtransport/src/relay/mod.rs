@@ -353,8 +353,7 @@ impl RelayTunnelCarrier {
         self.last_punch_ack.take()
     }
 
-    /// Send one framed control/data message over the tunnel. Crate-visible:
-    /// the `punch` helper uses it for PROBE frames.
+    /// Send one framed control/data message over the tunnel.
     pub(crate) fn send_frame(&mut self, kind: u8, payload: &[u8]) -> Result<(), TransportError> {
         let wire = tunnel::encode_frame(kind, payload).map_err(|e| match e {
             tunnel::FrameError::TooLarge(n, _) => TransportError::FrameTooLarge(n),
@@ -496,7 +495,7 @@ impl RelayTunnelCarrier {
                 // line must be consumed WHOLE before we commit the attach:
                 // if connect() returned after only the 5-byte 'A'+sid prefix
                 // arrived (a TCP split), the 6 trailing address bytes would
-                // sit in the buffer and poll_recv would mis-read them as two
+                // sit in the buffer and poll_recv would misread them as two
                 // empty DATA frames. Waiting for the full 11 bytes makes the
                 // line self-delimiting and the buffer clean on return.
                 if self.rx.len() < 11 {

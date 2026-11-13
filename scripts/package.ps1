@@ -25,6 +25,10 @@
 .PARAMETER OutDir
     Output folder (default: <repo>\dist).
 
+.PARAMETER RequireCargoAbout
+    Fail instead of falling back when cargo-about is missing or fails
+    (release builds: the license file must come from cargo-about).
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\package.ps1
     (Windows PowerShell 5.1 or PowerShell 7)
@@ -33,7 +37,8 @@
 param(
     [switch]$SkipBuild,
     [switch]$NoInstaller,
-    [string]$OutDir
+    [string]$OutDir,
+    [switch]$RequireCargoAbout
 )
 
 Set-StrictMode -Version Latest
@@ -177,7 +182,10 @@ function Write-ThirdPartyLicenses([string]$outFile, [string]$version) {
             -o $outFile (Join-Path $Root 'packaging\about.hbs') `
             --manifest-path (Join-Path $Root 'Cargo.toml')
         if ($LASTEXITCODE -eq 0) { return }
+        if ($RequireCargoAbout) { throw 'cargo-about failed (-RequireCargoAbout)' }
         Write-Warning 'cargo-about failed; using the cargo metadata fallback'
+    } elseif ($RequireCargoAbout) {
+        throw 'cargo-about is not installed (-RequireCargoAbout)'
     }
     Step 'THIRD_PARTY_LICENSES.txt (cargo metadata)'
     Write-ThirdPartyFallback $outFile $version

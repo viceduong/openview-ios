@@ -91,7 +91,7 @@ pub unsafe extern "C" fn ov_identity_fingerprint_pine(
 /// `id` must be null or a live identity from [`ov_identity_create`]; `out`
 /// must be null or writable for `cap` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn ov_identity_pairing_code(
+pub unsafe extern "C" fn ov_identity_short_code(
     id: *const Identity,
     out: *mut c_char,
     cap: usize,
@@ -106,6 +106,6 @@ pub unsafe extern "C" fn ov_identity_pairing_code(
         };
         // SAFETY: `out` is non-null and writable for `cap` bytes (caller
         // contract).
-        unsafe { copy_str(&id.pairing_code(), out, cap) }
+        unsafe { copy_str(&id.short_code(), out, cap) }
     })
 }

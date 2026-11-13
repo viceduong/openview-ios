@@ -30,6 +30,16 @@ jobs:
           set -o pipefail
           bash ios/build_ios.sh --device 2>&1 | tee device.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
           test ${PIPESTATUS[0]} -eq 0
+      - name: Screenshots
+        run: |
+          chmod +x scripts/ios_screenshots.sh
+          bash scripts/ios_screenshots.sh 2>&1 | tail -20
+          ls -la docs/images/
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-screenshots
+          path: docs/images/ios-*.png
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4

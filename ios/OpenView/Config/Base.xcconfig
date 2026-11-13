@@ -11,7 +11,7 @@
 // Note the `/$()/` in URLs: `//` starts a comment in .xcconfig files, and
 // `$()` expands to nothing, so the value becomes `wss://relay.example.com/relay`.
 
-// Reverse-DNS prefix of the bundle identifiers (app: <prefix>.remoteview).
+// Reverse-DNS prefix of the bundle identifiers (app: <prefix>.openview).
 OV_BUNDLE_ID_PREFIX = org.openview
 
 // Relay server baked into the build (Info.plist key OVDefaultRelayURL).
@@ -19,6 +19,6 @@ OV_BUNDLE_ID_PREFIX = org.openview
 // change it in Settings > Connection.
 OV_DEFAULT_RELAY_URL =
 
-PRODUCT_BUNDLE_IDENTIFIER = $(OV_BUNDLE_ID_PREFIX).remoteview
+PRODUCT_BUNDLE_IDENTIFIER = $(OV_BUNDLE_ID_PREFIX).openview
 
 #include? "Local.xcconfig"

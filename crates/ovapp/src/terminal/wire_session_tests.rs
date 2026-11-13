@@ -17,7 +17,7 @@ fn established_pair(
     use ovtransport::InMemoryCarrier;
 
     let (mut cc, mut sc) = InMemoryCarrier::pair();
-    let code = server_id.pairing_code();
+    let code = server_id.short_code();
     let mut client = Handshake::new(
         Role::Client,
         0x11,

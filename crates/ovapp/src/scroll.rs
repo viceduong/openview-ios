@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::bands::MoveRect;
 use crate::tiles::{TileMap, TileRect, TILE};
 
-/// Smallest dirty band (tile rows) worth a scroll search.
+/// Smallest dirty band height (pixels) worth a scroll search.
 pub(crate) const MIN_ROWS: u32 = 96;
 /// Smallest dirty band width (pixels).
 pub(crate) const MIN_WIDTH: u32 = 128;

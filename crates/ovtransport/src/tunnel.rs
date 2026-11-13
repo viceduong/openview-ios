@@ -42,7 +42,8 @@ pub const MAX_FRAME: usize = 0xFFFF - 3;
 /// One decoded frame pulled off the stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {
-    /// One of [`DATA`], [`PING`], [`PONG`], [`DISCONNECT`].
+    /// One of [`DATA`], [`PING`], [`PONG`], [`DISCONNECT`], [`PROBE`],
+    /// [`PUNCH_ACK`] (other kinds are rejected by the decoder).
     pub kind: u8,
     /// Payload bytes (may be empty).
     pub payload: Vec<u8>,

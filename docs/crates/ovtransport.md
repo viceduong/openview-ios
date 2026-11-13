@@ -7,7 +7,7 @@
 
 ## 1. Overview
 
-A **Carrier** moves whole datagrams between two peers. These are handshake messages and sealed `ovcore` records, opaque to the carrier. The trait is **synchronous and non-blocking**. The caller owns the loop and calls `send` and `poll_recv`. Carriers do not run callbacks off the caller's stack. The crate spawns only two kinds of thread: the optional relay read-watcher (`RelayTunnelCarrier::set_read_waker`, `relay/watch.rs`) and, with feature `ws-client`, the WebSocket pump behind `RelayTunnelCarrier::connect_ws` (`relay/ws_client.rs`). Two kinds of call block deliberately: the relay `connect*` constructors, waiting at most 10 s for `O`, and the punch helpers in `punch.rs`.
+A **Carrier** moves whole datagrams between two peers. These are handshake messages and sealed `ovcore` records, opaque to the carrier. The trait is **synchronous and non-blocking**. The caller owns the loop and calls `send` and `poll_recv`. Carriers do not run callbacks off the caller's stack. The crate spawns only two kinds of thread: the optional relay read-watcher (`RelayTunnelCarrier::set_read_waker`, `relay/watch.rs`) and, with feature `ws-client`, the WebSocket pump behind `RelayTunnelCarrier::connect_ws` (`relay/ws_client.rs`). One kind of call blocks deliberately: the relay `connect*` constructors, waiting at most 10 s for `O`.
 
 The `ovcore` record layer needs **lossless, in-order** delivery (see [ovcore.md §4.4](ovcore.md)). Each carrier gets there differently:
 
@@ -37,7 +37,6 @@ The crate exports five carrier types plus the direct engine, and `pub mod ws`, t
 | `relay::watch` | `src/relay/watch.rs` | private | read-waker thread (`ov-relay-watch`), hand-declared `poll` / `WSAPoll` (`wait_readable_any`) |
 | `relay::ws_client` | `src/relay/ws_client.rs` | private, feature `ws-client` | `WsEndpoint`, WebSocket dial and HTTP upgrade, loopback pair, `ov-relay-ws` pump thread |
 | `ws` | `src/ws.rs` | `pub mod` | RFC 6455 codec shared by `ovrelay` and the client: `accept_key`, `encode` / `encode_into` (masked or unmasked), `unmask`, `Deframer`, `sha1`, `base64`, opcode constants |
-| `punch` | `src/punch.rs` | re-exported (`HolePunch`, constants) | relay-assisted hole-punch helpers (PROBE / 0xFE punches / PUNCH_ACK). Only used by tests; the shells use `direct` |
 | `direct` | `src/direct/mod.rs` | `pub mod`; `DirectCarrier`, `DirectSockets`, `DirectState` re-exported | module doc, constants, `DirectState`, `DirectIo`, `DirectStats`, re-exports |
 | | `src/direct/engine/mod.rs` | | `DirectEngine`: authenticated probing of candidate addresses, COMMIT, REBIND, SYNC markers, DACK and replay |
 | | `src/direct/engine/media_channel.rs` | | the engine's media channel: v2 framing, video and audio sends, feedback, NACKs, pacing |
@@ -267,21 +266,13 @@ A minimal, pure-std RFC 6455 codec. `ovrelay` uses it on the server side (handsh
 | `Deframer::new(max_payload)`, `push`, `next_frame`, `buffered` | buffering deframer; a masked server frame is unmasked rather than rejected; oversized, fragmented-control, reserved-bit and unknown-opcode frames are `InvalidData` |
 | `OP_CONT`, `OP_TEXT`, `OP_BINARY`, `OP_CLOSE`, `OP_PING`, `OP_PONG`, `MAX_CONTROL` | opcodes and the 125-byte control payload cap |
 
-## 7. Relay-assisted hole punching — `punch.rs`
+## 7. Hole-punch frames (PROBE / PUNCH_ACK)
 
-`HolePunch` is a set of pure helpers:
-
-| Function | Action |
-|---|---|
-| `plan(relay, local_port)` | send a PROBE frame through the tunnel with our UDP port |
-| `punch_target(peer_external, peer_local_port)` | the peer's relay-observed IP combined with its announced port |
-| `punch(socket, peer, n, interval)` | send `n` one-byte `0xFE` (`PUNCH_BYTE`) datagrams; blocks for `n × interval` |
-| `send_punch_ack(relay, port)` / `wait_ack(relay, deadline)` | PUNCH_ACK exchange through the tunnel (5 ms poll sleeps) |
-| `should_demote(last_rx)` | `last_rx.elapsed() > DEMOTE_AFTER` (3 s) |
-
-Defaults: `DEFAULT_PUNCH_COUNT` 10, `DEFAULT_PUNCH_INTERVAL` 100 ms.
-
-Only `tests/punch_loopback.rs` uses this module. The shells use the authenticated candidate probing in `direct/`, which is a different design.
+The tunnel still defines the PROBE (`0x04`) and PUNCH_ACK (`0x05`) frames, and
+`RelayTunnelCarrier` records the last of each (`take_probe`, `take_punch_ack`)
+together with the relay-observed peer address (`peer_external_addr`). The
+shipped binaries do not punch with them: the direct path uses the
+authenticated candidate probing in `direct/` (section 8).
 
 ## 8. Direct path — `direct/`
 
@@ -598,7 +589,6 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `MAX_PATHS` / `GOVERNED_CWND_FLOOR` | 256 / 256 | `direct/carrier.rs` / `direct/link.rs` |
 | `MAX_SHARD`, `MAX_UNIT`, `MAX_DATA_SHARDS`, `REPLAY_WINDOW`, `FEC_MIN`/`FEC_MAX`, `REORDER_GRACE`, `FRAME_TIMEOUT`, `MAX_FRAMES`, `MAX_BUFFERED` | 1136, 4 MiB, 3693, 4096, 0.10/0.30, 4 ms, 150 ms, 96, 16 MiB | `media/mod.rs` |
 | `FEEDBACK_INTERVAL`, `FEEDBACK_UNIT_US`, `FEEDBACK_MAX`, `PACING_GAIN`, `START_RATE`, `MIN_RATE`, `MAX_RATE`, `LOSS_HIGH`, `TREND_WINDOW` | 25 ms, 50 µs, 500, 1.5, 6 Mbps, 2 Mbps, 200 Mbps, 10 %, 20 | `cc/mod.rs` |
-| `PUNCH_BYTE`, `DEFAULT_PUNCH_COUNT`, `DEFAULT_PUNCH_INTERVAL`, `DEMOTE_AFTER` | 0xFE, 10, 100 ms, 3 s | `punch.rs` |
 
 ## 12. Error handling
 
@@ -630,7 +620,6 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `tunnel.rs` | single frame, byte-at-a-time feeds, multiple frames per feed, offset compaction across 1000 frames, max size, oversize latch, unknown-kind latch, encode rejects |
 | `relay/tests.rs` | fake-relay ping/pong and attach, DATA round trip, `wait_attached` (late attach, park timeout → `Closed`, no verdict → `Ok(false)`), full send buffer without blocking mode, queue-and-drain order under a stalled reader, read-waker coalescing, rejection → `Closed` |
 | `rudp/tests.rs` | lossless in-order with no retransmits; 5/10/30 % loss with reordering stays in order and exact; datagrams stay within the MTU budget; raw mode is byte-identical and switches on framed input; framed records wait for raw records sent before the switch; `WouldBlock` keeps packets queued |
-| `punch.rs` | punch datagrams carry 0xFE, target port override, 3 s demotion grace |
 | `ws.rs` | RFC 6455 accept-key example, SHA-1 vectors, 7/16/64-bit length encodings, unmasking at any offset and split, deframer round trips for any split, bad frames rejected |
 | `relay/ws_client.rs` | upgrade-response validation, loopback pair connected, pump bridges a scripted server |
 | `direct/tests.rs` | probe round trip and tamper, marker vs record header, key asymmetry, unarmed pass-through, promote-then-demote keeps order both ways (direct socket killed mid-session), media frames survive 3 % random loss (FEC, NACK, audio gaps, feedback, records alongside), NAT rebinding moves the link (relay gone), relay-less stall survives up to 15 s, media replay and forgery rejected, media over loopback sockets, foreign probe rejected, unacked records replayed on demotion |
@@ -643,18 +632,13 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 |---|---|
 | `handshake_over_udp.rs` | full `ovcore` pairing-code handshake plus AEAD records both ways over two real `UdpP2pCarrier`s; exact datagram counts |
 | `udp_reliable.rs` | a 357 × 4.1 KB burst (≈1.5 MB) arrives complete and in order; 5 % loss with reordering through a UDP proxy (set with `UDP_LOSS`) is recovered; raw mode interoperates with an "old peer" and auto-switches on framed input |
-| `punch_loopback.rs` | live `ovrelay`, PROBE exchange, simultaneous 0xFE punches, PUNCH_ACK, then the handshake plus one record over the punched sockets; `detect_symmetric` stub |
 | `ws_client_relay.rs` | `#![cfg(feature = "ws-client")]`. A host and a viewer both reach a local `ovrelay` through `ws://127.0.0.1:<port>/relay` (`connect_ws`), complete the handshake and exchange AEAD records, a large burst, PING/PONG and a close; a hostname TCP relay (`connect_host("localhost", …)`) pairs with a WebSocket viewer; WebSocket errors are reported |
 | `ws_relay.rs` | a WebSocket viewer (`connect_bridge` behind a hand-rolled WS client) pairs with a TCP host; 16-bit WS lengths; no punch address for a WS peer; auto-PONG through the bridge; host close reaches the viewer; plain `GET /` health check; raw TCP clients still pair and learn addresses; `#[ignore]` 40 s WebSocket keepalive soak |
 
-## 14. Known limitations and TODOs found in code
+## 14. Limitations
 
-1. **Stale doc comments.**
-   - `direct/mod.rs`: the module doc omits probe type 4 (REBIND).
-   - `tunnel.rs`: the `DecodedFrame` doc lists only kinds 0–3.
-2. **The datagram limit differs by carrier.** The trait doc says 65 535 bytes, but the relay tunnel accepts at most 65 532. A 65 533–65 535-byte datagram fails on the relay with `FrameTooLarge`.
-3. **`HolePunch` is unused** by the shipped binaries and blocks in `punch()` and `wait_ack()`. It is superseded by `direct/`.
-4. **Replay overflow.** Past `REPLAY_LIMIT` (64 MiB of unacknowledged records), the oldest records are forgotten; a later demotion then loses them (the record layer's anti-replay window skips the gap rather than desyncing, but the application sees the loss).
-5. **Theoretical magic collision.** In rudp raw mode, a raw record whose sender device ID starts with the bytes `B7 'R' 'U' '1'` (LE low 32 bits) would be taken for a framed packet. That is about 2⁻³² per device ID, and device IDs are derived from fingerprints.
-6. **`FeedbackRx` truncates the reference time to u32 µs** (it wraps about every 71 minutes). The sender's `unwrap_remote` follows forward wraps only.
-7. **Relay writes can block.** Once more than 256 KiB is queued, `RelayTunnelCarrier` writes block with sleeps (up to a 20 s stall timeout), so a sender can still block on a stalled relay.
+1. **The datagram limit differs by carrier.** The trait doc says 65 535 bytes, but the relay tunnel accepts at most 65 532. A 65 533–65 535-byte datagram fails on the relay with `FrameTooLarge`.
+2. **Replay overflow.** Past `REPLAY_LIMIT` (64 MiB of unacknowledged records), the oldest records are forgotten; a later demotion then loses them (the record layer's anti-replay window skips the gap rather than desyncing, but the application sees the loss).
+3. **Theoretical magic collision.** In rudp raw mode, a raw record whose sender device ID starts with the bytes `B7 'R' 'U' '1'` (LE low 32 bits) would be taken for a framed packet. That is about 2⁻³² per device ID, and device IDs are derived from fingerprints.
+4. **`FeedbackRx` truncates the reference time to u32 µs** (it wraps about every 71 minutes). The sender's `unwrap_remote` follows forward wraps only.
+5. **Relay writes can block.** Once more than 256 KiB is queued, `RelayTunnelCarrier` writes block with sleeps (up to a 20 s stall timeout), so a sender can still block on a stalled relay.

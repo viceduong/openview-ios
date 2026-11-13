@@ -5,7 +5,7 @@
 #   ./build_ios.sh --sim          simulator .app (no signing; Apple silicon + Intel)
 #   ./build_ios.sh --device       unsigned device .ipa (re-sign with Sideloadly / AltStore)
 #   ./build_ios.sh --ipa          signed archive + .ipa export (needs DEVELOPMENT_TEAM,
-#                                 see RemoteView/Config/Base.xcconfig)
+#                                 see OpenView/Config/Base.xcconfig)
 #   ./build_ios.sh --test         unit tests on an iOS simulator
 #   ./build_ios.sh --xcframework  only build build/OvFFI.xcframework
 #
@@ -35,7 +35,7 @@ esac
 
 IOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${IOS_DIR}/.." && pwd)"
-APP_DIR="${IOS_DIR}/RemoteView"
+APP_DIR="${IOS_DIR}/OpenView"
 BUILD_DIR="${IOS_DIR}/build"
 HEADERS_DIR="${IOS_DIR}/OvFFI/include"
 XCFRAMEWORK="${BUILD_DIR}/OvFFI.xcframework"

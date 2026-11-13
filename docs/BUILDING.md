@@ -124,9 +124,15 @@ license, the license texts shipped in each crate (identical texts printed
 once), and the notices of the bundled C libraries libopus and zstd.
 
 Releases are built by `.github/workflows/release.yml` when a `v*` tag is
-pushed: it runs `package.ps1` on Windows, builds the unsigned iOS `.ipa` on
-macOS, and publishes both with checksums and the matching `CHANGELOG.md`
-section as release notes.
+pushed. It checks that the tag matches the versions in `Cargo.toml` and
+`ios/OpenView/project.yml` (and `Info.plist`), runs the whole CI workflow,
+then runs `package.ps1 -RequireCargoAbout` on Windows, builds static
+`ovrelay` binaries for Linux x86_64 / aarch64 (musl, `cargo zigbuild`) and
+the unsigned iOS `.ipa` on macOS, and publishes everything with
+`SHA256SUMS`, build provenance attestations and the matching
+`CHANGELOG.md` section as release notes (rename `## [Unreleased]` to
+`## [x.y.z] - date` before tagging). A tag containing `-` (for example
+`v0.2.0-rc.1`) is published as a pre-release.
 
 ## iOS app
 
@@ -152,7 +158,7 @@ cargo test -p ovffi             # the Rust side of the C ABI, on the Mac itself
 ```
 
 Signing team, bundle id prefix and a baked-in default relay are set in
-`ios/RemoteView/Config/Local.xcconfig` (git-ignored). See
+`ios/OpenView/Config/Local.xcconfig` (git-ignored). See
 [ios/README.md](../ios/README.md) and [IOS_APP.md](IOS_APP.md).
 
 CI builds and tests the app on every change to the shared crates or `ios/`
