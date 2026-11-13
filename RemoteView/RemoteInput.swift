@@ -145,7 +145,7 @@ enum ZoomPreset {
     case fill
     /// One remote pixel = one device pixel.
     case native
-    /// Default when a session opens: the remote screen's height fills half
+    /// Default when a session opens: the remote screen's height fills 2/5
     /// of the view's height (never below fit — e.g. landscape stays at fit).
     case halfHeight
 }

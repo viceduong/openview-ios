@@ -908,10 +908,10 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return max(bounds.width / frameSize.width, bounds.height / frameSize.height)
     }
 
-    /// The remote screen's height fills half of the view's height.
+    /// The remote screen's height fills 2/5 of the view's height.
     private var halfHeightScale: CGFloat {
         guard frameSize.height > 0, bounds.height > 0 else { return 0 }
-        return bounds.height * 0.5 / frameSize.height
+        return bounds.height * 0.4 / frameSize.height
     }
 
     /// One remote pixel = one device pixel.
