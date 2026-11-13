@@ -1,0 +1,68 @@
+[package]
+name = "ovapp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView application shell: terminal command-channel session + chat over the AEAD record layer"
+
+[features]
+default = []
+# Host-only zstd ENCODER (the C `zstd` crate). Only `ovhost` enables it: the
+# iOS staticlib (`ovffi`) must stay pure Rust, and every peer decodes zstd
+# with the pure-Rust `ruzstd` below regardless of this feature.
+zstd-encode = ["dep:zstd"]
+# Opus audio (Phase 4): the C libopus (via `opus`/`opusic-sys`, built with
+# CMake). Desktop binaries only (`ovhost`, `ovview`); the iOS staticlib keeps
+# a pure-Rust tree and decodes Opus in Swift (AVAudioConverter).
+opus = ["dep:opus"]
+# Phase 5: Media Foundation H.264 encoder/decoder MFTs (Windows only;
+# `ovhost` encodes, `ovview` decodes). The iOS staticlib never enables it
+# and decodes with VideoToolbox in Swift.
+mf = ["dep:windows"]
+
+[dependencies]
+ovcore = { path = "../ovcore" }
+ovtransport = { path = "../ovtransport" }
+# Pure-Rust DEFLATE (miniz_oxide backend) — no C toolchain, so the iOS
+# aarch64-apple-ios staticlib keeps building.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# Pure-Rust zstd DECODER (Phase 3): viewer + iOS decode the host's zstd frames.
+ruzstd = "0.7"
+# Pure-Rust LZ4 block codec (Wave 1, FrameCodec::Lz4 / CAP_LZ4): decode in
+# every build (iOS included), safe decoder for untrusted input.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+# Pure-Rust data parallelism (Wave 1): host band compression and viewer
+# band-container decode on all cores (iOS included).
+rayon = "1"
+# Wave 2 lossy-first image tiles (CAP_LOSSY): pure-Rust baseline JPEG
+# encoder (host; `simd` = runtime-detected AVX2 DCT on x86, scalar
+# elsewhere) and pure-Rust decoder (every viewer, iOS staticlib included).
+jpeg-encoder = { version = "0.6", features = ["simd"] }
+zune-jpeg = "0.4"
+zstd = { version = "0.13", default-features = false, optional = true }
+opus = { version = "0.4", optional = true }
+# Diagnostics (never `println!` in this library).
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+ovrelay = { path = "../ovrelay" }
+
+[lints]
+workspace = true

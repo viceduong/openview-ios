@@ -1,0 +1,43 @@
+name: Verify iOS (clean repo)
+on:
+  push:
+    branches: [clean-verify]
+jobs:
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust targets
+        run: |
+          rustup show
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: ovffi tests
+        run: cargo test -p ovffi --locked
+      - name: Build simulator app
+        run: |
+          set -o pipefail
+          bash ios/build_ios.sh --sim 2>&1 | tee sim.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          bash ios/build_ios.sh --test 2>&1 | tee test.log | grep -E "error:|Executed|TEST (SUCCEEDED|FAILED)" || true
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Build unsigned device ipa
+        run: |
+          set -o pipefail
+          bash ios/build_ios.sh --device 2>&1 | tee device.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: "*.log"
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenView-iOS-device
+          path: ios/build/*.ipa

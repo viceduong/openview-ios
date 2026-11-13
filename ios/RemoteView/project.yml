@@ -1,0 +1,114 @@
+# XcodeGen spec for the OpenView iOS app. Generate the project with
+#   xcodegen generate --spec project.yml
+# (ios/build_ios.sh does this, after building ../build/OvFFI.xcframework).
+name: OpenView
+options:
+  deploymentTarget:
+    iOS: "15.6"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: false
+  generateEmptyDirectories: false
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    IPHONEOS_DEPLOYMENT_TARGET: "15.6"
+
+targets:
+  OpenView:
+    type: application
+    platform: iOS
+    # Every folder under RemoteView/ (App, Session, Screen, Input, Transport,
+    # Settings, Support) is picked up recursively, with matching groups.
+    sources:
+      - path: RemoteView
+    # Bundle id prefix, signing team and an optional baked-in relay live in
+    # Config/Base.xcconfig (+ the git-ignored Config/Local.xcconfig).
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    dependencies:
+      # The Rust core (crates/ovffi) as a static-library XCFramework with the
+      # C header and the `OvFFI` module map; Swift uses it via `import OvFFI`.
+      # Built by build_ios.sh (device + arm64/x86_64 simulator slices).
+      - framework: ../build/OvFFI.xcframework
+        embed: false
+    scheme:
+      testTargets:
+        - RemoteViewTests
+      gatherCoverageData: true
+    info:
+      path: RemoteView/App/Info.plist
+      properties:
+        CFBundleDisplayName: OpenView
+        CFBundleShortVersionString: "0.1.0"  # keep in sync with the workspace crate version (Cargo.toml)
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: OpenView connects to peers on your local network or to your relay server.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UILaunchScreen: {}
+        # iPad mouse/trackpad: deliver secondary clicks and scroll as events
+        # (RemoteScreenSurface right-click + wheel).
+        UIApplicationSupportsIndirectInputEvents: true
+        UIRequiredDeviceCapabilities:
+          - arm64
+        NSFaceIDUsageDescription: OpenView uses Face ID to unlock the app and your saved access PINs.
+        # Landscape sessions (iPhone: no upside-down; iPad: all).
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Per-controller status bar (the session hides it).
+        UIViewControllerBasedStatusBarAppearance: true
+        # ProMotion iPhones may run the session's display link (pan / zoom /
+        # cursor redraws) above 60 Hz.
+        CADisableMinimumFrameDurationOnPhone: true
+        # Optional relay baked into the build (OV_DEFAULT_RELAY_URL in
+        # Config/*.xcconfig); empty = ask on first launch.
+        OVDefaultRelayURL: "$(OV_DEFAULT_RELAY_URL)"
+        # ITSAppUsesNonExemptEncryption is deliberately not set: the app uses
+        # encryption (TLS + its own end-to-end session encryption), so a
+        # distributor must answer the export-compliance question for their
+        # build. See ios/README.md.
+    settings:
+      base:
+        INFOPLIST_FILE: RemoteView/App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        # Single-size 1024 app icon (RemoteView/App/Assets.xcassets); Xcode
+        # generates every device size from it.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Blue accent (#0A6CFF light / #3D8BFF dark), RemoteView/App/Assets.xcassets.
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+
+  # Pure-logic unit tests (relay address parsing, direct-path candidates,
+  # viewport zoom math). The few source files they cover are compiled into
+  # the test bundle directly, so the tests need neither the app host nor the
+  # Rust library and run in any simulator:
+  #   xcodebuild test -project OpenView.xcodeproj -scheme OpenView \
+  #     -destination 'platform=iOS Simulator,name=iPhone 15'
+  RemoteViewTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: RemoteViewTests
+      - path: RemoteView/Settings/RelayAddress.swift
+      - path: RemoteView/Transport/DirectPaths.swift
+      - path: RemoteView/Screen/ViewportMath.swift
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(OV_BUNDLE_ID_PREFIX).remoteview.tests"
+        GENERATE_INFOPLIST_FILE: YES

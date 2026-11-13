@@ -1,0 +1,188 @@
+// Settings page: grouped cards of toggle rows.
+
+import { Theme } from "../theme.slint";
+import { App } from "../adapters.slint";
+import { Icon, IconSize } from "../components/icon.slint";
+import { Button, ButtonVariant, ButtonSize } from "../components/button.slint";
+import { Input } from "../components/input.slint";
+import { Card, CardHeader, Divider, Toggle, SettingRow, Segmented } from "../components/widgets.slint";
+import { CustomScrollView } from "../components/scroll-view.slint";
+
+component Group inherits Card {
+    pad: Theme.spacing-lg;
+}
+
+export component SettingsPage inherits Rectangle {
+    CustomScrollView {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        VerticalLayout {
+            padding: Theme.spacing-xl;
+            padding-top: 20px;
+            spacing: Theme.spacing-lg;
+            alignment: start;
+
+            Text {
+                text: "Settings";
+                color: Theme.text-primary;
+                font-size: Theme.font-2xl;
+                font-weight: Theme.font-weight-semibold;
+            }
+
+            // Relay first: nothing connects until one is configured.
+            Group {
+                CardHeader {
+                    icon-name: "link";
+                    title: "Relay";
+                    subtitle: "Devices meet through a relay server (host:port), then switch to a direct path when the network allows.";
+                }
+                Rectangle {
+                    visible: App.relay-missing;
+                    height: App.relay-missing ? missing.preferred-height + 2 * Theme.spacing-sm : 0px;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.primary-soft;
+                    missing := Text {
+                        x: Theme.spacing-md;
+                        width: parent.width - 2 * Theme.spacing-md;
+                        height: parent.height;
+                        text: "No relay configured. Enter the address of the relay you use to connect to other computers (for example the one running on your home PC).";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-sm;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Theme.spacing-sm;
+                    padding-left: Theme.spacing-xs;
+                    padding-right: Theme.spacing-xs;
+                    Input {
+                        label: "Relay address (host:port)";
+                        placeholder: App.default-relay;
+                        text <=> App.relay-address;
+                        committed => { App.setting-changed("relay"); }
+                    }
+                }
+                VerticalLayout {
+                    padding-left: Theme.spacing-xs;
+                    padding-right: Theme.spacing-xs;
+                    SettingRow {
+                        title: "Run a relay on this PC";
+                        description: "Other devices can reach this PC through it (TCP port 4569). When off, this PC's host uses the relay address above.";
+                        Toggle {
+                            checked <=> App.run-relay;
+                            toggled => { App.setting-changed("run-relay"); }
+                        }
+                    }
+                }
+            }
+
+            Group {
+                CardHeader { icon-name: "settings"; title: "General"; }
+                VerticalLayout {
+                    padding-left: Theme.spacing-xs;
+                    padding-right: Theme.spacing-xs;
+                    SettingRow {
+                        title: "Start OpenView at sign-in";
+                        description: "Runs minimized in the notification area so this computer is always reachable.";
+                        Toggle {
+                            checked <=> App.start-at-login;
+                            toggled => { App.setting-changed("start-at-login"); }
+                        }
+                    }
+                }
+            }
+
+            Group {
+                CardHeader {
+                    icon-name: "shield";
+                    title: "Incoming sessions (this computer)";
+                    subtitle: App.settings-note != "" ? App.settings-note : "Changing these restarts the host; any open session is dropped.";
+                }
+                VerticalLayout {
+                    padding-left: Theme.spacing-xs;
+                    padding-right: Theme.spacing-xs;
+                    SettingRow {
+                        title: "Send PC audio to the remote device";
+                        description: "Stream what this computer plays (system audio loopback).";
+                        Toggle {
+                            checked <=> App.send-audio;
+                            toggled => { App.setting-changed("send-audio"); }
+                        }
+                    }
+                    Divider { }
+                    SettingRow {
+                        title: "Play the remote microphone on this PC";
+                        description: "Full-duplex audio: hear the phone's mic through these speakers.";
+                        Toggle {
+                            checked <=> App.play-mic;
+                            toggled => { App.setting-changed("play-mic"); }
+                        }
+                    }
+                    Divider { }
+                    SettingRow {
+                        title: "Hide wallpaper during sessions";
+                        description: "A flat desktop streams faster; restored when the session ends.";
+                        Toggle {
+                            checked <=> App.hide-wallpaper;
+                            toggled => { App.setting-changed("hide-wallpaper"); }
+                        }
+                    }
+                    Divider { }
+                    SettingRow {
+                        title: "Frame rate";
+                        description: "Auto starts at 30 fps and rises to 60 when the link allows.";
+                        Segmented {
+                            options: ["Auto", "30 fps", "60 fps"];
+                            selected <=> App.fps-mode;
+                            changed-to => { App.setting-changed("fps"); }
+                        }
+                    }
+                    Divider { }
+                    SettingRow {
+                        title: "Direct connections";
+                        description: "Upgrade from the relay to a direct UDP path when the device can reach this PC.";
+                        Toggle {
+                            checked <=> App.direct;
+                            toggled => { App.setting-changed("direct"); }
+                        }
+                    }
+                    Divider { }
+                    SettingRow {
+                        title: "Open the router port automatically (UPnP)";
+                        description: "Maps the direct UDP port on your router so direct connections work from outside.";
+                        Toggle {
+                            checked <=> App.upnp;
+                            enabled: App.direct;
+                            toggled => { App.setting-changed("upnp"); }
+                        }
+                    }
+                }
+            }
+
+            Group {
+                CardHeader {
+                    icon-name: "info";
+                    title: "Troubleshooting";
+                    subtitle: "Logs of OpenView, the host, the relay and the viewer.";
+                }
+                VerticalLayout {
+                    spacing: Theme.spacing-sm;
+                    padding-left: Theme.spacing-xs;
+                    padding-right: Theme.spacing-xs;
+                    HorizontalLayout {
+                        Button {
+                            text: "Open logs folder";
+                            size: ButtonSize.SM;
+                            variant: ButtonVariant.Secondary;
+                            clicked => { App.open-logs(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+            }
+        }
+    }
+}

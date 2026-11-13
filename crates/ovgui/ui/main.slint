@@ -1,0 +1,232 @@
+// Root window: sidebar + page stack + modals + toast. Re-exports everything
+// Rust touches.
+
+import { Theme } from "theme.slint";
+import { App, Page, HostStatus, Connection } from "adapters.slint";
+import { Icon, IconSize } from "components/icon.slint";
+import { Button, ButtonVariant, ButtonSize, LinkButton } from "components/button.slint";
+import { Input } from "components/input.slint";
+import { ClickAway } from "components/click-away.slint";
+import { NavItem, Modal, Toast, StatusDot } from "components/widgets.slint";
+import { RemotePage } from "pages/remote.slint";
+import { SettingsPage } from "pages/settings.slint";
+import { AboutPage } from "pages/about.slint";
+
+export { App, Page, HostStatus, Connection, Theme }
+
+component Sidebar inherits Rectangle {
+    width: 220px;
+    background: Theme.sidebar;
+    property <color> status-color:
+        App.host-status == HostStatus.Ready ? Theme.success :
+        App.host-status == HostStatus.Connected ? Theme.primary :
+        App.host-status == HostStatus.Error ? Theme.error :
+        App.host-status == HostStatus.Paused ? Theme.idle : Theme.warning;
+    property <string> status-short:
+        App.host-status == HostStatus.Ready ? "Ready to connect" :
+        App.host-status == HostStatus.Connected ? "Session active" :
+        App.host-status == HostStatus.Error ? "Not reachable" :
+        App.host-status == HostStatus.Paused ? "Remote access paused" :
+        App.host-status == HostStatus.External ? "Another host is running" : "Starting…";
+
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        height: 100%;
+        background: Theme.border;
+    }
+
+    VerticalLayout {
+        padding: Theme.spacing-lg;
+        padding-top: 20px;
+        spacing: Theme.spacing-xs;
+
+        HorizontalLayout {
+            spacing: Theme.spacing-md;
+            padding-left: Theme.spacing-xs;
+            padding-bottom: Theme.spacing-xl;
+            Image {
+                source: @image-url("../../../assets/openview.svg");
+                width: 40px;
+                height: 40px;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 0px;
+                Text {
+                    text: "OpenView";
+                    color: Theme.text-primary;
+                    font-size: 19px;
+                    font-weight: Theme.font-weight-bold;
+                }
+                Text {
+                    text: "for Windows";
+                    color: Theme.text-muted;
+                    font-size: Theme.font-sm;
+                }
+            }
+        }
+
+        NavItem {
+            label: "Remote Control";
+            icon-name: "monitor";
+            active: App.page == Page.Remote;
+            clicked => { App.page = Page.Remote; }
+        }
+        NavItem {
+            label: "Settings";
+            icon-name: "settings";
+            active: App.page == Page.Settings;
+            clicked => { App.page = Page.Settings; }
+        }
+        NavItem {
+            label: "About";
+            icon-name: "info";
+            active: App.page == Page.About;
+            clicked => { App.page = Page.About; }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        // Bottom status pill ("Ready to connect").
+        Rectangle {
+            height: 44px;
+            border-radius: Theme.radius-md;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            HorizontalLayout {
+                padding-left: Theme.spacing-md;
+                padding-right: Theme.spacing-md;
+                spacing: Theme.spacing-sm;
+                VerticalLayout {
+                    alignment: center;
+                    StatusDot { dot-color: root.status-color; }
+                }
+                Text {
+                    text: root.status-short;
+                    color: Theme.text-primary;
+                    font-size: Theme.font-sm;
+                    font-weight: Theme.font-weight-medium;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+        Text {
+            text: "v" + App.version;
+            color: Theme.text-muted;
+            font-size: Theme.font-xs;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "OpenView";
+    min-width: 860px;
+    min-height: 600px;
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    background: Theme.background;
+    default-font-family: Theme.font-family;
+
+    property <bool> dark: App.dark-mode;
+    changed dark => { Theme.dark = App.dark-mode; }
+    init => { Theme.dark = App.dark-mode; }
+
+    property <Page> page: App.page;
+    changed page => { click-away.clear(); }
+
+    click-away := ClickAway { }
+
+    HorizontalLayout {
+        Sidebar { }
+        Rectangle {
+            horizontal-stretch: 1;
+            RemotePage {
+                visible: App.page == Page.Remote;
+                width: parent.width;
+                height: parent.height;
+            }
+            SettingsPage {
+                visible: App.page == Page.Settings;
+                width: parent.width;
+                height: parent.height;
+            }
+            AboutPage {
+                visible: App.page == Page.About;
+                width: parent.width;
+                height: parent.height;
+            }
+        }
+    }
+
+    // ---- Change PIN ----
+    Modal {
+        width: parent.width;
+        height: parent.height;
+        shown: App.pin-dialog-open;
+        title: "Change PIN";
+        dismissed => { App.pin-dialog-open = false; }
+        Text {
+            text: "Devices must enter this PIN to control this computer. Saving restarts the host, which ends any open session.";
+            color: Theme.text-secondary;
+            font-size: Theme.font-md;
+            wrap: word-wrap;
+        }
+        Input {
+            label: "New PIN (at least 6 characters)";
+            password: true;
+            text <=> App.new-pin;
+        }
+        Input {
+            label: "Confirm PIN";
+            password: true;
+            text <=> App.confirm-pin;
+            error: App.pin-dialog-error;
+            accepted => { App.save-pin(); }
+        }
+        Rectangle {
+            visible: App.pin-dialog-info != "";
+            height: App.pin-dialog-info != "" ? 36px : 0px;
+            border-radius: Theme.radius-sm;
+            background: Theme.primary-soft;
+            Text {
+                x: Theme.spacing-md;
+                width: parent.width - 2 * Theme.spacing-md;
+                text: App.pin-dialog-info;
+                color: Theme.text-primary;
+                font-size: Theme.font-md;
+                vertical-alignment: center;
+                height: parent.height;
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.spacing-sm;
+            Button {
+                text: "Generate";
+                icon-name: "key";
+                variant: ButtonVariant.Ghost;
+                clicked => { App.generate-pin(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Cancel";
+                variant: ButtonVariant.Secondary;
+                clicked => { App.pin-dialog-open = false; }
+            }
+            Button {
+                text: "Save PIN";
+                clicked => { App.save-pin(); }
+            }
+        }
+    }
+
+    Toast {
+        x: (parent.width - self.width) / 2 + 110px;
+        y: parent.height - self.height - 24px;
+        message: App.toast-text;
+        shown: App.toast-shown;
+    }
+}

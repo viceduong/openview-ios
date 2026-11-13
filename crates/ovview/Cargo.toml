@@ -1,0 +1,45 @@
+[package]
+name = "ovview"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView viewer: shows and controls a remote OpenView host"
+
+[dependencies]
+ovcore = { path = "../ovcore" }
+ovtransport = { path = "../ovtransport" }
+# `opus`: Opus audio decode/encode (libopus; desktop-only C dependency).
+ovapp = { path = "../ovapp", features = ["opus", "mf"] }
+ovdiscovery = { path = "../ovdiscovery" }
+hex.workspace = true
+# Data dirs, the JSON status channel on stdout, stderr logging.
+ovcommon = { path = "../ovcommon", features = ["logging"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+
+# Section 4: Direct2D presenter (flip-model swap chain, high-quality cubic).
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Foundation_Numerics",
+] }
+
+[dev-dependencies]
+# In-process relay for the unit tests.
+ovrelay = { path = "../ovrelay" }
+
+[build-dependencies]
+embed-resource = "3"
+
+[lints]
+workspace = true

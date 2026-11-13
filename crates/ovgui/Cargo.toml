@@ -1,0 +1,70 @@
+[package]
+name = "ovgui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView for Windows: desktop GUI that supervises ovhost/ovrelay and launches ovview"
+
+[[bin]]
+name = "OpenView"
+path = "src/main.rs"
+
+[features]
+# D3D11 WARP presentation (Slint software raster via a DXGI swap chain) is the
+# default renderer on Windows; `--no-default-features` = plain software.
+default = ["d3d11"]
+d3d11 = ["dep:anyhow", "dep:tracing", "dep:raw-window-handle", "dep:winit"]
+
+[dependencies]
+# Pin the Slint MINOR (the vendored D3D11 platform is verified on 1.14).
+slint = { version = "~1.14", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-software",
+    "compat-1-2",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Data-dir rule + the JSON status events ovhost/ovview print on stdout.
+ovcommon = { path = "../ovcommon" }
+
+anyhow = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = { version = "0.6", optional = true }
+winit = { version = "0.30", optional = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+] }
+
+[build-dependencies]
+slint-build = "~1.14"
+embed-resource = "3"
+
+[lints]
+workspace = true

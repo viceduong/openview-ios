@@ -1,0 +1,88 @@
+import { Theme } from "../theme.slint";
+import { App } from "../adapters.slint";
+import { Card } from "../components/widgets.slint";
+import { Icon, IconSize } from "../components/icon.slint";
+import { AboutSlint } from "std-widgets.slint";
+
+component Fact inherits HorizontalLayout {
+    in property <string> icon-name;
+    in property <string> text;
+    spacing: Theme.spacing-md;
+    VerticalLayout {
+        alignment: center;
+        Icon { name: root.icon-name; size: IconSize.SM; icon-color: Theme.primary; }
+    }
+    Text {
+        text: root.text;
+        color: Theme.text-secondary;
+        font-size: Theme.font-md;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+export component AboutPage inherits Rectangle {
+    VerticalLayout {
+        padding: Theme.spacing-xl;
+        padding-top: 20px;
+        spacing: Theme.spacing-lg;
+        alignment: start;
+        Text {
+            text: "About";
+            color: Theme.text-primary;
+            font-size: Theme.font-2xl;
+            font-weight: Theme.font-weight-semibold;
+        }
+        Card {
+            pad: Theme.spacing-2xl;
+            HorizontalLayout {
+                spacing: Theme.spacing-xl;
+                VerticalLayout {
+                    alignment: start;
+                    Image {
+                        source: @image-url("../../../../assets/openview.svg");
+                        width: 96px;
+                        height: 96px;
+                    }
+                }
+                VerticalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: start;
+                    Text {
+                        text: "OpenView for Windows";
+                        color: Theme.text-primary;
+                        font-size: Theme.font-2xl;
+                        font-weight: Theme.font-weight-bold;
+                    }
+                    Text {
+                        text: "Version " + App.version;
+                        color: Theme.primary;
+                        font-size: Theme.font-md;
+                        font-weight: Theme.font-weight-semibold;
+                    }
+                    Text {
+                        text: "Personal-use remote desktop. Reach this PC from your phone or another computer, and control other computers from here.";
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-md;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: Theme.spacing-sm; }
+                    Fact { icon-name: "shield"; text: "End-to-end encrypted sessions (X25519 + ChaCha20-Poly1305), PIN-authenticated."; }
+                    Fact { icon-name: "link"; text: "Relay first, then a direct UDP path when the network allows."; }
+                    Fact { icon-name: "monitor"; text: "Runs ovhost, ovrelay and ovview under the hood."; }
+                }
+            }
+        }
+        // Slint royalty-free license: the "Made with Slint" attribution.
+        Card {
+            pad: Theme.spacing-lg;
+            HorizontalLayout {
+                alignment: start;
+                AboutSlint {
+                    preferred-height: 120px;
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,87 @@
+// The Rust<->UI contract. `in` = Rust writes, UI displays; `in-out` = both;
+// callbacks = UI -> Rust. Exported from main.slint so Rust gets an API.
+
+export enum Page { Remote, Settings, About }
+
+export enum HostStatus { Starting, Ready, Connected, Paused, Error, External }
+
+export struct Connection {
+    id: string,        // formatted "309 731 599 215"
+    raw-id: string,    // digits only
+    name: string,
+    subtitle: string,  // "Last connected 2 hours ago"
+    favorite: bool,
+    has-pin: bool,
+}
+
+export global App {
+    // ---- navigation / appearance ----
+    in-out property <Page> page: Page.Remote;
+    in property <bool> dark-mode: false;
+    in property <string> version: "";
+    in property <bool> dev-mode: false;
+
+    // ---- allow remote control (this computer) ----
+    in property <string> my-id: "";             // formatted, "" = unknown yet
+    in property <string> pin: "";
+    in-out property <bool> pin-shown: false;
+    in property <HostStatus> host-status: HostStatus.Starting;
+    in property <string> status-text: "Starting…";
+    in property <string> status-detail: "";
+    in property <bool> session-active: false;
+    in property <bool> busy: false;              // a restart is in flight
+    callback copy-id();
+    callback copy-pin();
+    callback open-pin-dialog();
+    callback end-session();
+    callback toggle-pause();
+    callback take-over();
+
+    // ---- connect to a computer ----
+    in-out property <string> partner-id: "";
+    in-out property <string> partner-pin: "";
+    in-out property <bool> remember-pin: true;
+    in property <string> partner-error: "";
+    in property <bool> connecting: false;
+    in property <string> outgoing-relay: "";
+    pure callback format-id(string) -> string;
+    callback connect();
+    in property <[Connection]> connections: [];
+    in-out property <int> list-filter: 0;        // 0 = recent, 1 = favorites
+    in property <int> favorite-count: 0;
+    in property <int> recent-count: 0;
+    callback connection-connect(string);          // raw id
+    callback connection-select(string);
+    callback connection-toggle-favorite(string);
+    callback connection-remove(string);
+    callback list-filter-changed();
+
+    // ---- settings ----
+    in-out property <bool> start-at-login: false;
+    in-out property <bool> send-audio: true;
+    in-out property <bool> play-mic: true;
+    in-out property <bool> hide-wallpaper: true;
+    in-out property <int> fps-mode: 0;           // 0 Auto, 1 = 30, 2 = 60
+    in-out property <bool> direct: true;
+    in-out property <bool> upnp: true;
+    in-out property <string> relay-address: "";
+    in property <string> default-relay: "";      // placeholder / test relay
+    in property <bool> relay-missing: false;     // no outgoing relay configured
+    in-out property <bool> run-relay: true;      // run the bundled relay here
+    in property <string> settings-note: "";
+    callback setting-changed(string);            // key
+    callback open-logs();
+
+    // ---- change-PIN dialog ----
+    in-out property <bool> pin-dialog-open: false;
+    in-out property <string> new-pin: "";
+    in-out property <string> confirm-pin: "";
+    in property <string> pin-dialog-error: "";
+    in property <string> pin-dialog-info: "";
+    callback save-pin();
+    callback generate-pin();
+
+    // ---- toast ----
+    in property <string> toast-text: "";
+    in property <bool> toast-shown: false;
+}

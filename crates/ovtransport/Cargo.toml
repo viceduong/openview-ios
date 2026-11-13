@@ -1,0 +1,28 @@
+[package]
+name = "ovtransport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView Carrier transport layer: UDP P2P, TCP-framed, and in-process datagram carriers"
+
+[dependencies]
+ovcore = { path = "../ovcore" }
+thiserror.workspace = true
+# Socket options the std API lacks (SO_RCVBUF/SO_SNDBUF for the UDP
+# carrier). Pure Rust (libc / windows-sys): the iOS staticlib stays C-free.
+socket2 = "0.5"
+# Wave 3: Reed-Solomon FEC for video on the direct path's media channel.
+# Pure Rust (runtime SIMD detection on x86 / NEON on aarch64), builds for iOS.
+reed-solomon-simd = "3.1"
+# Wave 3: the media channel's AEAD (same crate/version ovcore uses).
+chacha20poly1305.workspace = true
+
+[dev-dependencies]
+ovrelay = { path = "../ovrelay" }
+ovdiscovery = { path = "../ovdiscovery" }
+
+[lints]
+workspace = true

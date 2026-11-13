@@ -1,0 +1,24 @@
+// Build settings shared by every configuration of the OpenView app and its
+// tests. project.yml applies this file to the Debug and Release configs.
+//
+// Override any value without editing tracked files: create
+// Config/Local.xcconfig (git-ignored) next to this file, e.g.
+//
+//     OV_BUNDLE_ID_PREFIX = com.example
+//     DEVELOPMENT_TEAM = ABCDE12345
+//     OV_DEFAULT_RELAY_URL = wss:/$()/relay.example.com/relay
+//
+// Note the `/$()/` in URLs: `//` starts a comment in .xcconfig files, and
+// `$()` expands to nothing, so the value becomes `wss://relay.example.com/relay`.
+
+// Reverse-DNS prefix of the bundle identifiers (app: <prefix>.remoteview).
+OV_BUNDLE_ID_PREFIX = org.openview
+
+// Relay server baked into the build (Info.plist key OVDefaultRelayURL).
+// Empty: the app asks for a relay on first launch. Users can always
+// change it in Settings > Connection.
+OV_DEFAULT_RELAY_URL =
+
+PRODUCT_BUNDLE_IDENTIFIER = $(OV_BUNDLE_ID_PREFIX).remoteview
+
+#include? "Local.xcconfig"

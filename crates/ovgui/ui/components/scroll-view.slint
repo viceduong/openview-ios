@@ -1,0 +1,163 @@
+// =============================================================================
+// Custom ScrollView — zero-offset scrollbar
+// =============================================================================
+// Drop-in replacement for std-widgets ScrollView.
+// Uses Flickable + a hand-drawn scrollbar so the thumb reaches the very top
+// and bottom of the track (no 16 px reserved for arrow buttons).
+// =============================================================================
+
+import { Theme } from "../theme.slint";
+
+component ScrollBar inherits Rectangle {
+    in-out property <length> value;           // negative (viewport-y)
+    in property <length> page-size;           // visible height
+    in property <length> maximum;             // positive, = content-height - visible-height
+
+    // NaN/Inf-safe clamp for scroll values written from drag math. See the
+    // comment on CustomScrollView.clamped-scroll for the IEEE-754 rationale.
+    pure function safe-value(v: length) -> length {
+        v < 1px && v > -10000000px ? clamp(v, -root.maximum, 0px) : 0px
+    }
+
+    // Track = full height of this Rectangle (zero padding)
+    property <length> track-height: self.height;
+    property <length> thumb-height: maximum + page-size > 0px
+        ? max(20px, track-height * (page-size / (maximum + page-size)))
+        : track-height;
+    property <length> thumb-y: maximum > 0px
+        ? (track-height - thumb-height) * clamp(-value / maximum, 0, 1)
+        : 0px;
+    property <bool> thumb-hover: track-touch.has-hover
+        && track-touch.mouse-y >= root.thumb-y
+        && track-touch.mouse-y <= root.thumb-y + root.thumb-height;
+
+    width: 6px;
+    visible: maximum > 0px;
+
+    // Thumb
+    thumb := Rectangle {
+        x: 0;
+        y: parent.thumb-y;
+        width: parent.width;
+        height: parent.thumb-height;
+        border-radius: 3px;
+        background: thumb-hover || track-touch.pressed ? Theme.text-muted : Theme.border;
+        opacity: thumb-hover || track-touch.pressed ? 1.0 : 0.7;
+        animate background { duration: Theme.duration-fast; }
+        animate opacity  { duration: Theme.duration-fast; }
+    }
+
+    // Full-track touch area — never moves, stable coordinate system
+    track-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+
+        property <length> press-offset;  // mouse offset within thumb at press time
+
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                if self.mouse-y >= root.thumb-y && self.mouse-y <= root.thumb-y + root.thumb-height {
+                    // Clicked on thumb — record offset for smooth drag
+                    self.press-offset = self.mouse-y - root.thumb-y;
+                } else {
+                    // Clicked on track — jump thumb center to click position
+                    self.press-offset = root.thumb-height / 2;
+                    root.value = root.safe-value(
+                        -(self.mouse-y - self.press-offset) / max(1px, root.track-height - root.thumb-height) * root.maximum
+                    );
+                }
+            }
+        }
+
+        moved => {
+            if self.pressed {
+                root.value = root.safe-value(
+                    -(self.mouse-y - self.press-offset) / max(1px, root.track-height - root.thumb-height) * root.maximum
+                );
+            }
+        }
+    }
+}
+
+export component CustomScrollView inherits Rectangle {
+    // Expose the same API as std ScrollView
+    in-out property <length> viewport-width <=> flick.viewport-width;
+    in-out property <length> viewport-height <=> flick.viewport-height;
+    in-out property <length> viewport-x <=> flick.viewport-x;
+    in-out property <length> viewport-y <=> flick.viewport-y;
+    out property <length> visible-width <=> flick.width;
+    out property <length> visible-height <=> flick.height;
+    in property <bool> enabled: true;
+    in property <float> scroll-speed: 3.0;  // wheel-scroll multiplier
+    property <length> prev-viewport-y: 0px; // track previous position for delta calc
+
+    // Sync prev-viewport-y on any viewport-y change (including programmatic).
+    // For user scrolls the flicked handler already sets prev-viewport-y to the
+    // same final value, so this is a harmless no-op in that path.  For external
+    // changes (e.g. scroll compensation) it prevents a jump on the next user scroll.
+    changed viewport-y => {
+        root.prev-viewport-y = root.viewport-y;
+    }
+
+    // Always reserve scrollbar space to avoid binding loops
+    // (flick.width -> viewport-height -> vbar.visible -> scrollbar-width -> flick.width)
+    property <length> scrollbar-space: 7px; // 6px bar + 1px gap
+
+    // NaN/Inf-safe clamp of a candidate scroll position.
+    //
+    // Slint's renderer panics if any length reaching layout is non-finite —
+    // euclid::Vector2D::cast() unwraps a `try_cast` of f32 → i32 physical
+    // pixels at vector.rs:698. Wheel events that compound the (speed-1)
+    // amplification across many consecutive flicks can accumulate rounding
+    // and, on rapid scroll bursts, produce a length that the renderer can't
+    // cast. IEEE-754 says NaN compares as false against anything, so the
+    // `> ... && < ...` finite-range probe rejects NaN/Inf into the safe
+    // fallback (0px). Finite values pass through to the regular clamp.
+    //
+    // The ±10000000px safety window is far beyond any real scroll content
+    // (millions of logical px → tens of millions of physical px even at 4×
+    // scale), so finite-but-large values still get the normal clamp path.
+    pure function clamped-scroll(target: length, lower-bound: length) -> length {
+        // Sanitise lower-bound first: a non-finite viewport-height from a
+        // mid-scroll layout shift would propagate -Inf into the clamp, which
+        // re-introduces the panic. The same `< 1px && > -10000000px` probe
+        // rejects NaN/Inf via IEEE-754 false-on-NaN comparisons.
+        target < 1px && target > -10000000px && lower-bound < 1px && lower-bound > -10000000px
+            ? clamp(target, min(0px, lower-bound), 0px)
+            : 0px
+    }
+
+    flick := Flickable {
+        x: 0;
+        y: 0;
+        width: root.width - root.scrollbar-space;
+        height: root.height;
+        interactive: false;
+
+        flicked => {
+            // Amplify: Flickable already moved by 1x delta, add (speed-1)x more.
+            // All math passes through `clamped-scroll`, which both bounds the
+            // result to the content's valid scroll range and refuses non-finite
+            // inputs so the renderer never sees NaN/Inf.
+            flick.viewport-y = root.clamped-scroll(
+                flick.viewport-y + (flick.viewport-y - root.prev-viewport-y) * (root.scroll-speed - 1),
+                -(flick.viewport-height - flick.height)
+            );
+            root.prev-viewport-y = flick.viewport-y;
+        }
+
+        @children
+    }
+
+    // Vertical scrollbar — right edge, hides when content fits
+    vbar := ScrollBar {
+        x: root.width - 6px;
+        y: 0;
+        height: root.height;
+        value <=> flick.viewport-y;
+        page-size: flick.height;
+        maximum: max(0px, flick.viewport-height - flick.height);
+    }
+}

@@ -1,0 +1,155 @@
+// Text input with the full set of native-field behaviors (focus border, Esc
+// revert, Enter commit, blur-commit-if-changed, password + reveal eye,
+// `clip` + `min-width: 0px` together, `visible`-toggled placeholder).
+// `reformat: true` routes every keystroke through `transform(text)` (e.g.
+// digit grouping) and keeps the caret at the end.
+
+import { Theme } from "../theme.slint";
+import { Icon, IconSize, IconButton } from "icon.slint";
+
+export component Input inherits Rectangle {
+    in-out property <string> text;
+    in property <string> label: "";
+    in property <string> placeholder: "";
+    in property <string> error: "";
+    in property <bool> enabled: true;
+    in property <bool> password: false;
+    in property <bool> reformat: false;
+    in property <length> font-size: Theme.font-md;
+    in property <length> box-height: 40px;
+
+    property <bool> has-error: error != "";
+    property <bool> is-focused: false;
+    property <bool> reveal: false;
+    property <string> text-before-edit: "";
+
+    callback accepted();
+    callback edited();
+    callback committed();
+    pure callback transform(string) -> string;
+
+    public function focus-field() { field.focus(); }
+
+    function commit-if-changed() {
+        if root.text != root.text-before-edit {
+            root.text-before-edit = root.text;
+            root.committed();
+        }
+    }
+
+    sink := FocusScope { width: 0px; height: 0px; }
+
+    height: (label != "" ? 20px : 0px) + box-height + (has-error ? 20px : 0px);
+    vertical-stretch: 0;
+
+    VerticalLayout {
+        spacing: Theme.spacing-xs;
+        alignment: start;
+
+        if label != "": Text {
+            text: root.label;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            font-weight: Theme.font-weight-semibold;
+        }
+
+        Rectangle {
+            height: root.box-height;
+            border-radius: Theme.radius-sm;
+            border-width: root.is-focused ? 2px : 1px;
+            border-color: has-error ? Theme.error
+                : (root.is-focused ? Theme.primary : Theme.border);
+            background: root.is-focused ? Theme.surface : Theme.field;
+            clip: true;
+            animate border-color { duration: Theme.duration-fast; }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-md;
+                padding-right: Theme.spacing-xs;
+                spacing: Theme.spacing-xs;
+
+                field := TextInput {
+                    min-width: 0px;
+                    horizontal-stretch: 1;
+                    text <=> root.text;
+                    enabled: root.enabled;
+                    font-size: root.font-size;
+                    color: root.enabled ? Theme.text-primary : Theme.text-muted;
+                    selection-background-color: Theme.primary-soft;
+                    selection-foreground-color: Theme.text-primary;
+                    input-type: (password && !reveal) ? InputType.password : InputType.text;
+                    vertical-alignment: center;
+                    single-line: true;
+
+                    accepted => {
+                        root.commit-if-changed();
+                        sink.focus();
+                        root.accepted();
+                    }
+                    edited => {
+                        if root.reformat {
+                            let t = root.transform(self.text);
+                            if t != self.text {
+                                self.text = t;
+                                self.set-selection-offsets(10000, 10000);
+                            }
+                        }
+                        root.edited();
+                    }
+                    changed has-focus => {
+                        root.is-focused = self.has-focus;
+                        if self.has-focus {
+                            root.text-before-edit = root.text;
+                        } else {
+                            root.commit-if-changed();
+                        }
+                    }
+                    key-pressed(event) => {
+                        if event.text == Key.Escape {
+                            root.text = root.text-before-edit;
+                            sink.focus();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                if password: VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        box: 30px;
+                        icon-name: root.reveal ? "eye-off" : "eye";
+                        icon-color: Theme.text-muted;
+                        clicked => { root.reveal = !root.reveal; }
+                    }
+                }
+            }
+
+            Text {
+                visible: root.text == "";
+                x: Theme.spacing-md;
+                width: max(0px, parent.width - self.x - Theme.spacing-md);
+                height: 100%;
+                text: root.placeholder;
+                color: Theme.text-muted;
+                font-size: root.font-size;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        Rectangle {
+            visible: has-error;
+            height: has-error ? 16px : 0px;
+            Text {
+                x: 0px;
+                width: parent.width;
+                text: root.error;
+                color: Theme.error;
+                font-size: Theme.font-xs;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}

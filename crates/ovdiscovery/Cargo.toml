@@ -1,0 +1,17 @@
+[package]
+name = "ovdiscovery"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView LAN discovery: mDNS/DNS-SD advertise + browse, pairing-code instance names"
+
+[dependencies]
+thiserror.workspace = true
+# Multicast interface selection for SSDP (pure Rust).
+socket2 = "0.5"
+
+[lints]
+workspace = true

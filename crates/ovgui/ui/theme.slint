@@ -1,0 +1,64 @@
+// Design tokens. `dark` is the only in-out (Rust mirrors the Windows app
+// theme into it); every color derives from it.
+
+export global Theme {
+    in-out property <bool> dark: false;
+
+    // Brand accent (#0A6CFF light / #3D8BFF dark).
+    out property <color> primary: self.dark ? #3D8BFF : #0A6CFF;
+    out property <color> primary-hover: self.dark ? #5A9DFF : #085BD9;
+    out property <color> primary-soft: self.dark ? #3D8BFF26 : #0A6CFF14;
+    out property <color> on-primary: #FFFFFF;
+
+    // Surfaces
+    out property <color> background: self.dark ? #15171C : #F3F5F8;
+    out property <color> surface: self.dark ? #1E2128 : #FFFFFF;
+    out property <color> sidebar: self.dark ? #1A1D23 : #FBFCFD;
+    out property <color> surface-hover: self.dark ? #2A2E37 : #EEF1F5;
+    out property <color> field: self.dark ? #262A32 : #F5F7FA;
+    out property <color> scrim: self.dark ? #000000A0 : #0F172A66;
+
+    // Text
+    out property <color> text-primary: self.dark ? #ECEFF4 : #161B26;
+    out property <color> text-secondary: self.dark ? #A9B1BF : #556070;
+    out property <color> text-muted: self.dark ? #737C8C : #8A94A6;
+
+    // Lines & status
+    out property <color> border: self.dark ? #30353F : #E1E5EC;
+    out property <color> border-strong: self.dark ? #3C424E : #CDD3DD;
+    out property <color> success: self.dark ? #34C77B : #16A34A;
+    out property <color> warning: self.dark ? #F0B43C : #D97706;
+    out property <color> error: self.dark ? #F26B6B : #DC2626;
+    out property <color> error-hover: self.dark ? #F58A8A : #B91C1C;
+    out property <color> error-soft: self.dark ? #F26B6B22 : #DC262612;
+    out property <color> idle: self.dark ? #737C8C : #9AA3B2;
+
+    // Spacing
+    out property <length> spacing-xs: 4px;
+    out property <length> spacing-sm: 8px;
+    out property <length> spacing-md: 12px;
+    out property <length> spacing-lg: 16px;
+    out property <length> spacing-xl: 24px;
+    out property <length> spacing-2xl: 32px;
+
+    // Radii
+    out property <length> radius-sm: 6px;
+    out property <length> radius-md: 8px;
+    out property <length> radius-lg: 12px;
+
+    // Fonts
+    out property <string> font-family: "Segoe UI";
+    out property <length> font-xs: 11px;
+    out property <length> font-sm: 12px;
+    out property <length> font-md: 14px;
+    out property <length> font-lg: 16px;
+    out property <length> font-xl: 20px;
+    out property <length> font-2xl: 28px;
+    out property <length> font-id: 30px;
+    out property <int> font-weight-regular: 400;
+    out property <int> font-weight-medium: 500;
+    out property <int> font-weight-semibold: 600;
+    out property <int> font-weight-bold: 700;
+
+    out property <duration> duration-fast: 120ms;
+}

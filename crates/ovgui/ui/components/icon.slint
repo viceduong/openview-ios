@@ -1,0 +1,88 @@
+// SVG icons (white-stroke, colorized to a theme color), looked up by name.
+// The lookup is split across several `image` properties: one long
+// `@image-url` ternary chain overflows the Slint compiler's stack.
+// Keep ui/icons 1:1 with these names; a missing name draws nothing.
+
+import { Theme } from "../theme.slint";
+
+export enum IconSize { XS, SM, MD, LG, XL }
+
+export component Icon inherits Rectangle {
+    in property <string> name: "";
+    in property <IconSize> size: IconSize.MD;
+    in property <color> icon-color: Theme.text-primary;
+
+    property <length> px:
+        size == IconSize.XS ? 12px :
+        size == IconSize.SM ? 16px :
+        size == IconSize.MD ? 20px :
+        size == IconSize.LG ? 24px : 32px;
+
+    property <image> nav-icon:
+        name == "monitor" ? @image-url("../icons/monitor.svg") :
+        name == "settings" ? @image-url("../icons/settings.svg") :
+        name == "info" ? @image-url("../icons/info.svg") :
+        name == "phone" ? @image-url("../icons/phone.svg") :
+        name == "shield" ? @image-url("../icons/shield.svg") :
+        name == "clock" ? @image-url("../icons/clock.svg") :
+        name == "link" ? @image-url("../icons/link.svg") : @image-url("");
+    property <image> action-icon:
+        name == "copy" ? @image-url("../icons/copy.svg") :
+        name == "eye" ? @image-url("../icons/eye.svg") :
+        name == "eye-off" ? @image-url("../icons/eye-off.svg") :
+        name == "star" ? @image-url("../icons/star.svg") :
+        name == "star-filled" ? @image-url("../icons/star-filled.svg") :
+        name == "trash" ? @image-url("../icons/trash.svg") :
+        name == "edit" ? @image-url("../icons/edit.svg") : @image-url("");
+    property <image> control-icon:
+        name == "pause" ? @image-url("../icons/pause.svg") :
+        name == "play" ? @image-url("../icons/play.svg") :
+        name == "power" ? @image-url("../icons/power.svg") :
+        name == "arrow-right" ? @image-url("../icons/arrow-right.svg") :
+        name == "check" ? @image-url("../icons/check.svg") :
+        name == "close" ? @image-url("../icons/close.svg") :
+        name == "key" ? @image-url("../icons/key.svg") :
+        name == "refresh" ? @image-url("../icons/refresh.svg") : @image-url("");
+
+    width: px;
+    height: px;
+
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: nav-icon.width > 0 ? nav-icon : action-icon.width > 0 ? action-icon : control-icon;
+        colorize: icon-color;
+        image-fit: contain;
+    }
+}
+
+// Icon-only button: hover background + pointer (a real control).
+export component IconButton inherits Rectangle {
+    in property <string> icon-name;
+    in property <color> icon-color: Theme.text-secondary;
+    in property <color> hover-color: Theme.primary;
+    in property <bool> enabled: true;
+    in property <length> box: 32px;
+    callback clicked();
+
+    width: box;
+    height: box;
+    border-radius: Theme.radius-sm;
+    background: touch.has-hover && enabled ? Theme.surface-hover : transparent;
+    opacity: enabled ? 1.0 : 0.4;
+    animate background { duration: Theme.duration-fast; }
+
+    Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        name: root.icon-name;
+        size: IconSize.SM;
+        icon-color: touch.has-hover && root.enabled ? root.hover-color : root.icon-color;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

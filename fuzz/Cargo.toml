@@ -1,0 +1,50 @@
+[package]
+name = "openview-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ovcore = { path = "../crates/ovcore" }
+ovapp = { path = "../crates/ovapp" }
+ovrelay = { path = "../crates/ovrelay", features = ["fuzzing"] }
+
+# Not part of the main workspace (see the root Cargo.toml `exclude`).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "handshake_feed"
+path = "fuzz_targets/handshake_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command_decode"
+path = "fuzz_targets/command_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bands_parse"
+path = "fuzz_targets/bands_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_frames"
+path = "fuzz_targets/ws_frames.rs"
+test = false
+doc = false
+bench = false

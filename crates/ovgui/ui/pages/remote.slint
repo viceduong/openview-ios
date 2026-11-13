@@ -1,0 +1,429 @@
+// Remote Control page: "Allow remote control" + "Connect to a computer"
+// side by side, recent/favorite connections below.
+
+import { Theme } from "../theme.slint";
+import { App, HostStatus, Connection, Page } from "../adapters.slint";
+import { Icon, IconSize, IconButton } from "../components/icon.slint";
+import { Button, ButtonVariant, ButtonSize, LinkButton } from "../components/button.slint";
+import { Input } from "../components/input.slint";
+import { Card, CardHeader, Divider, Toggle, Segmented, StatusDot } from "../components/widgets.slint";
+import { CustomScrollView } from "../components/scroll-view.slint";
+
+component FieldLabel inherits Text {
+    color: Theme.text-muted;
+    font-size: Theme.font-xs;
+    font-weight: Theme.font-weight-semibold;
+    letter-spacing: 0.6px;
+}
+
+component AllowCard inherits Card {
+    property <color> status-color:
+        App.host-status == HostStatus.Ready ? Theme.success :
+        App.host-status == HostStatus.Connected ? Theme.primary :
+        App.host-status == HostStatus.Error ? Theme.error :
+        App.host-status == HostStatus.Starting ? Theme.warning :
+        App.host-status == HostStatus.External ? Theme.warning : Theme.idle;
+
+    CardHeader {
+        icon-name: "shield";
+        title: "Allow remote control";
+        subtitle: "Share this ID and PIN with the device that connects.";
+    }
+    Rectangle { height: 2px; }
+
+    FieldLabel { text: "YOUR ID"; }
+    HorizontalLayout {
+        spacing: Theme.spacing-sm;
+        Text {
+            text: App.my-id != "" ? App.my-id : "— — —";
+            color: App.my-id != "" ? Theme.text-primary : Theme.text-muted;
+            font-size: Theme.font-id;
+            font-weight: Theme.font-weight-semibold;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon-name: "copy";
+                enabled: App.my-id != "";
+                clicked => { App.copy-id(); }
+            }
+        }
+    }
+
+    FieldLabel { text: "PIN"; }
+    HorizontalLayout {
+        spacing: Theme.spacing-xs;
+        Text {
+            text: App.pin-shown ? App.pin : "••••••••";
+            color: Theme.text-primary;
+            font-size: Theme.font-xl;
+            font-weight: Theme.font-weight-medium;
+            letter-spacing: App.pin-shown ? 1px : 3px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon-name: App.pin-shown ? "eye-off" : "eye";
+                clicked => { App.pin-shown = !App.pin-shown; }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon-name: "copy";
+                clicked => { App.copy-pin(); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            LinkButton {
+                text: "Change";
+                clicked => { App.open-pin-dialog(); }
+            }
+        }
+    }
+
+    Rectangle { height: 2px; }
+    Divider { }
+    Rectangle { height: 2px; }
+
+    // Status line.
+    HorizontalLayout {
+        spacing: Theme.spacing-md;
+        VerticalLayout {
+            alignment: start;
+            padding-top: 3px;
+            StatusDot { dot-color: root.status-color; }
+        }
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text {
+                text: App.status-text;
+                color: Theme.text-primary;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-semibold;
+                wrap: word-wrap;
+            }
+            Text {
+                text: App.status-detail;
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    // spacing 0 + an explicit collapsing gap: a collapsed (0-width) cell
+    // would still cost the row's spacing.
+    HorizontalLayout {
+        property <bool> ext: App.host-status == HostStatus.External;
+        spacing: 0px;
+        padding-top: Theme.spacing-xs;
+        Button {
+            visible: ext;
+            width: ext ? self.preferred-width : 0px;
+            text: "Stop it and take over";
+            icon-name: "refresh";
+            size: ButtonSize.SM;
+            enabled: !App.busy;
+            clicked => { App.take-over(); }
+        }
+        Button {
+            visible: !ext;
+            width: !ext ? self.preferred-width : 0px;
+            text: "End session";
+            icon-name: "power";
+            size: ButtonSize.SM;
+            variant: ButtonVariant.Secondary;
+            enabled: App.session-active && !App.busy;
+            clicked => { App.end-session(); }
+        }
+        Rectangle { width: ext ? 0px : Theme.spacing-sm; }
+        Button {
+            visible: !ext;
+            width: !ext ? self.preferred-width : 0px;
+            text: App.host-status == HostStatus.Paused ? "Resume remote access" : "Pause remote access";
+            icon-name: App.host-status == HostStatus.Paused ? "play" : "pause";
+            size: ButtonSize.SM;
+            max-w: 220px;
+            variant: App.host-status == HostStatus.Paused ? ButtonVariant.Primary : ButtonVariant.Secondary;
+            enabled: !App.busy;
+            clicked => { App.toggle-pause(); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+}
+
+component ConnectCard inherits Card {
+    CardHeader {
+        icon-name: "monitor";
+        title: "Connect to a computer";
+        subtitle: "Enter the partner's ID and PIN.";
+    }
+    Rectangle { height: 2px; }
+    Input {
+        label: "Partner ID";
+        placeholder: "123 456 789 012";
+        text <=> App.partner-id;
+        reformat: true;
+        font-size: Theme.font-lg;
+        transform(t) => { return App.format-id(t); }
+        accepted => { App.connect(); }
+    }
+    Input {
+        label: "PIN";
+        placeholder: "Partner's access PIN";
+        password: true;
+        text <=> App.partner-pin;
+        accepted => { App.connect(); }
+    }
+    HorizontalLayout {
+        spacing: Theme.spacing-sm;
+        Toggle { checked <=> App.remember-pin; }
+        Text {
+            text: "Remember PIN on this PC";
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    Rectangle { height: 2px; }
+    Button {
+        text: App.connecting ? "Connecting…" : "Connect";
+        icon-name: "arrow-right";
+        icon-trailing: true;
+        size: ButtonSize.LG;
+        max-w: 10000px;
+        loading: App.connecting;
+        enabled: App.partner-id != "";
+        clicked => { App.connect(); }
+    }
+    Rectangle {
+        visible: App.partner-error != "";
+        height: App.partner-error != "" ? err.preferred-height : 0px;
+        err := Text {
+            width: parent.width;
+            text: App.partner-error;
+            color: Theme.error;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+    }
+    Text {
+        visible: !App.relay-missing;
+        height: App.relay-missing ? 0px : self.preferred-height;
+        text: "Relay " + App.outgoing-relay + " · direct path when reachable";
+        color: Theme.text-muted;
+        font-size: Theme.font-xs;
+        overflow: elide;
+    }
+    HorizontalLayout {
+        visible: App.relay-missing;
+        height: App.relay-missing ? self.preferred-height : 0px;
+        spacing: Theme.spacing-xs;
+        Text {
+            text: "No relay configured yet.";
+            color: Theme.warning;
+            font-size: Theme.font-xs;
+            vertical-alignment: center;
+        }
+        LinkButton {
+            text: "Open Settings";
+            clicked => { App.page = Page.Settings; }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+}
+
+component ConnectionRow inherits Rectangle {
+    in property <Connection> item;
+    height: 56px;
+    border-radius: Theme.radius-md;
+    background: hover.has-hover ? Theme.surface-hover : transparent;
+    animate background { duration: Theme.duration-fast; }
+    hover := TouchArea {
+        double-clicked => { App.connection-connect(root.item.raw-id); }
+        clicked => { App.connection-select(root.item.raw-id); }
+    }
+    HorizontalLayout {
+        padding-left: Theme.spacing-md;
+        padding-right: Theme.spacing-sm;
+        spacing: Theme.spacing-md;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 34px;
+                height: 34px;
+                border-radius: 17px;
+                background: Theme.primary-soft;
+                Icon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    name: "monitor";
+                    size: IconSize.SM;
+                    icon-color: Theme.primary;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.item.name != "" ? root.item.name : root.item.id;
+                color: Theme.text-primary;
+                font-size: Theme.font-md;
+                font-weight: Theme.font-weight-semibold;
+                overflow: elide;
+            }
+            Text {
+                text: (root.item.name != "" ? root.item.id + " · " : "") + root.item.subtitle + (root.item.has-pin ? " · PIN saved" : "");
+                color: Theme.text-secondary;
+                font-size: Theme.font-sm;
+                overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon-name: root.item.favorite ? "star-filled" : "star";
+                icon-color: root.item.favorite ? #F5B301 : Theme.text-muted;
+                hover-color: #F5B301;
+                clicked => { App.connection-toggle-favorite(root.item.raw-id); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon-name: "trash";
+                icon-color: Theme.text-muted;
+                hover-color: Theme.error;
+                clicked => { App.connection-remove(root.item.raw-id); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: "Connect";
+                size: ButtonSize.SM;
+                variant: ButtonVariant.Outline;
+                clicked => { App.connection-connect(root.item.raw-id); }
+            }
+        }
+    }
+}
+
+component ConnectionsCard inherits Card {
+    pad: Theme.spacing-lg;
+    HorizontalLayout {
+        padding-left: Theme.spacing-sm;
+        spacing: Theme.spacing-md;
+        VerticalLayout {
+            alignment: center;
+            Icon { name: "clock"; size: IconSize.MD; icon-color: Theme.text-secondary; }
+        }
+        Text {
+            text: "Recent & favorites";
+            color: Theme.text-primary;
+            font-size: Theme.font-lg;
+            font-weight: Theme.font-weight-semibold;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Segmented {
+            options: ["Recent (\{App.recent-count})", "Favorites (\{App.favorite-count})"];
+            selected <=> App.list-filter;
+            changed-to(i) => { App.list-filter-changed(); }
+        }
+    }
+    Divider { }
+    VerticalLayout {
+        spacing: 2px;
+        for c in App.connections: ConnectionRow { item: c; }
+    }
+    Rectangle {
+        visible: App.connections.length == 0;
+        height: App.connections.length == 0 ? 72px : 0px;
+        Text {
+            text: App.list-filter == 0
+                ? "No connections yet. Computers you connect to will appear here."
+                : "No favorites yet. Click the star on a recent connection to pin it here.";
+            color: Theme.text-muted;
+            font-size: Theme.font-md;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component RemotePage inherits Rectangle {
+    CustomScrollView {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        VerticalLayout {
+            padding: Theme.spacing-xl;
+            padding-top: 20px;
+            spacing: Theme.spacing-lg;
+            alignment: start;
+
+            HorizontalLayout {
+                spacing: Theme.spacing-md;
+                Text {
+                    text: "Remote Control";
+                    color: Theme.text-primary;
+                    font-size: Theme.font-2xl;
+                    font-weight: Theme.font-weight-semibold;
+                    vertical-alignment: center;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        visible: App.dev-mode;
+                        width: App.dev-mode ? badge.preferred-width + 16px : 0px;
+                        height: 22px;
+                        border-radius: 11px;
+                        background: Theme.warning.with-alpha(0.18);
+                        badge := Text {
+                            text: "TEST MODE";
+                            color: Theme.warning;
+                            font-size: Theme.font-xs;
+                            font-weight: Theme.font-weight-bold;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+
+            // Two equal columns regardless of their text's natural widths.
+            cards := Rectangle {
+                height: max(allow.preferred-height, conn.preferred-height);
+                allow := AllowCard {
+                    x: 0px;
+                    y: 0px;
+                    width: (cards.width - Theme.spacing-lg) / 2;
+                    height: parent.height;
+                }
+                conn := ConnectCard {
+                    x: (cards.width + Theme.spacing-lg) / 2;
+                    y: 0px;
+                    width: (cards.width - Theme.spacing-lg) / 2;
+                    height: parent.height;
+                }
+            }
+
+            ConnectionsCard { }
+        }
+    }
+}

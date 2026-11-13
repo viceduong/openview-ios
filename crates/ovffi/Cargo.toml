@@ -1,0 +1,23 @@
+[package]
+name = "ovffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView C FFI: staticlib exposing identity/handshake/record/relay for the iOS shell"
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+ovcore = { path = "../ovcore" }
+ovtransport = { path = "../ovtransport" }
+ovapp = { path = "../ovapp" }
+
+[dev-dependencies]
+ovrelay = { path = "../ovrelay" }
+
+[lints]
+workspace = true

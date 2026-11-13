@@ -1,0 +1,141 @@
+// Button: variants/sizes, ONE collapsing icon slot (never `if`), loading
+// spinner, hover = background change, pointer cursor, disabled styling.
+
+import { Theme } from "../theme.slint";
+import { Icon, IconSize } from "icon.slint";
+
+export enum ButtonVariant { Primary, Secondary, Ghost, Destructive, Outline }
+export enum ButtonSize { SM, MD, LG }
+
+export component Button inherits Rectangle {
+    in property <string> text: "";
+    in property <string> icon-name: "";
+    in property <bool> icon-trailing: false;
+    in property <ButtonVariant> variant: ButtonVariant.Primary;
+    in property <ButtonSize> size: ButtonSize.MD;
+    in property <bool> enabled: true;
+    in property <bool> loading: false;
+    in property <length> max-w: size == ButtonSize.SM ? 160px : size == ButtonSize.MD ? 220px : 320px;
+    callback clicked();
+
+    property <length> btn-height: size == ButtonSize.SM ? 30px : size == ButtonSize.MD ? 36px : 44px;
+    property <length> padding-h: size == ButtonSize.SM ? Theme.spacing-md : size == ButtonSize.MD ? 14px : Theme.spacing-xl;
+    property <length> font-sz: size == ButtonSize.SM ? Theme.font-sm : size == ButtonSize.MD ? Theme.font-md : Theme.font-lg;
+    property <bool> hovered: touch.has-hover && enabled && !loading;
+
+    property <color> bg-color:
+        !enabled ? Theme.surface-hover :
+        variant == ButtonVariant.Primary ? Theme.primary :
+        variant == ButtonVariant.Secondary ? Theme.surface :
+        variant == ButtonVariant.Destructive ? Theme.error : transparent;
+    property <color> bg-hover:
+        variant == ButtonVariant.Primary ? Theme.primary-hover :
+        variant == ButtonVariant.Destructive ? Theme.error-hover :
+        variant == ButtonVariant.Outline ? Theme.primary-soft :
+        Theme.surface-hover;
+    property <color> text-color:
+        !enabled ? Theme.text-muted :
+        variant == ButtonVariant.Primary ? Theme.on-primary :
+        variant == ButtonVariant.Destructive ? white :
+        variant == ButtonVariant.Outline ? Theme.primary : Theme.text-primary;
+    property <color> border-clr:
+        variant == ButtonVariant.Outline ? Theme.primary :
+        variant == ButtonVariant.Secondary ? Theme.border-strong : transparent;
+
+    property <bool> lead-shown: loading || (icon-name != "" && !icon-trailing);
+    property <bool> trail-shown: icon-name != "" && icon-trailing && !loading;
+
+    height: btn-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    max-width: max-w;
+    border-radius: Theme.radius-sm;
+    background: hovered ? bg-hover : bg-color;
+    border-width: (variant == ButtonVariant.Outline || variant == ButtonVariant.Secondary) ? 1px : 0px;
+    border-color: border-clr;
+    opacity: enabled ? 1.0 : 0.7;
+    animate background { duration: Theme.duration-fast; }
+
+    HorizontalLayout {
+        padding-left: padding-h;
+        padding-right: padding-h;
+        spacing: 0px;
+        alignment: center;
+
+        // Lead slot: spinner OR leading icon. Collapses, never `if`.
+        Rectangle {
+            width: lead-shown ? 16px : 0px;
+            Rectangle {
+                visible: loading;
+                width: 14px; height: 14px;
+                border-radius: 7px;
+                border-width: 2px; border-color: text-color;
+                background: transparent; clip: true;
+                Rectangle {
+                    width: 7px; height: 7px; x: 3.5px; y: -2px;
+                    background: bg-color; border-radius: 3.5px;
+                }
+            }
+            Icon {
+                visible: icon-name != "" && !loading && !icon-trailing;
+                name: icon-name;
+                size: IconSize.SM;
+                icon-color: text-color;
+            }
+        }
+
+        if text != "": HorizontalLayout {
+            padding-left: lead-shown ? Theme.spacing-sm : 0px;
+            padding-right: trail-shown ? Theme.spacing-sm : 0px;
+            Text {
+                text: root.text;
+                color: text-color;
+                font-size: font-sz;
+                font-weight: Theme.font-weight-semibold;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            width: trail-shown ? 16px : 0px;
+            Icon {
+                visible: trail-shown;
+                name: icon-name;
+                size: IconSize.SM;
+                icon-color: text-color;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled && !loading;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Text-only link button ("Change", "Generate").
+export component LinkButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: 24px;
+    width: label.preferred-width + 8px;
+    border-radius: 4px;
+    background: touch.has-hover && enabled ? Theme.primary-soft : transparent;
+    label := Text {
+        text: root.text;
+        color: root.enabled ? Theme.primary : Theme.text-muted;
+        font-size: Theme.font-sm;
+        font-weight: Theme.font-weight-semibold;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

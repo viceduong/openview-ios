@@ -1,0 +1,25 @@
+[package]
+name = "ovcore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView secure-remote protocol core: AEAD handshake + record encryption, framing, identity"
+
+[dependencies]
+chacha20poly1305.workspace = true
+x25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+spake2.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+tracing = "0.1"
+
+[lints]
+workspace = true

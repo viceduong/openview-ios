@@ -1,0 +1,53 @@
+[package]
+name = "ovhost"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenView host: makes this PC reachable through a relay (and a direct UDP path) and streams its screen"
+
+[dependencies]
+ovcore = { path = "../ovcore" }
+ovtransport = { path = "../ovtransport" }
+# `zstd-encode`: the host compresses screen payloads with C zstd (host-only;
+# viewers decode with pure-Rust ruzstd).
+# `opus`: Opus audio encode/decode (libopus; host-only C dependency).
+ovapp = { path = "../ovapp", features = ["zstd-encode", "opus", "mf"] }
+ovdiscovery = { path = "../ovdiscovery" }
+hex.workspace = true
+# Data dirs, the JSON status channel on stdout, stderr logging.
+ovcommon = { path = "../ovcommon", features = ["logging"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+
+# DXGI Desktop Duplication capture (Phase 3); host-only.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    # Wave 1 `--system-audio`: WASAPI loopback capture.
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# In-process relay for the unit tests.
+ovrelay = { path = "../ovrelay" }
+
+[build-dependencies]
+embed-resource = "3"
+
+[lints]
+workspace = true

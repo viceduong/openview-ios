@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ovcore",
+    "crates/ovtransport",
+    "crates/ovrelay",
+    "crates/ovdiscovery",
+    "crates/ovapp",
+    "crates/ovview",
+    "crates/ovhost",
+    "crates/ovffi",
+    "crates/ovgui",
+    "crates/ovcommon",
+]
+# cargo-fuzz harness (nightly only); built on its own, see fuzz/README.md.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["OpenView contributors"]
+license = "MIT"
+repository = "https://github.com/OWNER/openview"
+rust-version = "1.92"
+
+[workspace.dependencies]
+chacha20poly1305 = { version = "0.10", features = ["alloc"] }
+x25519-dalek = { version = "2", features = ["getrandom", "static_secrets", "reusable_secrets"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
+# Balanced PAKE for PIN authentication (RustCrypto, pure Rust; iOS-safe).
+spake2 = "0.4"
+zeroize = { version = "1.8", features = ["derive"] }
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+rand_core = "0.6"
+hex = "0.4"
+thiserror = "2"
+# Win32 bindings (host/viewer/GUI; Windows targets only).
+windows = "0.62"
+
+[workspace.lints.clippy]
+# New in clippy 1.100 (36 call sites). Allowed for now; migrating the
+# constant-size `chunks_exact` loops to `as_chunks` is tracked separately.
+chunks_exact_to_as_chunks = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
