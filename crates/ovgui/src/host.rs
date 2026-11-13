@@ -668,15 +668,45 @@ fn friendly_error(reason: &str, relay: &str) -> String {
     if r.contains("refused") || r.contains("10061") {
         format!("Can't reach the relay at {relay} (connection refused). Retrying…")
     } else if r.contains("handshake") {
-        "A device tried to connect but the handshake failed (wrong PIN?).".to_owned()
+        handshake_text(&r).to_owned()
     } else {
         format!("{reason}. Retrying…")
+    }
+}
+
+/// A failed incoming handshake, by cause (`r` is the lowercased reason).
+/// Only a real credential failure mentions the PIN.
+fn handshake_text(r: &str) -> &'static str {
+    if r.contains("authentication failed") {
+        "A device tried to connect with a wrong PIN."
+    } else if r.contains("too many failed pin") || r.contains("rate limited") {
+        "Too many wrong PINs: new attempts are refused for a while."
+    } else if r.contains("timed out") {
+        "A device started to connect but the connection did not complete (network problem?)."
+    } else if r.contains("incompatible") {
+        "A device with a different OpenView version tried to connect. Update both."
+    } else {
+        "A device tried to connect but the secure connection could not be set up."
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_failures_are_described_by_cause() {
+        let t = |m: &str| friendly_error(m, "127.0.0.1:4569");
+        assert!(t("handshake failed: authentication failed: bad MAC").contains("wrong PIN"));
+        assert!(!t("handshake timed out").contains("PIN"));
+        assert!(t("handshake timed out").contains("did not complete"));
+        assert!(
+            t("handshake failed: too many failed PIN attempts; retry in 30 s").contains("Too many")
+        );
+        assert!(t("handshake failed: incompatible handshake version: v1").contains("version"));
+        assert!(!t("handshake recv: io error").contains("PIN"));
+        assert!(t("relay x: connect failed: (os error 10061)").contains("Can't reach the relay"));
+    }
 
     fn env(dev: bool) -> Env {
         let mut e = Env::detect();

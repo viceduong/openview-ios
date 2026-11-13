@@ -181,6 +181,10 @@ fn lan_handshake(
     };
     let mut carrier =
         UdpP2pCarrier::new(local, addr).map_err(|e| (format!("udp socket: {e}"), false))?;
+    // Reliable-UDP framing from the first packet: a lost handshake datagram
+    // is retransmitted instead of stalling the handshake (the host's LAN
+    // port accepts a framed HELLO and frames its side too).
+    carrier.enable_reliable();
     let psk = ovcore::pin::pin_psk(pin.as_bytes());
     let mut hs = Handshake::new(Role::Client, my_dev, me, Auth::Pin(psk));
     // Pin the device id: mDNS answers are unauthenticated, so a different

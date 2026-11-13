@@ -1008,11 +1008,10 @@ fn screen_passes_opus_through_and_advertises_cap_opus() {
     }
 }
 
-/// The iOS datagram transport speaks the reliable UDP framing. A
-/// peer that switched (as a desktop host does after our CAPS advertised
-/// CAP_RUDP) sends framed, fragmented records over a lossy, reordering
-/// wire; the FFI carrier auto-switches, delivers every record intact and in
-/// order through the record sink, and its own records go back framed.
+/// The iOS datagram transport speaks the reliable UDP framing from the first
+/// packet. A peer sends framed, fragmented records over a lossy, reordering
+/// wire; the FFI carrier delivers every record intact and in order through
+/// the record sink, and its own records go framed.
 #[test]
 fn datagram_transport_recovers_loss_with_reliable_framing() {
     use std::collections::VecDeque;
@@ -1105,12 +1104,11 @@ fn datagram_transport_recovers_loss_with_reliable_framing() {
             break;
         }
     }
-    assert_eq!(
-        w(|w| w.established),
-        2,
-        "handshake (raw, lossless) completes"
+    assert_eq!(w(|w| w.established), 2, "handshake (lossless) completes");
+    assert!(
+        w(|w| w.framed_seen) > 0,
+        "the datagram transport frames from the first packet (handshake included)"
     );
-    assert_eq!(w(|w| w.framed_seen), 0, "nothing framed before the switch");
 
     // The server's peer advertised CAP_RUDP: switch it (TerminalSession
     // does this on CAPS); from now on the wire is lossy.

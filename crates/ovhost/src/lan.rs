@@ -6,8 +6,11 @@
 //! [`DEFAULT_LAN_PORT`]; the SRV record carries the bound port) — or dials
 //! an attended host's address with its pairing code. The session
 //! then runs over a point-to-point UDP carrier
-//! ([`ovtransport::UdpP2pCarrier`]: raw datagrams until both sides speak
-//! the reliable-UDP framing) with the same PIN handshake, session code and
+//! ([`ovtransport::UdpP2pCarrier`]) in the reliable-UDP framing from the
+//! first packet (fragments <= 1.2 KB, retransmission, in-order delivery —
+//! the handshake datagrams included; a viewer that starts with bare
+//! datagrams is switched over by the first framed packet the host sends)
+//! with the same PIN handshake, session code and
 //! direct-path upgrade as a relayed session — the LAN carrier simply plays
 //! the relay's part.
 //!
@@ -31,15 +34,15 @@ pub(crate) const DEFAULT_LAN_PORT: u16 = ovdiscovery::mdns::DEFAULT_LAN_PORT;
 /// How often a lost listener socket is re-bound.
 const REBIND_EVERY: Duration = Duration::from_secs(1);
 
-/// A viewer's first datagram (its HELLO) on the LAN port.
+/// A viewer whose HELLO is waiting on the LAN port.
 pub(crate) struct LanPending {
     /// The listener socket, handed over to the session (connected to
-    /// `peer` by the carrier).
+    /// `peer` by the carrier). The HELLO is still queued in it (only
+    /// peeked), so the session carrier reads it through its own
+    /// reliable-UDP link like every later datagram.
     pub(crate) socket: UdpSocket,
     /// The viewer's address.
     pub(crate) peer: SocketAddr,
-    /// The HELLO, to feed to the server handshake.
-    pub(crate) first: Vec<u8>,
 }
 
 /// The LAN session listener: a UDP socket on the LAN port, polled between
@@ -83,30 +86,30 @@ impl LanListener {
         }
     }
 
-    /// A viewer's HELLO, if one is waiting (non-blocking). Anything that is
-    /// not a handshake HELLO is dropped.
+    /// A viewer's HELLO, if one is waiting (non-blocking). It is left in
+    /// the socket (peeked); anything ahead of it that is not a handshake
+    /// HELLO is dropped.
     pub(crate) fn poll(&mut self) -> Option<LanPending> {
         let sock = self.socket()?;
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 65_536];
         loop {
-            match sock.recv_from(&mut buf) {
+            match sock.peek_from(&mut buf) {
                 Ok((n, peer)) => {
                     if !is_hello(&buf[..n]) {
                         debug!("lan: ignoring a {n}-byte non-HELLO datagram from {peer}");
+                        let _ = sock.recv_from(&mut buf);
                         continue;
                     }
                     debug!("lan: HELLO from {peer}");
                     let socket = self.sock.take()?;
-                    return Some(LanPending {
-                        socket,
-                        peer,
-                        first: buf[..n].to_vec(),
-                    });
+                    return Some(LanPending { socket, peer });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
                 // Windows reports an earlier ICMP port-unreachable on the
                 // next receive (WSAECONNRESET): harmless, keep reading.
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                // Bigger than the buffer (Windows WSAEMSGSIZE): not a HELLO.
+                Err(_) if sock.recv_from(&mut buf).is_ok() => continue,
                 Err(e) => {
                     debug!("lan: receive failed: {e}");
                     return None;
@@ -149,14 +152,42 @@ fn bind_socket(port: u16) -> io::Result<UdpSocket> {
 }
 
 /// A v2 handshake HELLO (or a v1 one, which the handshake answers with
-/// REJECT(incompatible version)).
+/// REJECT(incompatible version)): a bare datagram, or the first packet of a
+/// reliable-UDP link (viewers frame their LAN handshake so a lost datagram
+/// is retransmitted: DATA, sequence 0, first fragment, HELLO payload).
 fn is_hello(d: &[u8]) -> bool {
+    if ovtransport::rudp::is_framed(d) {
+        const T_DATA: u8 = 1;
+        const F_FIRST: u8 = 1;
+        let hdr = ovtransport::rudp::DATA_HEADER;
+        return d.len() > hdr
+            && d[4] == T_DATA
+            && d[5] & F_FIRST != 0
+            && d[6..10] == [0, 0, 0, 0]
+            && d[hdr] == TAG_HELLO;
+    }
     matches!(d.first(), Some(&TAG_HELLO) | Some(&LEGACY_TAG_HELLO))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognises_raw_and_framed_hellos() {
+        assert!(is_hello(&[TAG_HELLO, 0]));
+        assert!(is_hello(&[LEGACY_TAG_HELLO]));
+        assert!(!is_hello(&[0x12]));
+        let mut framed = vec![0xB7, b'R', b'U', b'1', 1, 3, 0, 0, 0, 0, 0, 0, 0, 0];
+        framed.push(TAG_HELLO);
+        assert!(is_hello(&framed));
+        framed[9] = 1; // sequence 1: not the start of a link
+        assert!(!is_hello(&framed));
+        let ack = [
+            0xB7, b'R', b'U', b'1', 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(!is_hello(&ack));
+    }
 
     #[test]
     fn hands_over_the_socket_on_hello_and_rebinds() {
@@ -173,8 +204,14 @@ mod tests {
         tx.send_to(b"\x99junk", to).unwrap();
         tx.send_to(&[TAG_HELLO, 1, 2, 3], to).unwrap();
         let p = l.wait(Duration::from_secs(2)).expect("hello");
-        assert_eq!(p.first, vec![TAG_HELLO, 1, 2, 3]);
         assert_eq!(p.peer, tx.local_addr().unwrap());
+        // The HELLO is still queued for the session carrier.
+        let mut b = [0u8; 16];
+        let (n, _) = p
+            .socket
+            .recv_from(&mut b)
+            .expect("HELLO left in the socket");
+        assert_eq!(&b[..n], &[TAG_HELLO, 1, 2, 3]);
         // The session owns the port now; after it ends the listener
         // re-binds the same port.
         drop(p);

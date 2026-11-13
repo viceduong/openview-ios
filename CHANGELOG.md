@@ -55,7 +55,9 @@ First public release.
   (`--relay-fallback` dials the relay when nobody answers). The Windows app
   lists **Computers on this network**; the iOS app lists **On this
   network** (NWBrowser). The host keeps serving the LAN while its relay is
-  unreachable. New `lan` status event.
+  unreachable. New `lan` status event. LAN sessions use the reliable-UDP
+  framing from the first packet (handshake retransmission, <= 1.2 KB
+  fragments), so they survive Wi-Fi loss and large first screen updates.
 
 #### Screen streaming
 - DXGI Desktop Duplication capture with dirty/move rects and GDI fallback.

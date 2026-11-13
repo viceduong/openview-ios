@@ -310,7 +310,11 @@ session is established it is saved as a LAN connection.
    once when 64 datagrams are waiting, otherwise about 1 ms later
    (`scheduleDirectPump`).
 3. Each pump's outbound datagrams go out as one `NWConnection.batch`.
-4. The reliable-UDP framing is done in Rust.
+4. The reliable-UDP framing is done in Rust, from the first packet (the
+   handshake is retransmitted when a datagram is lost).
+5. A receive error other than cancellation (e.g. ECONNREFUSED after an ICMP
+   port-unreachable) does not stop the receive loop; it re-arms after
+   50 ms.
 
 ### 4.4 Direct upgrade next to a relay
 

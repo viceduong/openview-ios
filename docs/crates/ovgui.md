@@ -182,7 +182,7 @@ in [ovcommon.md](ovcommon.md) §3); its stderr (human logs) only goes to
 | `ready` | **Ready**: "Ready — waiting for a connection" |
 | `peer_connected` | **Connected** (first 8 hex chars of the fingerprint, local HH:MM) plus a tray balloon |
 | `peer_disconnected` | Back to Ready plus a balloon |
-| `session_failed` | **Error**, with a friendly message: "Can't reach the relay at ... (connection refused)", "handshake failed (wrong PIN?)", or the raw reason |
+| `session_failed` | **Error**, with a friendly message: "Can't reach the relay at ... (connection refused)"; for a failed incoming handshake one text per cause: "A device tried to connect with a wrong PIN." (authentication failed only), "Too many wrong PINs: …", "A device started to connect but the connection did not complete (network problem?)." (timeout), a version mismatch, or "… the secure connection could not be set up."; otherwise the raw reason |
 | `error` | Remembered as the reason shown if the host exits |
 | `direct_path` (`listening` / `disabled` / `active` / `fallback`), `upnp` | Status detail, e.g. "Relay 127.0.0.1:4569 · direct UDP 4570 · router port open (UPnP)" |
 | `lan` | Logged to `openview.log` (LAN port, mDNS on/off) |

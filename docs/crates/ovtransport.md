@@ -154,7 +154,7 @@ The record layer requires ordered, lossless delivery. Raw UDP with 4 KiB records
 
 ### 5.4 Negotiation
 
-`ReliableLink::new()` starts with raw sending and `auto_enable` on. The app layer calls `Carrier::enable_reliable()` once the peer's CAPS includes `CAP_RUDP` (`ovapp::terminal`, bit `1 << 4`; see [ovapp.md](ovapp.md)). A peer that never advertises it sees only raw datagrams.
+`ReliableLink::new()` starts with raw sending and `auto_enable` on. The app layer calls `Carrier::enable_reliable()` once the peer's CAPS includes `CAP_RUDP` (`ovapp::terminal`, bit `1 << 4`; see [ovapp.md](ovapp.md)). A peer that never advertises it sees only raw datagrams. `DirectCarrier` forwards `reliable_capable` / `enable_reliable` to its primary carrier, so a UDP primary (a LAN session) still switches after the direct engine wrapped it. LAN sessions enable the framing before their first packet (see [ovhost.md](ovhost.md) §1).
 
 ## 6. Relay tunnel — `tunnel.rs` and `relay/`
 

@@ -62,7 +62,7 @@ const MAX_RELAY_RETRY: Duration = Duration::from_secs(30);
 /// Where the session's viewer came from.
 enum Inbound {
     /// A viewer attached through the relay.
-    Relay(RelayTunnelCarrier),
+    Relay(Box<RelayTunnelCarrier>),
     /// A viewer's HELLO arrived on the LAN port.
     Lan(LanPending),
 }
@@ -119,15 +119,20 @@ pub(crate) fn listen_once(opts: &SessionOpts, lan: Option<&mut LanListener>) -> 
     let my_dev = unattended::device_id(&me);
     let mut hs = Handshake::new(Role::Server, my_dev, &me, auth);
     match acquire(addr, session_id, lan)? {
-        Inbound::Relay(carrier) => serve(carrier, hs, opts),
+        Inbound::Relay(carrier) => serve(*carrier, hs, opts),
         Inbound::Lan(p) => {
             info!("LAN viewer {}", p.peer);
             // Per-source PIN attempt limiting (the viewer's address is real
             // here, unlike behind the relay).
             hs.set_auth_source(p.peer.ip());
-            let carrier = UdpP2pCarrier::from_socket(p.socket, p.peer);
-            // The HELLO the listener already read.
-            let _ = hs.feed(&p.first);
+            let mut carrier = UdpP2pCarrier::from_socket(p.socket, p.peer);
+            // Reliable-UDP framing from the first packet we send: every
+            // LAN viewer (ovview, the iOS app's datagram carrier) switches
+            // on the first framed packet, the handshake gets retransmission
+            // and large screen records are fragmented — without waiting for
+            // the viewer's CAPS, which the iOS app sends only once it saw
+            // the first screen update.
+            carrier.enable_reliable();
             serve(carrier, hs, opts)
         }
     }
@@ -220,7 +225,7 @@ fn serve<C: Carrier + 'static>(
 #[cfg(test)]
 fn park_until_attached(addr: &RelayAddr, session_id: u32) -> Result<RelayTunnelCarrier, String> {
     match acquire(addr, session_id, None)? {
-        Inbound::Relay(c) => Ok(c),
+        Inbound::Relay(c) => Ok(*c),
         Inbound::Lan(_) => Err("no LAN listener was given".into()),
     }
 }
@@ -287,7 +292,7 @@ fn acquire(
                 left
             };
             match carrier.wait_attached(slice) {
-                Ok(true) => return Ok(Inbound::Relay(carrier)),
+                Ok(true) => return Ok(Inbound::Relay(Box::new(carrier))),
                 Ok(false) if Instant::now() < deadline => {
                     if let Some(p) = lan.as_deref_mut().and_then(LanListener::poll) {
                         // Give the relay slot up; the LAN viewer wins.
@@ -299,7 +304,7 @@ fn acquire(
             }
         };
         match outcome {
-            Ok(true) => return Ok(Inbound::Relay(carrier)),
+            Ok(true) => return Ok(Inbound::Relay(Box::new(carrier))),
             // Relay silent for the whole window, or it timed the park out:
             // both are idle, not failure.
             Ok(false) | Err(ovtransport::TransportError::Closed) => {
@@ -474,7 +479,7 @@ mod tests {
         let mut hs = Handshake::new(Role::Server, dev, &host_id, Auth::Pin(psk));
         hs.set_auth_source(p.peer.ip());
         let mut carrier = UdpP2pCarrier::from_socket(p.socket, p.peer);
-        let _ = hs.feed(&p.first);
+        carrier.enable_reliable();
         // The viewer's first record may ride in the handshake's last batch.
         let mut got =
             handshake_over(&mut hs, &mut carrier, Duration::from_secs(10)).expect("host handshake");

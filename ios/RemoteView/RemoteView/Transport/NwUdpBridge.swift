@@ -9,13 +9,14 @@ import Network
 // ever touched from that one serial queue, avoiding re-entrancy with
 // ov_session_pump. All methods must be called on `queue`.
 //
-// The Rust side frames records into <= 1.2 KB reliable-UDP
-// datagrams (ACKs + retransmissions, see ovtransport::rudp) once the host
-// switches; this bridge still just moves opaque datagrams. Each callback
+// The Rust side frames everything, the handshake included, into <= 1.2 KB
+// reliable-UDP datagrams (ACKs + retransmissions, see ovtransport::rudp);
+// this bridge just moves opaque datagrams. Each callback
 // re-arms the receive immediately (before the caller's work), and
 // SessionController batches the pumps.
 final class NwUdpBridge {
     private let connection: NWConnection
+    private let queue: DispatchQueue
     private var onReceive: ((Data) -> Void)?
     private var onState: ((NWConnection.State) -> Void)?
     /// Datagrams queued before the connection reaches `.ready` (bounded —
@@ -31,6 +32,7 @@ final class NwUdpBridge {
          onState: @escaping (NWConnection.State) -> Void) {
         self.onReceive = onReceive
         self.onState = onState
+        self.queue = queue
         let params = NWParameters.udp
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host),
                                            port: NWEndpoint.Port(rawValue: port) ?? 0)
@@ -98,7 +100,20 @@ final class NwUdpBridge {
 
     private func receiveLoop() {
         connection.receiveMessage { [weak self] content, _, _, error in
-            guard let self, !self.closed, error == nil else { return }
+            guard let self, !self.closed else { return }
+            if let error {
+                // A cancelled connection ends the loop. Anything else (e.g.
+                // ECONNREFUSED from an ICMP port-unreachable while the host
+                // re-binds its LAN port) is transient: keep receiving, or
+                // every later datagram — the host's handshake answer
+                // included — would be ignored for good.
+                if case .posix(let code) = error, code == .ECANCELED { return }
+                self.queue.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+                    guard let self, !self.closed, self.isReady else { return }
+                    self.receiveLoop()
+                }
+                return
+            }
             // Re-arm first so the next datagram is already being received
             // while this one is processed (keeps up with bursts).
             self.receiveLoop()

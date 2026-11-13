@@ -46,7 +46,8 @@ or fix.
 | `ovview: host did not attach within 35s` / `host not reachable (relay park timed out with no host)` | No host is parked under that code or ID on this relay. Check that both sides use the **same relay address**, that the host shows `waiting on relay ...`, and the code or device ID. Remember that a relay started with an explicit `--bind` must use the port the clients dial (default 4569). |
 | `relay <addr>: connect failed: ...` (either side), or in the GUI "Can't reach the relay at ... (connection refused)" | The relay is not running or the TCP port is blocked |
 | `bad relay `x`: ...` | `--relay` must be an IP, `hostname[:port]` or a `ws://` / `wss://` URL |
-| `handshake failed: ...`, or in the GUI "handshake failed (wrong PIN?)" | Wrong PIN or code, or a device-ID mismatch |
+| `handshake failed: authentication failed ...`, or in the GUI "A device tried to connect with a wrong PIN." | Wrong PIN or code, or a device-ID mismatch |
+| `handshake timed out`, or in the GUI "A device started to connect but the connection did not complete" | The viewer's packets stopped arriving mid-handshake (Wi-Fi loss, firewall, the viewer gave up). LAN sessions retransmit lost handshake packets; update both sides if it persists |
 | `handshake timed out` | The peer attached but the handshake did not finish in time (about 2 s on the viewer, 10 s on the host). |
 | `--unattended needs a PIN (OPENVIEW_PIN or --pin)` / `--connect needs the host's PIN (OPENVIEW_PIN or --pin)` | Set `OPENVIEW_PIN` (or pass `--pin`) |
 | `pass exactly one of --connect, --code or --id` (or a clap usage error) | Viewer target flags are missing or combined |

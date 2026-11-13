@@ -222,7 +222,7 @@ The plaintext is the application message format: [crates/ovapp.md](crates/ovapp.
 
 ## 5. Reliable UDP (`rudp`): `UdpP2pCarrier` and every direct-path link
 
-Raw mode, before negotiation, is used only by `UdpP2pCarrier`: each record is one bare UDP datagram. Framed mode is switched on per direction when the peer advertises `CAP_RUDP`, or when the first framed datagram arrives. Direct-path links are framed from the start.
+Raw mode, before negotiation, is used only by `UdpP2pCarrier`: each record is one bare UDP datagram. Framed mode is switched on per direction when the peer advertises `CAP_RUDP`, or when the first framed datagram arrives. Direct-path links and LAN sessions (the host's LAN port, `ovview --id`, the iOS datagram transport) are framed from the start, handshake included.
 
 **DATA** (14-byte header + ≤ 1200-byte fragment):
 
@@ -367,4 +367,4 @@ The FEC ratio is `clamp(0.10 + 4·loss, 0.10, 0.30)`. Feedback drives a GCC-like
 | STUN (host candidate gathering) | RFC 5389 Binding Request (20 B, cookie `0x2112A442`); XOR-MAPPED-ADDRESS, falling back to MAPPED-ADDRESS; default server `stun.cloudflare.com:3478` |
 | UPnP | SSDP M-SEARCH to `239.255.255.250:1900` (plus unicast to `x.y.z.1`), then SOAP `AddPortMapping` / `GetExternalIPAddress` / `DeletePortMapping` on WANIPConnection:2/1 or WANPPPConnection:1 |
 | mDNS / DNS-SD | Instance `<device-id>._openview._udp.local`: SRV port = the host's LAN session port (UDP 4571), target `openview-<id>.local`; TXT `id=<device id>`, `v=<handshake version>`, `name=<computer name>`; A/AAAA = the host's LAN addresses. Group `224.0.0.251:5353`; browsers query from an ephemeral port (legacy-unicast replies). See [ovdiscovery.md §3](crates/ovdiscovery.md) |
-| LAN session | The viewer sends its handshake HELLO (`0x11`) to the host's LAN port; the session then runs on that UDP 4-tuple exactly like a UDP P2P carrier (raw datagrams, rudp once `CAP_RUDP` is negotiated), PIN auth (or pairing code for an attended host); the direct upgrade may follow |
+| LAN session | The viewer sends its handshake HELLO (`0x11`) to the host's LAN port as the first packet of a reliable-UDP link (DATA, sequence 0; a bare HELLO is accepted too); both sides stay framed from then on (retransmission, <= 1.2 KB fragments, in order), so the session runs on that UDP 4-tuple like a framed UDP P2P carrier. PIN auth (or pairing code for an attended host); the direct upgrade may follow |

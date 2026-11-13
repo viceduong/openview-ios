@@ -11,7 +11,7 @@ liveness, file transfer) lives in Rust. Swift only moves bytes and renders.
 | Source | `crates/ovffi/src/` (module map below; `lib.rs` holds the crate doc and the module list) |
 | C header | `ios/OvFFI/include/shim.h` (+ `module.modulemap`, module `OvFFI`, shipped inside the XCFramework; Swift uses `import OvFFI`) |
 | Swift wrapper | `ios/RemoteView/RemoteView/Transport/OvFFI.swift` (`OvSessionBox`, `OvScreenBox`) |
-| Tests | `src/tests/` (`ffi.rs`, `relay.rs`, `direct.rs`, `pin.rs`, `header.rs`) |
+| Tests | `src/tests/` (`ffi.rs`, `relay.rs`, `direct.rs`, `pin.rs`, `lan.rs`, `header.rs`) |
 | Dependencies | `ovcore`, `ovtransport` (without the `ws-client` feature: the app owns its WebSocket and uses the byte-stream bridge), `ovapp`; dev-dep `ovrelay` (`Cargo.toml`) |
 
 Module map (`crates/ovffi/src/`):
@@ -346,12 +346,17 @@ int32_t ov_session_on_datagram(OvSession*, const uint8_t *data, size_t len);
   creates the `FfiDatagramCarrier`. Returns `0` / `-1`.
 - `on_datagram` queues one datagram for the next pump. Returns `-2` if the
   transport is not a datagram transport.
-- The carrier wraps an `ovtransport::rudp::ReliableLink`. It starts in raw
-  mode (bare records). It switches to reliable framing (fragments of at most
-  1.2 KB, ACK/retransmit, in order) as soon as the peer sends a framed
-  datagram, which a capable host does once CAPS advertise `CAP_RUDP`. ACKs
-  and retransmits also go out through the datagram sink, from within pump.
-  The shell keeps moving opaque datagrams.
+- The carrier wraps an `ovtransport::rudp::ReliableLink` that is **framed
+  from the first packet** (fragments of at most 1.2 KB, ACK/retransmit, in
+  order), the handshake included. The datagram transport is the LAN session
+  to a host's LAN port, which accepts a framed HELLO and frames its side
+  too. (It used to start raw and wait for the CAPS exchange: on a real
+  Wi-Fi a lost handshake datagram then stalled the handshake, and the
+  host's first screen record went out as one oversized datagram before the
+  app's CAPS — sent only after the first screen update — could switch it;
+  regression test `tests/lan.rs`.) Bare inbound datagrams are still
+  accepted. ACKs and retransmits also go out through the datagram sink,
+  from within pump. The shell keeps moving opaque datagrams.
 - The client's first HELLO is emitted during the first pump. Swift must
   have its UDP bridge in place before that pump (`SessionController`
   installs `NwUdpBridge` first).
@@ -726,6 +731,17 @@ directly.
 | `datagram_transport_recovers_loss_with_reliable_framing` | reliable-UDP loss recovery |
 | `screen_passes_h264_through_and_advertises_cap_h264` | H.264 pass-through, CAP_H264, IDR requests |
 | `screen_decodes_lz4_frames` | LZ4 frames |
+
+**`src/tests/lan.rs`** — `ios_datagram_mode_survives_a_lossy_lan_to_a_host_lan_port`:
+an `OvSession` in datagram mode driven like the iOS app (one UDP datagram
+per sink call, pump on inbound and every 50 ms) over real loopback UDP to a
+host built like `ovhost`'s LAN listener (peeked HELLO, `UdpP2pCarrier` with
+the framing on, PIN server handshake), with 15 % loss in both directions.
+The handshake completes, a 200 KB record sent straight after it arrives
+intact, records behind it too, and the viewer's reply reaches the host;
+every datagram stays <= 1214 B. With the old raw start it fails at the
+handshake. `examples/lan_probe.rs` runs the same viewer against a real
+`ovhost --lan-port` (`PROBE_LOSS=<percent>`).
 
 **`src/tests/relay.rs`** — uses a real in-process `ovrelay::Relay`. Each
 session has its own `Collector`, so there is no global state.

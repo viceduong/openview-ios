@@ -491,6 +491,17 @@ impl Carrier for DirectCarrier {
         true
     }
 
+    /// The primary path decides: a UDP bootstrap carrier (a LAN session)
+    /// must switch its own link to the reliable framing once the peer's
+    /// CAPS advertise `CAP_RUDP`, or large records stay raw datagrams.
+    fn reliable_capable(&self) -> bool {
+        self.primary.reliable_capable()
+    }
+
+    fn enable_reliable(&mut self) -> bool {
+        self.primary.enable_reliable()
+    }
+
     fn stats(&self) -> &CarrierStats {
         &self.stats
     }

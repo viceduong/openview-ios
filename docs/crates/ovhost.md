@@ -145,11 +145,15 @@ kbps, media summary) are `debug` (`-v`); per-input-event lines are `trace`
 
    **LAN viewer:** only a datagram starting with a handshake HELLO tag
    (`0x11`, or the v1 `0x01`, which is answered with REJECT(incompatible))
-   is taken. The listener socket is handed to the session as a
-   `UdpP2pCarrier` connected to the viewer (raw datagrams, then the
-   reliable-UDP framing once both sides advertise `CAP_RUDP`); the HELLO is
-   fed to the server handshake and `set_auth_source(viewer IP)` enables the
-   per-source PIN attempt limit. After the session the port is bound again.
+   is taken, bare or as the first packet of a reliable-UDP link (DATA,
+   sequence 0); it is only peeked, so it stays queued. The listener socket
+   is handed to the session as a `UdpP2pCarrier` connected to the viewer,
+   with the reliable-UDP framing switched on before anything is sent: the
+   handshake datagrams are retransmitted when lost, and screen records are
+   fragmented to <= 1.2 KB without waiting for the viewer's CAPS (the iOS
+   app sends its CAPS only after the first screen update). A viewer that
+   starts with bare datagrams switches on the host's first framed packet.
+   `set_auth_source(viewer IP)` enables the per-source PIN attempt limit. After the session the port is bound again.
    From here on the session is identical to a relayed one, including the
    direct-path upgrade (the LAN carrier plays the relay's part).
 

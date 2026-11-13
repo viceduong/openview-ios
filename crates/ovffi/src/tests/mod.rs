@@ -8,5 +8,6 @@
 mod direct;
 mod ffi;
 mod header;
+mod lan;
 mod pin;
 mod relay;

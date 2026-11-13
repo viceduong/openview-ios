@@ -10,11 +10,16 @@ use crate::callbacks::{DatagramSink, Sink};
 /// A [`Carrier`] whose send path calls a host callback and whose receive
 /// path is a queue fed by `ov_session_on_datagram`.
 ///
-/// Datagrams pass through an [`ovtransport::rudp::ReliableLink`].
-/// It starts in raw mode (bare records) and switches to
-/// the reliable framing (<= 1.2 KB fragments, ACK/retransmit, in-order) as
-/// soon as the peer sends a framed datagram — a capable host does after our
-/// CAPS advertised `CAP_RUDP`. The shell keeps moving opaque datagrams; ACKs
+/// Datagrams pass through an [`ovtransport::rudp::ReliableLink`] in the
+/// reliable framing **from the first packet** (<= 1.2 KB fragments,
+/// ACK/retransmit, in-order), the handshake included: this transport is a
+/// LAN session to a host's LAN port (`ovhost --lan-port`), which accepts a
+/// framed HELLO and frames its side too. Starting raw (bare datagrams until
+/// the CAPS exchange) lost the session on real Wi-Fi: one lost handshake
+/// datagram stalled the handshake for good, and the host's first screen
+/// records went out as oversized bare datagrams before our CAPS (sent only
+/// after the first screen update) could switch it. Inbound bare datagrams
+/// are still accepted. The shell keeps moving opaque datagrams; ACKs
 /// and retransmissions go out through the same sink from `ov_session_pump`
 /// (call it at least every ~50 ms in direct mode so RTO timers run).
 pub(crate) struct FfiDatagramCarrier {
@@ -30,11 +35,13 @@ pub(crate) struct FfiDatagramCarrier {
 
 impl FfiDatagramCarrier {
     pub(crate) fn new(sink: Sink<DatagramSink>) -> Self {
+        let mut link = ovtransport::rudp::ReliableLink::new();
+        link.enable();
         Self {
             sink,
             inbound: VecDeque::new(),
             delivered: VecDeque::new(),
-            link: ovtransport::rudp::ReliableLink::new(),
+            link,
             closed: false,
             stats: CarrierStats::default(),
         }
