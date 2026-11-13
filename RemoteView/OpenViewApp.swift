@@ -9,6 +9,9 @@ struct OpenViewApp: App {
         // Settings cleanup (removed control settings), before any
         // @AppStorage reads them.
         RemoteInputController.migrateDefaults()
+        // Diagnostics: persistent log, network / lifecycle events, hang
+        // monitor (see DiagLog.swift).
+        DiagLog.shared.start()
     }
 
     var body: some Scene {

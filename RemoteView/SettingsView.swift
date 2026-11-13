@@ -35,6 +35,9 @@ struct SettingsView: View {
 
     @State private var confirmForgetPINs = false
     @State private var biometryUnavailable = false
+    /// Diagnostics: the kept session log files offered to the share sheet.
+    @State private var shareLogs: [URL] = []
+    @State private var showShareLogs = false
 
     private var version: String {
         let info = Bundle.main.infoDictionary
@@ -228,6 +231,13 @@ struct SettingsView: View {
             .padding(.vertical, 2)
             NavigationLink(destination: SessionLogView(lines: app.lastSessionLog)) {
                 Text("Last session log")
+            }
+            Button("Share diagnostic logs") {
+                shareLogs = DiagLog.shared.allFiles()
+                showShareLogs = !shareLogs.isEmpty
+            }
+            .sheet(isPresented: $showShareLogs) {
+                ShareSheet(items: shareLogs)
             }
             Toggle(isOn: $logTouchRouting) {
                 VStack(alignment: .leading, spacing: 2) {

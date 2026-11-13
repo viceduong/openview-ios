@@ -122,14 +122,14 @@ final class OvSessionBox {
 
     /// Drain handshake events / decrypt inbound records. Sinks fire here.
     func pump() throws {
-        try check(ov_session_pump(ptr))
+        try Breadcrumb.shared.run("ov_session_pump") { try check(ov_session_pump(ptr)) }
     }
 
     /// Send one application record on `channel` (chat uses channel 1).
     func sendRecord(channel: UInt8, payload: Data) throws {
         try payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self)
-            try check(ov_session_send_record(ptr, channel, base, raw.count))
+            try Breadcrumb.shared.run("ov_session_send_record") { try check(ov_session_send_record(ptr, channel, base, raw.count)) }
         }
     }
 
@@ -167,14 +167,16 @@ final class OvSessionBox {
     /// One received WebSocket message; processed by the next `pumpRelay()`.
     func relayFeed(_ data: Data) throws {
         let rc = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
-            ov_session_relay_feed(ptr, raw.baseAddress?.assumingMemoryBound(to: UInt8.self), raw.count)
+            Breadcrumb.shared.run("ov_session_relay_feed") {
+                ov_session_relay_feed(ptr, raw.baseAddress?.assumingMemoryBound(to: UInt8.self), raw.count)
+            }
         }
         try check(rc)
     }
 
     /// The WebSocket closed or failed; the relay reports closed once drained.
     func relayEOF() {
-        _ = ov_session_relay_eof(ptr)
+        _ = Breadcrumb.shared.run("ov_session_relay_eof") { ov_session_relay_eof(ptr) }
     }
 
     /// Wave 1 event-driven relay receive: `handler` runs on a Rust watcher
@@ -199,7 +201,7 @@ final class OvSessionBox {
     /// every available tunnel frame per call; throws `.closed` once the
     /// relay connection has reached EOF.
     func pumpRelay() throws {
-        try check(ov_session_pump_relay(ptr))
+        try Breadcrumb.shared.run("ov_session_pump_relay") { try check(ov_session_pump_relay(ptr)) }
     }
 
     /// Send a file to the peer (v0.27): begin-less `FILE_XFER_DATA` chunks
@@ -211,7 +213,7 @@ final class OvSessionBox {
         let rc = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
             let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return name.withCString { cName in
-                ov_file_send(ptr, cName, base, raw.count)
+                Breadcrumb.shared.run("ov_file_send") { ov_file_send(ptr, cName, base, raw.count) }
             }
         }
         try check(rc)
@@ -247,16 +249,18 @@ final class OvSessionBox {
     func onDirectDatagram(pathID: UInt32, _ data: Data) {
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            _ = ov_session_on_direct_datagram(ptr, pathID, base, raw.count)
+            _ = Breadcrumb.shared.run("ov_session_on_direct_datagram") {
+                ov_session_on_direct_datagram(ptr, pathID, base, raw.count)
+            }
         }
     }
 
     /// 0 relay, 1 probing, 2 direct (-1 never for a live box).
-    var directState: Int32 { ov_session_direct_state(ptr) }
+    var directState: Int32 { Breadcrumb.shared.run("ov_session_direct_state") { ov_session_direct_state(ptr) } }
     /// Milliseconds until the direct engine needs a pump (-1 = none).
-    var directDeadlineMs: Int64 { ov_session_direct_deadline_ms(ptr) }
+    var directDeadlineMs: Int64 { Breadcrumb.shared.run("ov_session_direct_deadline_ms") { ov_session_direct_deadline_ms(ptr) } }
     /// The active direct path id, or -1.
-    var directPath: Int64 { ov_session_direct_path(ptr) }
+    var directPath: Int64 { Breadcrumb.shared.run("ov_session_direct_path") { ov_session_direct_path(ptr) } }
 
     /// Drop every Swift-side callback (session teardown). The C sinks stay
     /// installed but become no-ops, and the closures — which capture the
@@ -525,14 +529,14 @@ final class OvScreenBox {
     /// Ask the Rust keepalive whether a PING is due (`nowMs` = shell
     /// monotonic ms). Returns the sequence to send (> 0) or 0.
     func keepaliveTick(nowMs: Int64) -> UInt64 {
-        let seq = ov_screen_keepalive_tick(ptr, nowMs)
+        let seq = Breadcrumb.shared.run("ov_screen_keepalive_tick") { ov_screen_keepalive_tick(ptr, nowMs) }
         return seq > 0 ? UInt64(seq) : 0
     }
 
     /// Run the liveness verdict (fires `onLiveness`). `nowMs` = shell
     /// monotonic ms, consistent with `keepaliveTick`.
     func livenessTick(nowMs: Int64) {
-        ov_screen_liveness_tick(ptr, nowMs)
+        _ = Breadcrumb.shared.run("ov_screen_liveness_tick") { ov_screen_liveness_tick(ptr, nowMs) }
     }
 
     /// Watchdog: ms since the last inbound record (-1 = no screen).
@@ -558,7 +562,9 @@ final class OvScreenBox {
     func feed(_ data: Data) {
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress else { return }
-            ov_screen_feed(ptr, base.assumingMemoryBound(to: UInt8.self), raw.count)
+            _ = Breadcrumb.shared.run("ov_screen_feed") {
+                ov_screen_feed(ptr, base.assumingMemoryBound(to: UInt8.self), raw.count)
+            }
         }
         if frameReady {
             frameReady = false

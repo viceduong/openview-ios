@@ -523,6 +523,34 @@ final class SessionController: ObservableObject {
             identityMismatch = IdentityMismatch(expected: expected, got: pine)
         } else {
             onEstablished?(pine)
+            // Diagnostics: hand the host the logs of earlier runs (a few
+            // seconds in, behind the first frames).
+            let g = gen
+            queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.uploadDiagLogs(generation: g)
+            }
+        }
+    }
+
+    /// Session queue: send earlier launches' diagnostic logs to the host
+    /// (file transfer, `ovlog-ios-*` names the host files under its own log
+    /// folder) and mark them uploaded. At most a few MB per connection.
+    private func uploadDiagLogs(generation gen: Int) {
+        guard gen == queueGeneration, !halted, let session else { return }
+        var budget = 8 << 20
+        for url in DiagLog.shared.pendingUploads() {
+            guard let data = try? Data(contentsOf: url) else { continue }
+            guard data.count <= budget else { break }
+            budget -= data.count
+            let name = DiagLog.shared.uploadName(for: url)
+            do {
+                try session.sendFile(name: name, data: data)
+                DiagLog.shared.markUploaded(url)
+                log("Diagnostics: uploaded \(name) (\(data.count) bytes) to the host")
+            } catch {
+                log("Diagnostics: upload of \(name) failed: \(error)")
+                break
+            }
         }
     }
 
@@ -1552,6 +1580,9 @@ final class SessionController: ObservableObject {
 
     /// Append a session-log line (callable from any thread).
     private func log(_ text: String) {
+        // Persistent copy first: written from its own queue, so it survives
+        // a blocked main thread / session queue.
+        DiagLog.shared.log(text)
         onMain { $0.appendLine(text) }
     }
 
