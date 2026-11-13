@@ -36,49 +36,140 @@ pub(crate) enum Upgrade {
     Answered,
 }
 
-/// Read the HTTP request head and answer it. A valid WebSocket upgrade gets
-/// `101 Switching Protocols`; anything else a short plain-text response.
-/// The head must arrive before `deadline`.
-pub(crate) fn handshake(stream: &mut TcpStream, deadline: Instant) -> io::Result<Upgrade> {
-    let head = read_head(stream, deadline)?;
-    let text = String::from_utf8_lossy(&head);
+/// The request path WebSocket clients use unless configured otherwise
+/// (`wss://host/relay`).
+pub const DEFAULT_WS_PATH: &str = "/relay";
+
+/// The only `Sec-WebSocket-Version` this server speaks (RFC 6455).
+const WS_VERSION: &str = "13";
+
+/// The parts of an HTTP request head the relay cares about.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Request {
+    method: String,
+    /// Request target without the query string.
+    path: String,
+    http11: bool,
+    upgrade_ws: bool,
+    connection_upgrade: bool,
+    key: Option<String>,
+    version: Option<String>,
+}
+
+fn parse_request(head: &[u8]) -> Request {
+    let text = String::from_utf8_lossy(head);
     let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut key = None;
-    let mut upgrade_ws = false;
+    let mut parts = lines.next().unwrap_or_default().split(' ');
+    let method = parts.next().unwrap_or_default().to_owned();
+    let target = parts.next().unwrap_or_default();
+    let http11 = parts.next() == Some("HTTP/1.1");
+    let path = target.split('?').next().unwrap_or_default().to_owned();
+    let mut req = Request {
+        method,
+        path,
+        http11,
+        ..Request::default()
+    };
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         let (name, value) = (name.trim(), value.trim());
         if name.eq_ignore_ascii_case("sec-websocket-key") {
-            key = Some(value.to_string());
+            req.key = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+            req.version = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("upgrade") {
-            upgrade_ws = value.eq_ignore_ascii_case("websocket");
+            req.upgrade_ws = value
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("websocket"));
+        } else if name.eq_ignore_ascii_case("connection") {
+            req.connection_upgrade = value
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
         }
     }
-    match (upgrade_ws, key) {
-        (true, Some(key)) => {
+    req
+}
+
+/// What to answer a request with.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// `101 Switching Protocols` with this accept key.
+    Upgrade(String),
+    /// A plain response: status line, extra headers, body.
+    Plain(&'static str, &'static str, &'static str),
+}
+
+/// Decide the answer (pure; unit-tested). `paths` are the accepted
+/// WebSocket request paths.
+fn answer(req: &Request, paths: &[String]) -> Answer {
+    let ws_path = paths.contains(&req.path);
+    if req.method != "GET" || !req.http11 {
+        return Answer::Plain("400 Bad Request", "", "ovrelay: bad request\n");
+    }
+    if !req.upgrade_ws {
+        return match req.path.as_str() {
+            "/" | "/health" => Answer::Plain("200 OK", "", "ovrelay\n"),
+            _ if ws_path => Answer::Plain(
+                "426 Upgrade Required",
+                "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n",
+                "ovrelay: WebSocket upgrade required\n",
+            ),
+            _ => Answer::Plain("404 Not Found", "", "ovrelay: not found\n"),
+        };
+    }
+    if !ws_path {
+        return Answer::Plain("404 Not Found", "", "ovrelay: unknown WebSocket path\n");
+    }
+    if req.version.as_deref() != Some(WS_VERSION) {
+        // RFC 6455 §4.4: tell the client which version we speak.
+        return Answer::Plain(
+            "426 Upgrade Required",
+            "Sec-WebSocket-Version: 13\r\n",
+            "ovrelay: unsupported Sec-WebSocket-Version (need 13)\n",
+        );
+    }
+    match (&req.key, req.connection_upgrade) {
+        (Some(key), true) if !key.is_empty() => Answer::Upgrade(accept_key(key)),
+        _ => Answer::Plain(
+            "400 Bad Request",
+            "",
+            "ovrelay: bad WebSocket upgrade (Connection / Sec-WebSocket-Key)\n",
+        ),
+    }
+}
+
+/// Read the HTTP request head and answer it. A valid WebSocket upgrade on
+/// one of `paths` with `Sec-WebSocket-Version: 13` gets `101 Switching
+/// Protocols`; `GET /` and `GET /health` get `200`; an upgrade on another
+/// path `404`, another version `426` (with `Sec-WebSocket-Version: 13`), a
+/// malformed upgrade `400`. The head must arrive before `deadline`.
+pub(crate) fn handshake(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    paths: &[String],
+) -> io::Result<Upgrade> {
+    let head = read_head(stream, deadline)?;
+    let req = parse_request(&head);
+    match answer(&req, paths) {
+        Answer::Upgrade(accept) => {
             let resp = format!(
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-                accept_key(&key)
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
             );
             stream.write_all(resp.as_bytes())?;
             Ok(Upgrade::Accepted)
         }
-        _ => {
-            let healthy =
-                request_line.starts_with("GET / ") || request_line.starts_with("GET /health ");
-            let (status, body) = if healthy {
-                ("200 OK", "ovrelay\n")
-            } else {
-                (
-                    "426 Upgrade Required",
-                    "ovrelay: WebSocket upgrade required\n",
-                )
-            };
+        Answer::Plain(status, extra, body) => {
+            if !status.starts_with("200") {
+                tracing::debug!(
+                    "refused HTTP request {} {:?}: {status}",
+                    req.method,
+                    req.path
+                );
+            }
             let resp = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\n{extra}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(resp.as_bytes())?;
@@ -349,6 +440,74 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out)?;
         Ok(out)
+    }
+
+    const UPGRADE: &str = "GET /relay HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    fn ans(head: &str) -> Answer {
+        answer(
+            &parse_request(head.as_bytes()),
+            &[DEFAULT_WS_PATH.to_owned()],
+        )
+    }
+
+    fn status(a: &Answer) -> &str {
+        match a {
+            Answer::Upgrade(_) => "101",
+            Answer::Plain(s, ..) => &s[..3],
+        }
+    }
+
+    #[test]
+    fn upgrade_on_the_relay_path_with_version_13_is_accepted() {
+        assert_eq!(
+            ans(UPGRADE),
+            Answer::Upgrade("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".into())
+        );
+        // A query string does not change the path.
+        assert_eq!(
+            status(&ans(&UPGRADE.replace("/relay", "/relay?x=1"))),
+            "101"
+        );
+    }
+
+    #[test]
+    fn wrong_path_and_version_are_refused_with_proper_statuses() {
+        assert_eq!(status(&ans(&UPGRADE.replace("/relay", "/"))), "404");
+        assert_eq!(status(&ans(&UPGRADE.replace("/relay", "/relayx"))), "404");
+        let v8 = ans(&UPGRADE.replace("Version: 13", "Version: 8"));
+        assert_eq!(status(&v8), "426");
+        assert!(
+            matches!(v8, Answer::Plain(_, extra, _) if extra.contains("Sec-WebSocket-Version: 13"))
+        );
+        let no_version = UPGRADE.replace("Sec-WebSocket-Version: 13\r\n", "");
+        assert_eq!(status(&ans(&no_version)), "426");
+        let no_key = UPGRADE.replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "");
+        assert_eq!(status(&ans(&no_key)), "400");
+        let no_conn = UPGRADE.replace("Connection: keep-alive, Upgrade", "Connection: close");
+        assert_eq!(status(&ans(&no_conn)), "400");
+        assert_eq!(status(&ans(&UPGRADE.replace("GET", "POST"))), "400");
+        assert_eq!(
+            status(&ans(&UPGRADE.replace("HTTP/1.1", "HTTP/1.0"))),
+            "400"
+        );
+    }
+
+    #[test]
+    fn plain_requests_get_health_or_hints() {
+        assert_eq!(status(&ans("GET / HTTP/1.1\r\n\r\n")), "200");
+        assert_eq!(status(&ans("GET /health HTTP/1.1\r\n\r\n")), "200");
+        assert_eq!(status(&ans("GET /relay HTTP/1.1\r\n\r\n")), "426");
+        assert_eq!(status(&ans("GET /etc/passwd HTTP/1.1\r\n\r\n")), "404");
+    }
+
+    #[test]
+    fn configured_paths_replace_the_default() {
+        let paths = vec!["/ov".to_owned(), "/".to_owned()];
+        let req = |p: &str| parse_request(UPGRADE.replace("/relay", p).as_bytes());
+        assert_eq!(status(&answer(&req("/ov"), &paths)), "101");
+        assert_eq!(status(&answer(&req("/"), &paths)), "101");
+        assert_eq!(status(&answer(&req("/relay"), &paths)), "404");
     }
 
     #[test]

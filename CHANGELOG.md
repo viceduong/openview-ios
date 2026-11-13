@@ -12,14 +12,23 @@ First public release.
 ### Added
 
 #### Security and sessions
-- Ed25519 device identities with fingerprints and pairing codes; X25519
-  handshake with signed key exchange; ChaCha20-Poly1305 AEAD record layer
-  with per-direction keys and sequence checks (`ovcore`).
-- Unattended access with a PIN, authenticated with SPAKE2 (handshake v2):
-  no offline PIN guessing, key confirmation in both directions, the PAKE key
-  and the full transcript mixed into the key schedule; host-side attempt
-  throttling (lockout from 30 s doubling to 15 min) with a distinct "too
-  many attempts" error; explicit incompatible-version error for v1 peers.
+- Ed25519 device identities with fingerprints; X25519 handshake with
+  signed key exchange; ChaCha20-Poly1305 AEAD record layer with
+  per-direction keys (`ovcore`).
+- Handshake v3: both credentials — the unattended **PIN** and the attended
+  **one-time pairing code** — are authenticated with SPAKE2 (separate
+  identities, so they are never interchangeable): no offline guessing, key
+  confirmation in both directions, the PAKE key and the full transcript
+  mixed into the key schedule; host-side attempt throttling (lockout from
+  30 s doubling to 15 min) with a distinct "too many attempts" error; an
+  explicit incompatible-version error ("update both apps") for older peers.
+- Attended pairing codes are random, one-time and 10 digits (`1234 567890`):
+  the first four name the relay slot (public), the other six are the secret
+  and never cross the wire; the host shows a new code after every attempt.
+- Record format v3: a 64-bit sequence number in the authenticated header
+  and a 2048-record IPsec-style anti-replay window — duplicates and stale
+  records are dropped (counted), reordering on datagram paths is accepted
+  (shared with the media channel's window).
 - Typed `HandshakeError` / `CoreError`; session keys and identity secrets
   zeroized on drop with redacting `Debug`.
 - Hostile-input hardening: bounded file-transfer reassembly (concurrency,
@@ -147,6 +156,11 @@ First public release.
 - Media Foundation (`mfplat.dll`) is delay-loaded: on Windows N/KN without
   the Media Feature Pack, `ovhost` / `ovview` start and use lossless tiles.
   The binaries link the C runtime statically (no VC++ redistributable).
+- Pairing codes are 10 digits instead of 6 (`ovview --code`, iOS "Pair
+  with code"); `ovview` accepts them with spaces or dashes.
+- `ovrelay` accepts WebSocket upgrades only on `/relay` with
+  `Sec-WebSocket-Version: 13` (`--ws-path` adds or replaces paths, e.g.
+  `--ws-path /` for a proxy that forwards the root); other paths get `404`.
 - GUI: helper binaries must sit next to `OpenView.exe` (`OPENVIEW_BIN_DIR`
   for development; a missing binary shows a clear error); the PIN is handed
   to `ovhost` / `ovview` via `OPENVIEW_PIN`, never argv; the relay address
@@ -174,6 +188,12 @@ First public release.
 - PIN authentication moved to SPAKE2 (handshake v2): the earlier PIN proof
   allowed offline guessing by anyone who reached the host (SEC-0); the
   static X25519 key is now mixed into the key schedule (SEC-5).
+- Pairing codes moved to SPAKE2 too (handshake v3): the code travelled in
+  cleartext, was derived from the host's public fingerprint, and the relay
+  session ID exposed four of its six digits (SEC-8).
+- The record layer rejects replayed and duplicated records (SEC-6), and the
+  relay's WebSocket server validates the request path and protocol version
+  (SEC-7).
 - The PIN no longer has to appear on a command line (SEC-2).
 - iOS keeps a saved PIN after transient network errors; only a real
   authentication failure discards it (SEC-3).

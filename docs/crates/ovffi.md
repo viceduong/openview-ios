@@ -176,7 +176,7 @@ transport call on one serial queue, `OvQueues.session` (`OvFFI.swift`).
 | `void ov_identity_free(OvIdentity *id)` | — | NULL-safe |
 | `int32_t ov_identity_fingerprint(const OvIdentity *id, uint8_t *out)` | `0` / `-1` | writes 16 bytes |
 | `int32_t ov_identity_fingerprint_pine(const OvIdentity *id, char *out, size_t cap)` | string length / `-1` | e.g. `"A1B2C3D4 E5F60718 ..."` |
-| `int32_t ov_identity_pairing_code(const OvIdentity *id, char *out, size_t cap)` | string length / `-1` | 6-digit code |
+| `int32_t ov_identity_pairing_code(const OvIdentity *id, char *out, size_t cap)` | string length / `-1` | 6-digit **fingerprint short code** (public; not a pairing credential — attended hosts show a random one-time 10-digit code) |
 
 `ov_session_create` does **not** take an identity. Every session generates
 its own (`Identity::generate()` in `ov_session_create`). The identity API is
@@ -209,14 +209,16 @@ int32_t ov_session_begin_pin(OvSession *s, const uint8_t *pin, size_t pin_len);
 ```
 
 - `auth_mode` for `ov_session_begin`: `0` = pairing code
-  (`Auth::PairingCode`), `1` = direct device (`Auth::DirectDevice`). Any
-  other value returns `-1`.
+  (`Auth::PairingCode`: the code given to `ov_session_create` is the SPAKE2
+  password, handshake v3; it never crosses the wire), `1` = direct device
+  (`Auth::DirectDevice`). Any other value returns `-1`.
 - `ov_session_begin_pin` uses PIN / unattended mode (auth mode 2). The PIN
   bytes are stretched by `ovcore::pin::pin_psk` into a 32-byte PSK, used as
-  the SPAKE2 password (handshake v2). Neither the PIN nor anything an
-  observer could test guesses against crosses the wire. PIN sessions take a
-  third flight: after the host's READY the client sends CONFIRM (flushed by
-  the same pump), and the host is established only once it verifies it.
+  the SPAKE2 password (handshake v3, separate SPAKE2 identities from pairing
+  codes). Neither the PIN nor anything an observer could test guesses
+  against crosses the wire. Both credential modes take a third flight:
+  after the host's READY the client sends CONFIRM (flushed by the same
+  pump), and the host is established only once it verifies it.
   `pin_len == 0` returns `-1`.
 - A wrong PIN fails the pump with `-3` on both sides; a host that is
   throttling PIN attempts answers `-7`, and `ov_session_retry_after_secs`
@@ -376,7 +378,9 @@ int32_t ov_session_set_wake_sink(OvSession*, void *user, ov_wake_sink sink);
   (a transport already exists) or `-4` (connect failed).
 - `session_id`: both peers must use the same u32.
   - In pairing mode, `ov_relay_session_id` gives the first 4 bytes of the
-    pairing code, big-endian, zero-padded.
+    pairing code — its public rendezvous digits — big-endian, zero-padded
+    (`ovcore::pairing::relay_session_id`). The whole code is the SPAKE2
+    password (`ov_session_create`); no part of it is sent in the handshake.
   - The iOS app's device-ID/PIN mode uses the device ID's low 32 bits
     (`SessionDialer.dial`).
 - **Wake sink (event-driven receive).** While the transport is the TCP

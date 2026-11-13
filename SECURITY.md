@@ -48,6 +48,19 @@ and only test against machines and relays you own or are allowed to test.
   (5 per source address, 10 globally, then a lockout starting at 30 s and
   doubling up to 15 minutes), which limits online guessing to roughly a
   hundred attempts per day once saturated.
+- **Pairing codes.** Attended sessions use a random one-time 10-digit code
+  (`1234 567890`), authenticated with the same SPAKE2 handshake under
+  separate identities (a code and a PIN are never interchangeable). The
+  first four digits are a public rendezvous name for the relay; the six
+  secret digits never cross the wire in any form, so an observer of the
+  relay cannot test guesses offline. An active attacker gets one guess
+  (1 in 10^6) per code: the host burns the code after any attempt and
+  shows a new one, and the attempt throttle applies as for PINs.
+- **Record integrity and replay.** Every record carries its 64-bit
+  sequence number (the AEAD nonce counter, authenticated); the receiver
+  keeps a 2048-record sliding anti-replay window, so a duplicated, replayed
+  or stale record is dropped, while records reordered by a datagram path
+  are still accepted.
 - **PIN handling on Windows.** `OpenView.exe` stores PINs in Windows
   Credential Manager and passes them to `ovhost` / `ovview` in the
   `OPENVIEW_PIN` environment variable, never on a command line.
@@ -61,29 +74,24 @@ and only test against machines and relays you own or are allowed to test.
 - Other software running as the same Windows user (it can read that
   user's Credential Manager entries and OpenView's data folder).
 - Denial of service against a relay you expose to the internet (the relay
-  has connection caps but no authentication).
+  has connection caps but no authentication), including someone parking on
+  a pairing code's public rendezvous digits before the real viewer.
+- Shoulder-surfing the pairing code on the host's screen, or a viewer that
+  is shown a code by social engineering.
 
 ## Known limitations
 
-- **Pairing-code mode is not a PAKE.** The one-time 6-digit code of
-  attended sessions (`ovhost` without a PIN, `ovview --code`) is derived
-  from the host's public fingerprint and sent in the handshake; it is a
-  rendezvous and authorization value, not a secret. Use PIN mode for
-  anything exposed beyond a trusted network, and check the fingerprint for
-  attended sessions.
 - **The host runs as the signed-in user.** It is not a Windows service:
   it cannot see or control the lock screen, the sign-in screen, UAC
   prompts or other elevated windows (Windows blocks that input), and a real
   Ctrl+Alt+Del is only possible with extra setup. Signing out stops it.
 - **The relay sees metadata, not content**: the IP addresses of both sides,
-  the session ID (derived from the device ID or pairing code), connection
-  times and traffic volume. Run your own relay and put it behind TLS
+  the session ID (the low 32 bits of the device ID, or a pairing code's
+  four public rendezvous digits — never its secret part), connection times
+  and traffic volume. Run your own relay and put it behind TLS
   (`wss://`) if that matters to you.
 - **Relays are open.** Anyone who can reach your relay can park and dial
   sessions through it (they still need the PIN to reach a host).
-- **No replay window in the record layer** (SEC-6 in
-  [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)): correctness relies on the
-  transport delivering records exactly once and in order.
 - **Classical cryptography only**: the key exchange is X25519 with no
   post-quantum hybrid.
 - **Unsigned binaries.** Release binaries are not code-signed yet; verify

@@ -258,7 +258,7 @@ build-time `OVDefaultRelayURL` Info.plist key (`OV_DEFAULT_RELAY_URL` in
 | Target | Pairing code | Relay session id | Begin call |
 |---|---|---|---|
 | Device | placeholder `"000000"` | `UInt32(truncatingIfNeeded: deviceID)` (low 32 bits, matching `ovhost --unattended`) | `beginPin(pin)` |
-| Pairing | the partner's code | `ov_relay_session_id(code)` | `begin(authMode: 0)` |
+| Pairing | the host's 10-digit one-time code (`PairView` accepts exactly 10 digits) | `ov_relay_session_id(code)` (its 4 public rendezvous digits) | `begin(authMode: 0)` (SPAKE2; the code never crosses the wire) |
 
 ### 4.1 Relay over TCP
 
@@ -806,8 +806,9 @@ These are observed in code, as of this writing.
 
 **Client-only app**
 
-- The app never acts as a host. "Your pairing code" and "This device's
-  fingerprint" come from a throwaway per-launch identity
+- The app never acts as a host (the pairing sheet therefore no longer
+  shows "Your pairing code"). Settings' "This device's pairing code" and
+  fingerprint come from a throwaway per-launch identity
   (`PairingStateBox`, `ov_identity_create`). Each session generates its own
   identity in `ov_session_create`. The code shown is therefore not usable
   by a partner to connect to the phone.

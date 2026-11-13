@@ -87,7 +87,8 @@ The crate root (`src/lib.rs`) re-exports the most-used items, for example
 - `MAX_COMMAND_LEN = MAX_RECORD_LEN - RECORD_OVERHEAD` (65 479).
   `TerminalSession::send` returns `TransportError::FrameTooLarge` **before**
   encrypting anything larger. As a result, an oversized command never uses up
-  a send sequence number, which would otherwise desync the peer for good.
+  a send sequence number (a refused record would leave a gap in the peer's
+  replay window).
 - `MAX_TEXT_PAYLOAD = 60 KiB` is the cap for CLIPBOARD and TYPE text.
   - `truncate_utf8` clips text on a char boundary (used for clipboard).
   - `chunk_utf8` splits text into several records (used for chat).

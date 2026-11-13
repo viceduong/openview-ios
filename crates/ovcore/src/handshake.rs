@@ -1,50 +1,59 @@
-//! Handshake state machine, protocol version 2 (see `docs/WIRE_PROTOCOL.md` §3).
+//! Handshake state machine, protocol version 3 (see `docs/WIRE_PROTOCOL.md` §3).
 //!
 //! ```text
 //! Client                                   Server
 //! --- HELLO ------------------------------->   identity + eph keys, auth blob
-//!                                              (PIN mode: SPAKE2 message A)
+//!                                              (PIN / pairing: SPAKE2 message A)
 //! <-- HELLO + READY ------------------------   server identity + eph keys
-//!                                              (PIN mode: SPAKE2 message B),
+//!                                              (PIN / pairing: SPAKE2 message B),
 //!                                              READY = Ed25519 sig over the
 //!                                              transcript [+ server finished MAC]
-//! --- CONFIRM ----------------------------->   PIN mode only: client finished MAC
+//! --- CONFIRM ----------------------------->   PAKE modes: client finished MAC
 //! ```
 //!
-//! Pairing-code and direct-device sessions are established after two flights
-//! (the client after READY, the server right after the client's HELLO). PIN
-//! sessions need the third flight: the server only accepts once the client
-//! proved — with a MAC keyed by the PAKE-derived secret — that it knows the
-//! PIN.
+//! Direct-device sessions are established after two flights (the client
+//! after READY, the server right after the client's HELLO). The two
+//! credential modes — **PIN** (unattended) and **pairing code** (attended)
+//! — are both SPAKE2 and need the third flight: the server only accepts once
+//! the client proved, with a MAC keyed by the PAKE-derived secret, that it
+//! knows the credential.
 //!
-//! # PIN authentication (SPAKE2)
+//! # Credentials (SPAKE2)
 //!
-//! The access PIN (stretched by [`crate::pin::pin_psk`]) is the SPAKE2
-//! password, with fixed role identities `openview/v2/client` and
-//! `openview/v2/server`. The PAKE key is mixed into the session key schedule
+//! | Mode | SPAKE2 password | identities (client / server) |
+//! |---|---|---|
+//! | PIN | [`crate::pin::pin_psk`] of the PIN | `openview/v3/pin-client` / `openview/v3/pin-server` |
+//! | pairing code | the 10-digit code ([`crate::pairing`]) | `openview/v3/pair-client` / `openview/v3/pair-server` |
+//!
+//! The distinct identities make a PIN and a pairing code never
+//! interchangeable, even for equal strings. Neither credential crosses the
+//! wire in any form. The PAKE key is mixed into the session key schedule
 //! together with both X25519 shared secrets and the transcript hash, which
 //! covers both HELLOs in full (device IDs, static + ephemeral keys, Ed25519
 //! keys and signatures, auth mode, PAKE messages, clock field). Explicit key
 //! confirmation runs in both directions:
 //!
-//! - **server → client** in READY: `HMAC(server_finished, "ov2 server finished" || TH)`
-//! - **client → server** in CONFIRM: `HMAC(client_finished, "ov2 client finished" || TH)`
+//! - **server → client** in READY: `HMAC(server_finished, "ov3 server finished" || TH)`
+//! - **client → server** in CONFIRM: `HMAC(client_finished, "ov3 client finished" || TH)`
 //!
-//! A wrong PIN therefore fails cleanly on both sides — the client sends
-//! REJECT(auth failed) — and the only thing either a passive observer or an
-//! active attacker learns is "this one guess was wrong". Nothing on the wire
-//! is a function of the PIN alone, so there is no offline dictionary attack.
+//! A wrong credential therefore fails cleanly on both sides — the client
+//! sends REJECT(auth failed) — and the only thing either a passive observer
+//! or an active attacker learns is "this one guess was wrong". Nothing on the
+//! wire is a function of the credential alone, so there is no offline
+//! dictionary attack.
 //!
-//! Online guessing is bounded by the host-side [`AuthThrottle`]: a locked
-//! host answers a PIN HELLO with REJECT(rate limited, retry-after) without
-//! running the PAKE, surfaced as [`HandshakeError::RateLimited`].
+//! Online guessing is bounded by the host-side [`AuthThrottle`] (both modes)
+//! and, for pairing codes, by the host burning the code after one attempt.
+//! A locked host answers a HELLO with REJECT(rate limited, retry-after)
+//! without running the PAKE, surfaced as [`HandshakeError::RateLimited`].
 //!
 //! # Versioning
 //!
-//! v2 messages use new tags (`0x11..`) and HELLO carries a version byte. A
-//! v2 server answers a v1 HELLO (tag `0x01`) with REJECT(incompatible
-//! version) and fails with [`HandshakeError::IncompatibleVersion`]; a v1 peer
-//! fails immediately on the unknown tag instead of hanging.
+//! HELLO carries a version byte ([`PROTOCOL_VERSION`] = 3). A server answers
+//! any other version — and a v1 HELLO (tag `0x01`) — with REJECT(incompatible
+//! version) and fails with [`HandshakeError::IncompatibleVersion`]; an older
+//! peer fails immediately on that REJECT (v2) or on the unknown tag (v1)
+//! instead of hanging.
 //!
 //! # Key schedule
 //!
@@ -67,33 +76,35 @@ use crate::crypto;
 use crate::error::{HandshakeError, RejectCode};
 use crate::identity::Identity;
 use crate::session::{KeySchedule, Session, SessionKeys};
-use crate::throttle::AuthThrottle;
+use crate::throttle::{Attempt, AuthThrottle};
 
 /// Handshake protocol version carried in every HELLO.
-pub const PROTOCOL_VERSION: u8 = 2;
-/// HELLO (v2): both roles send (the server together with READY).
+pub const PROTOCOL_VERSION: u8 = 3;
+/// HELLO: both roles send (the server together with READY).
 pub const TAG_HELLO: u8 = 0x11;
-/// READY (v2): server only; transcript signature [+ server finished MAC].
+/// READY: server only; transcript signature [+ server finished MAC].
 pub const TAG_READY: u8 = 0x12;
-/// CONFIRM (v2): client only, PIN mode; client finished MAC.
+/// CONFIRM: client only, PAKE modes; client finished MAC.
 pub const TAG_CONFIRM: u8 = 0x13;
-/// REJECT (v2): either role; `code u8 || retry_after_secs u32 BE`.
+/// REJECT: either role; `code u8 || retry_after_secs u32 BE`.
 pub const TAG_REJECT: u8 = 0x1F;
 /// The v1 HELLO tag (pre-PAKE peers). Answered with REJECT(incompatible).
 pub const LEGACY_TAG_HELLO: u8 = 0x01;
 /// The v1 READY tag.
 pub const LEGACY_TAG_READY: u8 = 0x02;
 
-/// Largest accepted handshake message body (a v2 HELLO is ~300 bytes).
+/// Largest accepted handshake message body (a HELLO is ~300 bytes).
 const MAX_MSG_LEN: usize = 4 * 1024;
-/// SPAKE2 role identities (both sides use the same pair).
-const PAKE_ID_CLIENT: &[u8] = b"openview/v2/client";
-const PAKE_ID_SERVER: &[u8] = b"openview/v2/server";
+/// SPAKE2 role identities, per credential (both sides use the same pair).
+const PIN_ID_CLIENT: &[u8] = b"openview/v3/pin-client";
+const PIN_ID_SERVER: &[u8] = b"openview/v3/pin-server";
+const PAIR_ID_CLIENT: &[u8] = b"openview/v3/pair-client";
+const PAIR_ID_SERVER: &[u8] = b"openview/v3/pair-server";
 /// Domain tags.
-const TRANSCRIPT_TAG: &[u8] = b"openview handshake v2";
-const READY_SIG_TAG: &[u8] = b"ov2 ready";
-const SERVER_FINISHED_TAG: &[u8] = b"ov2 server finished";
-const CLIENT_FINISHED_TAG: &[u8] = b"ov2 client finished";
+const TRANSCRIPT_TAG: &[u8] = b"openview handshake v3";
+const READY_SIG_TAG: &[u8] = b"ov3 ready";
+const SERVER_FINISHED_TAG: &[u8] = b"ov3 server finished";
+const CLIENT_FINISHED_TAG: &[u8] = b"ov3 client finished";
 /// SPAKE2 (Ed25519 group) message: side byte + 32-byte element.
 const PAKE_MSG_LEN: usize = 33;
 const MAC_LEN: usize = 32;
@@ -211,7 +222,8 @@ pub enum Role {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum AuthMode {
-    /// 6-digit code from `Identity::pairing_code()` (attended access).
+    /// Attended access: a one-time pairing code ([`crate::pairing`]),
+    /// authenticated with SPAKE2.
     PairingCode = 0,
     /// Peer is pinned by device ID / fingerprint (LAN / direct).
     DirectDevice = 1,
@@ -233,15 +245,31 @@ impl AuthMode {
             _ => Err(HandshakeError::Malformed(format!("unknown auth mode {v}"))),
         }
     }
+
+    /// Whether this mode authenticates a credential with SPAKE2 (three
+    /// flights, key confirmation, throttled).
+    #[must_use]
+    pub fn is_pake(self) -> bool {
+        matches!(self, Self::Pin | Self::PairingCode)
+    }
+
+    /// The credential's name in error messages.
+    fn credential(self) -> &'static str {
+        match self {
+            Self::PairingCode => "pairing code",
+            _ => "PIN",
+        }
+    }
 }
 
-/// What we present in our HELLO (and, for PairingCode, what we assert about the peer).
+/// The credential this side authenticates with.
 ///
-/// `Debug` is redacting and the PIN key is zeroized on drop.
+/// `Debug` is redacting and credentials are zeroized on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Auth {
-    /// The 6-digit code of the **server** we are dialing (client side). On a
-    /// server, this is our own code, which incoming clients must present.
+    /// The one-time pairing code of the **server** (both sides hold the same
+    /// code: the host generated it, the user typed it on the viewer). The
+    /// SPAKE2 password — never sent on the wire.
     PairingCode(String),
     /// Nothing to present — the peer is pinned out-of-band.
     DirectDevice,
@@ -255,8 +283,10 @@ pub enum Auth {
 
 impl Drop for Auth {
     fn drop(&mut self) {
-        if let Auth::Pin(k) = self {
-            k.zeroize();
+        match self {
+            Auth::Pin(k) => k.zeroize(),
+            Auth::PairingCode(c) => c.zeroize(),
+            Auth::DirectDevice | Auth::MutualTls => {}
         }
     }
 }
@@ -282,13 +312,22 @@ impl Auth {
         }
     }
 
-    /// Decode a wire auth blob back into [`Auth`]. For PIN mode the blob is
-    /// a PAKE message, not a key, so the result carries an all-zero key
-    /// (the caller supplies its own PIN).
+    /// The SPAKE2 password and role identities of a credential mode.
+    fn pake_params(&self) -> Option<(&[u8], &'static [u8], &'static [u8])> {
+        match self {
+            Auth::Pin(psk) => Some((psk.as_slice(), PIN_ID_CLIENT, PIN_ID_SERVER)),
+            Auth::PairingCode(code) => Some((code.as_bytes(), PAIR_ID_CLIENT, PAIR_ID_SERVER)),
+            Auth::DirectDevice | Auth::MutualTls => None,
+        }
+    }
+
+    /// Decode a wire auth blob back into [`Auth`]. In the credential modes
+    /// the blob is a PAKE message, not the credential, so the result carries
+    /// an empty / all-zero credential (the caller supplies its own).
     #[must_use]
-    pub fn from_wire(mode: AuthMode, blob: &[u8]) -> Auth {
+    pub fn from_wire(mode: AuthMode, _blob: &[u8]) -> Auth {
         match mode {
-            AuthMode::PairingCode => Auth::PairingCode(String::from_utf8_lossy(blob).into_owned()),
+            AuthMode::PairingCode => Auth::PairingCode(String::new()),
             AuthMode::DirectDevice => Auth::DirectDevice,
             AuthMode::Pin => Auth::Pin([0u8; 32]),
             AuthMode::MutualTls => Auth::MutualTls,
@@ -372,7 +411,7 @@ pub struct Handshake {
 
     eph: Option<EphemeralSecret>,
     eph_pk: X25519PublicKey,
-    /// Client, PIN mode: the SPAKE2 state between HELLO and the server's HELLO.
+    /// Client, PAKE modes: the SPAKE2 state between HELLO and the server's HELLO.
     pake: Option<Spake2<Ed25519Group>>,
     /// The PAKE output once both messages are in.
     pake_key: Option<Zeroizing<Vec<u8>>>,
@@ -385,10 +424,13 @@ pub struct Handshake {
     peer_ed: Option<VerifyingKey>,
     session: Option<Session>,
 
-    /// Server, PIN mode: attempt limiter (default: [`AuthThrottle::global`]).
+    /// Server, PAKE modes: attempt limiter (default: [`AuthThrottle::global`]).
     throttle: Option<Arc<AuthThrottle>>,
-    /// Server, PIN mode: the client's address, when the carrier knows it.
+    /// Server, PAKE modes: the client's address, when the carrier knows it.
     auth_source: Option<IpAddr>,
+    /// Server, PAKE modes: the attempt in flight (a failure unless the
+    /// client's CONFIRM verifies — also when this handshake is dropped).
+    attempt: Option<Attempt>,
 }
 
 impl Handshake {
@@ -420,20 +462,20 @@ impl Handshake {
             session: None,
             throttle: None,
             auth_source: None,
+            attempt: None,
         };
         if role == Role::Client {
-            let blob = match &hs.auth {
-                Auth::Pin(psk) => {
+            let blob = match hs.auth.pake_params() {
+                Some((password, id_client, id_server)) => {
                     let (state, msg) = Spake2::<Ed25519Group>::start_a(
-                        &Password::new(psk),
-                        &PakeIdentity::new(PAKE_ID_CLIENT),
-                        &PakeIdentity::new(PAKE_ID_SERVER),
+                        &Password::new(password),
+                        &PakeIdentity::new(id_client),
+                        &PakeIdentity::new(id_server),
                     );
                     hs.pake = Some(state);
                     msg
                 }
-                Auth::PairingCode(code) => code.as_bytes().to_vec(),
-                Auth::DirectDevice | Auth::MutualTls => Vec::new(),
+                None => Vec::new(),
             };
             hs.our_hello = hs.encode_hello_body(&blob);
             hs.state = State::AwaitReady;
@@ -459,14 +501,14 @@ impl Handshake {
         self.clock_offset_ms = ms;
     }
 
-    /// Server, PIN mode: the client's network address, when known (direct /
-    /// LAN carriers). Enables per-source rate limiting on top of the global
+    /// Server, PAKE modes: the client's network address, when known (direct
+    /// / LAN carriers). Enables per-source rate limiting on top of the global
     /// limit. Relay-carried sessions leave it unset.
     pub fn set_auth_source(&mut self, source: IpAddr) {
         self.auth_source = Some(source);
     }
 
-    /// Server, PIN mode: use `throttle` instead of the process-wide
+    /// Server, PAKE modes: use `throttle` instead of the process-wide
     /// [`AuthThrottle::global`].
     pub fn set_throttle(&mut self, throttle: Arc<AuthThrottle>) {
         self.throttle = Some(throttle);
@@ -575,12 +617,12 @@ impl Handshake {
             (LEGACY_TAG_HELLO, Role::Server) => {
                 self.push_reject(RejectCode::IncompatibleVersion, 0);
                 Err(HandshakeError::IncompatibleVersion(
-                    "peer sent a v1 HELLO; v2 (PAKE) required — update the client".into(),
+                    "peer sent a v1 HELLO; v3 required — update both apps".into(),
                 ))
             }
             (LEGACY_TAG_HELLO | LEGACY_TAG_READY, Role::Client) => {
                 Err(HandshakeError::IncompatibleVersion(
-                    "peer speaks handshake v1; v2 (PAKE) required — update the host".into(),
+                    "peer speaks handshake v1; v3 required — update both apps".into(),
                 ))
             }
             (TAG_READY, Role::Server) => Err(HandshakeError::Unexpected("READY as server".into())),
@@ -601,6 +643,7 @@ impl Handshake {
         };
         self.pake = None;
         self.pake_key = None;
+        self.attempt = None; // records the failure
         Err(err)
     }
 
@@ -621,15 +664,16 @@ impl Handshake {
         let retry_after_secs = u32::from_be_bytes(retry);
         match (RejectCode::from_u8(code), self.role) {
             (Some(RejectCode::RateLimited), _) => HandshakeError::RateLimited { retry_after_secs },
-            (Some(RejectCode::IncompatibleVersion), _) => {
-                HandshakeError::IncompatibleVersion("peer rejected our handshake version".into())
-            }
+            (Some(RejectCode::IncompatibleVersion), _) => HandshakeError::IncompatibleVersion(
+                "the peer rejected our handshake version — update both apps".into(),
+            ),
             (Some(RejectCode::AuthFailed), Role::Client) => HandshakeError::AuthFailed(
                 "rejected by the host (wrong PIN or pairing code)".into(),
             ),
-            (Some(RejectCode::AuthFailed), Role::Server) => HandshakeError::AuthFailed(
-                "client rejected our key confirmation (wrong PIN)".into(),
-            ),
+            (Some(RejectCode::AuthFailed), Role::Server) => HandshakeError::AuthFailed(format!(
+                "client rejected our key confirmation (wrong {})",
+                self.auth.mode().credential()
+            )),
             (Some(RejectCode::AuthModeMismatch), _) => {
                 HandshakeError::AuthModeMismatch("rejected by the peer".into())
             }
@@ -680,7 +724,7 @@ impl Handshake {
         let version = r.u8("HELLO version")?;
         if version != PROTOCOL_VERSION {
             return Err(HandshakeError::IncompatibleVersion(format!(
-                "peer speaks handshake v{version}, we speak v{PROTOCOL_VERSION}"
+                "peer speaks handshake v{version}, we speak v{PROTOCOL_VERSION} — update both apps"
             )));
         }
         let device_id = u64::from_be_bytes(r.array::<8>("HELLO device id")?);
@@ -763,7 +807,7 @@ impl Handshake {
         }
         let h = self.parse_hello(body)?;
         self.check_mode(h.mode)?;
-        if h.mode == AuthMode::Pin {
+        if h.mode.is_pake() {
             let pake = self
                 .pake
                 .take()
@@ -797,7 +841,7 @@ impl Handshake {
             ));
         }
         let th = transcript_hash(&self.our_hello, &self.peer_hello);
-        // ready_sig = Ed(ed_server, "ov2 ready" || TH): the server signed the
+        // ready_sig = Ed(ed_server, "ov3 ready" || TH): the server signed the
         // whole transcript, including our HELLO.
         let ed = self
             .peer_ed
@@ -806,7 +850,8 @@ impl Handshake {
             .map_err(|_| HandshakeError::BadSignature("READY signature invalid".into()))?;
 
         let hk = self.derive(&th)?;
-        if self.auth.mode() == AuthMode::Pin {
+        let mode = self.auth.mode();
+        if mode.is_pake() {
             let ok = confirm.len() == MAC_LEN
                 && finished_mac(&hk.server_finished, SERVER_FINISHED_TAG, &th)
                     .verify_slice(confirm)
@@ -814,9 +859,10 @@ impl Handshake {
             if !ok {
                 // Tell the host so it fails now instead of timing out.
                 self.push_reject(RejectCode::AuthFailed, 0);
-                return Err(HandshakeError::AuthFailed(
-                    "wrong PIN (server key confirmation did not verify)".into(),
-                ));
+                return Err(HandshakeError::AuthFailed(format!(
+                    "wrong {} (server key confirmation did not verify)",
+                    mode.credential()
+                )));
             }
             let mac = finished_mac(&hk.client_finished, CLIENT_FINISHED_TAG, &th)
                 .finalize()
@@ -826,7 +872,7 @@ impl Handshake {
             self.out
                 .push(HandshakeEvent::Sent(datagram(TAG_CONFIRM, &b)));
         } else if !confirm.is_empty() {
-            return Err(malformed("confirm MAC outside PIN mode"));
+            return Err(malformed("confirm MAC outside a PAKE mode"));
         }
         self.session = Some(self.build_session(&hk.keys));
         self.state = State::Established;
@@ -866,15 +912,8 @@ impl Handshake {
     fn server_on_hello_inner(&mut self, body: &[u8]) -> Result<(), HandshakeError> {
         let h = self.parse_hello(body)?;
         self.check_mode(h.mode)?;
-        let blob = match &self.auth {
-            // Pairing check: the client must present OUR code.
-            Auth::PairingCode(our_code) => {
-                if !crate::pin::ct_eq(h.auth_blob, our_code.as_bytes()) {
-                    return Err(HandshakeError::AuthFailed("pairing code mismatch".into()));
-                }
-                our_code.as_bytes().to_vec()
-            }
-            Auth::Pin(psk) => {
+        let blob = match self.auth.pake_params() {
+            Some((password, id_client, id_server)) => {
                 let throttle = self.throttle.clone().unwrap_or_else(AuthThrottle::global);
                 let now = Instant::now();
                 if let Err(wait) = throttle.check(self.auth_source, now) {
@@ -884,7 +923,8 @@ impl Handshake {
                     tracing::warn!(
                         source = ?self.auth_source,
                         retry_after_secs,
-                        "PIN attempt refused: too many failures"
+                        "{} attempt refused: too many failures",
+                        h.mode.credential()
                     );
                     return Err(HandshakeError::RateLimited { retry_after_secs });
                 }
@@ -892,26 +932,26 @@ impl Handshake {
                     return Err(malformed("bad PAKE message length"));
                 }
                 let (state, msg) = Spake2::<Ed25519Group>::start_b(
-                    &Password::new(psk),
-                    &PakeIdentity::new(PAKE_ID_CLIENT),
-                    &PakeIdentity::new(PAKE_ID_SERVER),
+                    &Password::new(password),
+                    &PakeIdentity::new(id_client),
+                    &PakeIdentity::new(id_server),
                 );
                 let key = state
                     .finish(h.auth_blob)
                     .map_err(|e| HandshakeError::Malformed(format!("bad PAKE message: {e}")))?;
                 self.pake_key = Some(Zeroizing::new(key));
-                // Provisional failure: undone by a valid CONFIRM.
-                throttle.record_failure(self.auth_source, now);
+                // A failure unless the client's CONFIRM verifies.
+                self.attempt = Some(throttle.begin(self.auth_source));
                 msg
             }
-            Auth::DirectDevice | Auth::MutualTls => Vec::new(),
+            None => Vec::new(),
         };
         self.store_peer(&h, body);
         self.our_hello = self.encode_hello_body(&blob);
         let th = transcript_hash(&self.peer_hello, &self.our_hello);
         let hk = self.derive(&th)?;
 
-        let confirm = if self.auth.mode() == AuthMode::Pin {
+        let confirm = if self.auth.mode().is_pake() {
             finished_mac(&hk.server_finished, SERVER_FINISHED_TAG, &th)
                 .finalize()
                 .into_bytes()
@@ -933,7 +973,7 @@ impl Handshake {
         self.out
             .extend(response.iter().cloned().map(HandshakeEvent::Sent));
         let session = self.build_session(&hk.keys.swapped());
-        if self.auth.mode() == AuthMode::Pin {
+        if self.auth.mode().is_pake() {
             self.state = State::AwaitConfirm(Box::new(PendingConfirm {
                 session,
                 client_finished: hk.client_finished,
@@ -959,12 +999,14 @@ impl Handshake {
                 .verify_slice(mac)
                 .is_ok();
         if !ok {
-            return Err(HandshakeError::AuthFailed(
-                "wrong PIN (client key confirmation did not verify)".into(),
-            ));
+            return Err(HandshakeError::AuthFailed(format!(
+                "wrong {} (client key confirmation did not verify)",
+                self.auth.mode().credential()
+            )));
         }
-        let throttle = self.throttle.clone().unwrap_or_else(AuthThrottle::global);
-        throttle.record_success(self.auth_source);
+        if let Some(attempt) = self.attempt.take() {
+            attempt.succeed();
+        }
         self.pake_key = None;
         self.session = Some(p.session);
         self.state = State::Established;
@@ -973,7 +1015,7 @@ impl Handshake {
 
     // ---------------- key derivation ----------------
 
-    /// Run both X25519 exchanges and the v2 key schedule over `th`.
+    /// Run both X25519 exchanges and the v3 key schedule over `th`.
     fn derive(&mut self, th: &[u8; 32]) -> Result<crate::session::HandshakeKeys, HandshakeError> {
         let peer = self
             .peer
@@ -996,14 +1038,14 @@ impl Handshake {
         let mut ikm = Zeroizing::new(Vec::with_capacity(96));
         ikm.extend_from_slice(eph_dh.as_bytes());
         ikm.extend_from_slice(static_dh.as_bytes());
-        if self.auth.mode() == AuthMode::Pin {
+        if self.auth.mode().is_pake() {
             let k = self
                 .pake_key
                 .as_ref()
-                .ok_or_else(|| HandshakeError::Unexpected("PIN mode without a PAKE key".into()))?;
+                .ok_or_else(|| HandshakeError::Unexpected("PAKE mode without a PAKE key".into()))?;
             ikm.extend_from_slice(k);
         }
-        Ok(KeySchedule::derive_v2(&ikm, th))
+        Ok(KeySchedule::derive_v3(&ikm, th))
     }
 
     /// Session from client-view keys swapped into OUR view (`encrypt` = what we send).
@@ -1100,7 +1142,7 @@ mod tests {
         let server_id = Identity::generate();
         let (dev_c, dev_s) = (42424242u64, 987654321u64);
 
-        let server_code = server_id.pairing_code();
+        let server_code = crate::pairing::generate();
         let mut client = Handshake::new(
             Role::Client,
             dev_c,
@@ -1115,24 +1157,139 @@ mod tests {
             Auth::PairingCode(server_code),
         );
         server.expect_device(dev_c);
+        server.set_throttle(private_throttle());
 
-        let mut p_cs = Pipe::new(); // client -> server
-        let mut p_sc = Pipe::new(); // server -> client
-
-        p_cs.push(&sent(&mut client, "client"));
-        p_cs.deliver(&mut server)
-            .expect("server processes client hello");
-        p_sc.push(&all_sent(&mut server));
-        p_sc.deliver(&mut client)
-            .expect("client processes server hello+ready");
-
+        run_pin(&mut client, &mut server).expect("pairing handshake");
         assert!(server.is_established());
         assert!(client.is_established());
-        assert!(
-            client.take_events().is_empty(),
-            "no CONFIRM outside PIN mode"
-        );
         (client, server)
+    }
+
+    /// Every datagram of a full PAKE handshake, both directions.
+    fn pake_transcript(client: &mut Handshake, server: &mut Handshake) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let hello = all_sent(client);
+        wire.extend_from_slice(&hello);
+        let _ = server.feed(&hello);
+        let resp = all_sent(server);
+        wire.extend_from_slice(&resp);
+        let _ = client.feed(&resp);
+        let last = all_sent(client);
+        wire.extend_from_slice(&last);
+        let _ = server.feed(&last);
+        wire.extend_from_slice(&all_sent(server));
+        wire
+    }
+
+    fn pairing_pair(client_code: &str, server_code: &str) -> (Handshake, Handshake) {
+        let client = Handshake::new(
+            Role::Client,
+            11,
+            &Identity::generate(),
+            Auth::PairingCode(client_code.into()),
+        );
+        let mut server = Handshake::new(
+            Role::Server,
+            22,
+            &Identity::generate(),
+            Auth::PairingCode(server_code.into()),
+        );
+        server.set_throttle(private_throttle());
+        (client, server)
+    }
+
+    #[test]
+    fn pairing_code_never_appears_on_the_wire() {
+        let code = crate::pairing::generate();
+        let (mut c, mut s) = pairing_pair(&code, &code);
+        let wire = pake_transcript(&mut c, &mut s);
+        assert!(c.is_established() && s.is_established());
+        assert!(
+            !wire.windows(code.len()).any(|w| w == code.as_bytes()),
+            "the code must not travel in cleartext"
+        );
+        // Not even its secret part.
+        let secret = &code.as_bytes()[crate::pairing::RENDEZVOUS_DIGITS..];
+        assert!(!wire.windows(secret.len()).any(|w| w == secret));
+        assert_records_flow(&mut c, &mut s);
+    }
+
+    #[test]
+    fn pairing_server_waits_for_confirm() {
+        let code = crate::pairing::generate();
+        let (mut c, mut s) = pairing_pair(&code, &code);
+        s.feed(&all_sent(&mut c)).unwrap();
+        assert!(!s.is_established(), "pairing is a PAKE mode now");
+        c.feed(&all_sent(&mut s)).unwrap();
+        assert!(c.is_established());
+        let confirm = sent(&mut c, "CONFIRM");
+        assert_eq!(confirm[0], TAG_CONFIRM);
+        s.feed(&confirm).unwrap();
+        assert!(s.is_established());
+    }
+
+    #[test]
+    fn wrong_pairing_code_fails_on_both_sides_and_burns_the_attempt() {
+        let (mut c, mut s) = pairing_pair("1234000000", "1234999999");
+        let _ = pake_transcript(&mut c, &mut s);
+        assert!(c.error().unwrap().is_auth_failure(), "{:?}", c.failed());
+        assert!(c.failed().unwrap().contains("pairing code"));
+        assert!(s.error().unwrap().is_auth_failure(), "{:?}", s.failed());
+        // The host's handshake for this code is dead: even the right code
+        // cannot complete on it (the host then generates a new code).
+        let (mut retry, _) = pairing_pair("1234999999", "1234999999");
+        let err = s.feed(&all_sent(&mut retry)).unwrap_err();
+        assert!(err.is_auth_failure(), "{err}");
+        assert!(!s.is_established());
+    }
+
+    #[test]
+    fn pin_and_pairing_code_are_not_interchangeable() {
+        // Even with the same 32 password bytes, the SPAKE2 identities differ.
+        let code = "1".repeat(32);
+        let mut psk = [0u8; 32];
+        psk.copy_from_slice(code.as_bytes());
+        let mut c = Handshake::new(
+            Role::Client,
+            1,
+            &Identity::generate(),
+            Auth::PairingCode(code.clone()),
+        );
+        let mut s = Handshake::new(Role::Server, 2, &Identity::generate(), Auth::Pin(psk));
+        s.set_throttle(private_throttle());
+        let err = s.feed(&all_sent(&mut c)).unwrap_err();
+        assert!(matches!(err, HandshakeError::AuthModeMismatch(_)), "{err}");
+        // And below the mode byte: SPAKE2 itself keys on the identities.
+        let pw = Password::new(code.as_bytes());
+        let (a, ma) = Spake2::<Ed25519Group>::start_a(
+            &pw,
+            &PakeIdentity::new(PAIR_ID_CLIENT),
+            &PakeIdentity::new(PAIR_ID_SERVER),
+        );
+        let (b, mb) = Spake2::<Ed25519Group>::start_b(
+            &pw,
+            &PakeIdentity::new(PIN_ID_CLIENT),
+            &PakeIdentity::new(PIN_ID_SERVER),
+        );
+        assert_ne!(a.finish(&mb).unwrap(), b.finish(&ma).unwrap());
+    }
+
+    #[test]
+    fn pairing_mode_is_throttled_too() {
+        let throttle = Arc::new(AuthThrottle::new(
+            ThrottlePolicy::PER_SOURCE,
+            ThrottlePolicy {
+                threshold: 1,
+                ..ThrottlePolicy::GLOBAL
+            },
+        ));
+        let (mut c, mut s) = pairing_pair("1111111111", "2222222222");
+        s.set_throttle(throttle.clone());
+        let _ = pake_transcript(&mut c, &mut s);
+        let (mut c, mut s) = pairing_pair("2222222222", "2222222222");
+        s.set_throttle(throttle);
+        let _ = pake_transcript(&mut c, &mut s);
+        assert!(c.error().unwrap().is_rate_limited(), "{:?}", c.failed());
     }
 
     fn assert_records_flow(client: &mut Handshake, server: &mut Handshake) {
@@ -1437,11 +1594,31 @@ mod tests {
         let reject = sent(&mut s, "server reject");
         assert_eq!(reject[0], TAG_REJECT);
         assert_eq!(reject[3], RejectCode::IncompatibleVersion as u8);
-        // A v2 client receiving that REJECT reports the version problem.
+        // A v3 client receiving that REJECT reports the version problem.
         let cid = Identity::generate();
         let mut c = Handshake::new(Role::Client, 1, &cid, Auth::DirectDevice);
         let _ = c.take_events();
         let err = c.feed(&reject).unwrap_err();
+        assert!(
+            matches!(err, HandshakeError::IncompatibleVersion(_)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("update both apps"), "{err}");
+    }
+
+    #[test]
+    fn v2_hello_gets_incompatible_version() {
+        let (cid, sid) = (Identity::generate(), Identity::generate());
+        let mut c = Handshake::new(Role::Client, 1, &cid, Auth::DirectDevice);
+        let mut s = Handshake::new(Role::Server, 2, &sid, Auth::DirectDevice);
+        let mut hello = sent(&mut c, "client");
+        hello[3] = 2; // a v2 peer: same tags, older version byte
+        let err = s.feed(&hello).unwrap_err();
+        assert!(
+            matches!(err, HandshakeError::IncompatibleVersion(_)),
+            "{err}"
+        );
+        let err = c.feed(&sent(&mut s, "reject")).unwrap_err();
         assert!(
             matches!(err, HandshakeError::IncompatibleVersion(_)),
             "{err}"
@@ -1523,20 +1700,23 @@ mod tests {
             Role::Client,
             1,
             &client_id,
-            Auth::PairingCode("000000".into()),
+            Auth::PairingCode("0000000000".into()),
         );
         let mut server = Handshake::new(
             Role::Server,
             2,
             &server_id,
-            Auth::PairingCode(server_id.pairing_code()),
+            Auth::PairingCode(crate::pairing::generate()),
         );
-        let hello = sent(&mut client, "client");
-        let err = server.feed(&hello).unwrap_err();
-        assert!(err.to_string().contains("pairing code"), "got: {err}");
-        assert!(server.failed().is_some());
+        server.set_throttle(private_throttle());
+        // The server cannot tell yet (no code on the wire); the client fails
+        // on the server's key confirmation and tells the server.
+        server.feed(&sent(&mut client, "client")).unwrap();
         let err = client.feed(&all_sent(&mut server)).unwrap_err();
+        assert!(err.to_string().contains("pairing code"), "got: {err}");
         assert!(err.is_auth_failure(), "client is told: {err}");
+        let err = server.feed(&all_sent(&mut client)).unwrap_err();
+        assert!(err.is_auth_failure(), "{err}");
     }
 
     #[test]

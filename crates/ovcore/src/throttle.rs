@@ -1,16 +1,19 @@
-//! Online brute-force protection for PIN authentication.
+//! Online brute-force protection for credential (PIN / pairing-code)
+//! authentication.
 //!
 //! The PAKE ([`crate::handshake`]) guarantees that each handshake attempt
-//! tests **at most one** PIN guess, and that nothing an attacker observes
+//! tests **at most one** guess, and that nothing an attacker observes
 //! allows guessing offline. What remains is online guessing; this module
 //! bounds its rate on the host.
 //!
 //! Policy (per key — one per source address, plus one global key):
 //!
-//! - Every PIN attempt counts as a failure **when it starts** (the server
-//!   sends its key confirmation). A successful key confirmation from the
-//!   client then undoes it. An attacker who just drops the connection after
-//!   seeing the server's reply therefore still pays for the guess.
+//! - Every attempt that got as far as the server's key confirmation is an
+//!   [`Attempt`]. It counts as a failure unless the client's confirmation
+//!   verifies: an explicit failure, a timeout, or a dropped connection all
+//!   count — an attacker who disconnects after seeing the server's reply
+//!   still pays for the guess. Successful logins never count, so concurrent
+//!   legitimate handshakes cannot lock a host out.
 //! - Once a key reaches `threshold` failures it is locked for `base_lock`;
 //!   every further failure doubles the lock, capped at `max_lock`.
 //! - A key with no failure for `forget_after` starts over.
@@ -188,11 +191,21 @@ impl AuthThrottle {
         }
     }
 
-    /// A key confirmation succeeded: undo the attempt's provisional failure
-    /// and clear the source's history. An active lock is left to expire.
+    /// Start an attempt for `source`: it records a failure when dropped
+    /// unless [`Attempt::succeed`] is called first.
+    #[must_use]
+    pub fn begin(self: &Arc<Self>, source: Option<IpAddr>) -> Attempt {
+        Attempt {
+            throttle: Arc::clone(self),
+            source,
+            done: false,
+        }
+    }
+
+    /// A key confirmation succeeded: clear the source's failure history (an
+    /// active lock is left to expire). The global count is untouched.
     pub fn record_success(&self, source: Option<IpAddr>) {
         let mut st = self.lock_state();
-        st.global.failures = st.global.failures.saturating_sub(1);
         if let Some(ip) = source {
             if let Some(e) = st.sources.get_mut(&ip) {
                 if e.locked_until.is_none() {
@@ -201,6 +214,31 @@ impl AuthThrottle {
                     e.failures = 0;
                 }
             }
+        }
+    }
+}
+
+/// One credential attempt in flight (see the module docs). Dropping it
+/// without [`succeed`](Self::succeed) records a failure.
+#[derive(Debug)]
+pub struct Attempt {
+    throttle: Arc<AuthThrottle>,
+    source: Option<IpAddr>,
+    done: bool,
+}
+
+impl Attempt {
+    /// The client's key confirmation verified.
+    pub fn succeed(mut self) {
+        self.done = true;
+        self.throttle.record_success(self.source);
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        if !self.done {
+            self.throttle.record_failure(self.source, Instant::now());
         }
     }
 }
@@ -274,15 +312,20 @@ mod tests {
     }
 
     #[test]
-    fn success_undoes_the_provisional_failure() {
-        let t = AuthThrottle::new(P, P);
+    fn attempts_count_unless_they_succeed() {
+        let t = Arc::new(AuthThrottle::new(P, P));
         let now = Instant::now();
-        for _ in 0..10 {
-            t.record_failure(ip(1), now);
-            t.record_success(ip(1));
-        }
+        // Many concurrent attempts that all succeed: never a lock.
+        let inflight: Vec<Attempt> = (0..10).map(|_| t.begin(ip(1))).collect();
+        assert!(t.check(ip(1), now).is_ok());
+        inflight.into_iter().for_each(Attempt::succeed);
         assert!(t.check(ip(1), now).is_ok());
         assert!(t.check(None, now).is_ok());
+        // Abandoned attempts (dropped) count as failures.
+        for _ in 0..3 {
+            drop(t.begin(ip(1)));
+        }
+        assert!(t.check(ip(1), Instant::now()).is_err());
     }
 
     #[test]

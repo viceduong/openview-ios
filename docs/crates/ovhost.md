@@ -580,17 +580,18 @@ auth modes in `listen_once()`:
 | | Attended (default) | Unattended (a PIN via `OPENVIEW_PIN` or `--pin`; `--unattended` is implied) |
 |---|---|---|
 | Identity | `Identity::generate()`: a **fresh identity on every `listen_once`**, so `--service` without a PIN gets a new code for each session | Loaded from or created in **`<data dir>\ovhost-unattended.id`** (`unattended::load_or_create_identity`; default `%LOCALAPPDATA%\OpenView`), so it stays the same across runs. A file left next to the exe by an older release is copied over once (`ovcommon::paths::migrate_file`), so the device ID survives the upgrade |
-| What the operator shares | The **pairing code** (log `pairing code <code>`, status event `pairing_code`, a short 6-digit display code from `Identity::pairing_code`) | The **device ID** (log `device id <n> (unattended)`, status event `device_id`) and the PIN |
-| Relay session ID | The code's first 4 ASCII bytes as a big-endian `u32` | The low 32 bits of the device ID |
-| Handshake auth | `Auth::PairingCode(code)` | `Auth::Pin(psk)`, where `psk = ovcore::pin::pin_psk(pin)`: PBKDF2-HMAC-SHA256, 10 000 iterations, salt `openview-pin-v1` |
+| What the operator shares | The **pairing code** (log `pairing code <code>`, status event `pairing_code`): a random one-time 10-digit code from `ovcore::pairing::generate`, new for every `listen_once` — so a code is burned after any attempt | The **device ID** (log `device id <n> (unattended)`, status event `device_id`) and the PIN |
+| Relay session ID | The code's 4 public rendezvous digits as a big-endian `u32` (`ovcore::pairing::relay_session_id`) | The low 32 bits of the device ID |
+| Handshake auth | `Auth::PairingCode(code)`: SPAKE2 with the pairing identities | `Auth::Pin(psk)`, where `psk = ovcore::pin::pin_psk(pin)`: PBKDF2-HMAC-SHA256, 10 000 iterations, salt `openview-pin-v1`; SPAKE2 with the PIN identities |
 
 * **Device ID** = the first 5 fingerprint bytes as a big-endian `u64` (40
   bits). The same value is used as the handshake `my_dev` in both modes.
-* **PIN proof** (`crates/ovcore/src/pin.rs`): each side sends
-  `HMAC-SHA256(psk, "ov-pin-proof-v1" || own_eph_pk || own_dev_be8)`, so a
-  wrong PIN is rejected cleanly. The PSK also salts the HKDF key schedule. The
-  PIN never crosses the wire, and the ephemeral X25519 keys keep forward
-  secrecy.
+* **Credentials** ([ovcore.md](ovcore.md) §4.1): both modes run SPAKE2 with
+  key confirmation in both directions (handshake v3), so neither the PIN nor
+  any part of the code crosses the wire, a wrong credential fails cleanly on
+  both sides, and each attempt tests one guess. Attempts are throttled
+  host-wide (`AuthThrottle`; per source address on the LAN port). The
+  ephemeral X25519 keys keep forward secrecy.
 * A viewer dialing by device ID pins the expected device
   (`hs.expect_device`), so it cannot be steered to another host that shares
   the 32-bit relay session ID.

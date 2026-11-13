@@ -62,13 +62,13 @@ fn viewer_reports_a_missing_host() {
 #[test]
 fn record_behind_ready_survives_the_handshake() {
     let (ida, idb) = (Identity::generate(), Identity::generate());
-    // Pairing-code mode: the server completes on the client's HELLO, so
-    // it can send a record right behind READY. (PIN mode adds a CONFIRM
-    // flight, after which the client is already established.)
-    let code = idb.pairing_code();
+    // Direct-device mode: the server completes on the client's HELLO, so
+    // it can send a record right behind READY. (The credential modes — PIN
+    // and pairing code — add a CONFIRM flight, after which the client is
+    // already established.)
     let (mut cc, mut sc) = InMemoryCarrier::pair();
-    let mut client = Handshake::new(Role::Client, 1, &ida, Auth::PairingCode(code.clone()));
-    let mut server = Handshake::new(Role::Server, 2, &idb, Auth::PairingCode(code));
+    let mut client = Handshake::new(Role::Client, 1, &ida, Auth::DirectDevice);
+    let mut server = Handshake::new(Role::Server, 2, &idb, Auth::DirectDevice);
     for ev in client.take_events() {
         let HandshakeEvent::Sent(d) = ev;
         cc.send(&d).unwrap();
@@ -103,7 +103,8 @@ fn record_behind_ready_survives_the_handshake() {
     for _ in 0..5 {
         let _ = view.pump();
     }
-    assert_eq!(view.stats().decrypt_errors, 0, "no sequence desync");
+    assert_eq!(view.stats().decrypt_errors, 0, "no record lost");
+    assert_eq!(view.stats().replayed, 0);
     assert_eq!(
         *seen.lock().unwrap(),
         vec![b"first-record".to_vec(), b"second".to_vec()]

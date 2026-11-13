@@ -6,7 +6,7 @@
 #   ovhost   (listener; joins the relay as the RESPONDER by pairing code)
 #   ovview   (viewer; dials the relay with the code, handshakes as the CLIENT)
 #
-# Flow: relay -> host (publishes a fresh 6-digit pairing code) -> view joins
+# Flow: relay -> host (publishes a fresh random 10-digit one-time code) -> view joins
 # with that code -> both attach to the same relay session -> X25519 + Ed25519
 # + ChaCha20-Poly1305 handshake completes over the tunnel -> the view sends a
 # chat line, the host logs the decrypted content and echoes it back -> the
@@ -98,7 +98,7 @@ echo "[2/4] starting host (listener) on relay $RELAY"
 HOST_PID=$!
 code=""
 for _ in $(seq 1 75); do
-  code="$(grep -oE 'pairing code [0-9]{6}' "$TMP/host.log" 2>/dev/null | head -1 | awk '{print $3}')"
+  code="$(grep -oE 'pairing code [0-9]{10}' "$TMP/host.log" 2>/dev/null | head -1 | awk '{print $3}')"
   [ -n "$code" ] && break
   sleep 0.2
 done

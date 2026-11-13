@@ -32,6 +32,9 @@ impl TerminalSession {
                     Ok(cmd) => inbox.push(cmd),
                     Err(_) => self.stats.decode_errors += 1,
                 },
+                // A duplicate / stale record (e.g. delivered on both paths
+                // across a direct-path switch): dropped, only counted.
+                Err(e) if e.is_replay() => self.stats.replayed += 1,
                 Err(_) => self.stats.decrypt_errors += 1,
             }
         };

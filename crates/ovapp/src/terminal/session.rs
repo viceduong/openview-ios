@@ -192,8 +192,10 @@ pub struct TerminalStats {
     pub cmds_rx: u64,
     /// Commands sent.
     pub cmds_tx: u64,
-    /// Records that failed to decrypt (AEAD auth / desync).
+    /// Records that failed to decrypt (AEAD auth, wrong sender).
     pub decrypt_errors: u64,
+    /// Records dropped by the anti-replay window (duplicates, too old).
+    pub replayed: u64,
     /// Commands with an unknown opcode or bad payload.
     pub decode_errors: u64,
     /// Screen updates that could not be applied (lost/corrupt update or a

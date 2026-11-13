@@ -91,19 +91,21 @@ pub(crate) fn listen_once(opts: &SessionOpts, lan: Option<&mut LanListener>) -> 
         });
         (me, Auth::Pin(psk), session_id)
     } else {
+        // Attended: a fresh identity and a fresh random one-time code for
+        // every session attempt. Whatever happens to this handshake
+        // (success, wrong code, timeout), the next `listen_once` starts
+        // over with a new code — a code is burned after one attempt.
         let me = Identity::generate();
-        let code = me.pairing_code();
+        let code = ovcore::pairing::generate();
         info!("fingerprint  {}", me.fingerprint_pine());
         info!("pairing code {code}");
         status::emit(&StatusEvent::PairingCode {
-            code: code.to_string(),
+            code: code.clone(),
             fingerprint: hex::encode(me.fingerprint()),
         });
-        let session_id = u32::from_be_bytes(
-            code.as_bytes()[..4]
-                .try_into()
-                .map_err(|_| "pairing code shorter than 4 bytes".to_owned())?,
-        );
+        // The relay slot is named by the code's public rendezvous digits
+        // only (see `ovcore::pairing`), never by the secret part.
+        let session_id = ovcore::pairing::relay_session_id(&code);
         (me, Auth::PairingCode(code), session_id)
     };
     let addr = relay;

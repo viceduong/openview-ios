@@ -1,6 +1,7 @@
 //! Relay robustness: teardown delivers EOF to the peer, a re-park during an
 //! active session pairs with the next dialer, a parked side's timeout never
-//! kills an active session, and oversized WebSocket frames are rejected.
+//! kills an active session, oversized WebSocket frames are rejected, and
+//! WebSocket upgrades need the configured path and version 13.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -212,4 +213,54 @@ fn oversized_websocket_frame_is_rejected() {
     };
     assert!(ended, "connection must be closed");
     assert!(t.elapsed() < Duration::from_secs(4));
+}
+
+/// Send an HTTP request head, return the full response (the relay closes).
+fn http(addr: SocketAddr, head: &str) -> String {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(head.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+const UPGRADE: &str = "GET /relay HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+#[test]
+fn websocket_upgrade_requires_the_relay_path_and_version_13() {
+    let addr = start_relay(Duration::from_secs(5));
+    let wrong_path = http(addr, &UPGRADE.replace("/relay", "/other"));
+    assert!(wrong_path.starts_with("HTTP/1.1 404"), "{wrong_path}");
+    let wrong_version = http(addr, &UPGRADE.replace("Version: 13", "Version: 8"));
+    assert!(wrong_version.starts_with("HTTP/1.1 426"), "{wrong_version}");
+    assert!(wrong_version.contains("Sec-WebSocket-Version: 13"));
+    let health = http(addr, "GET /health HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    // The right path and version still upgrade.
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(UPGRADE.as_bytes()).unwrap();
+    let mut b = [0u8; 12];
+    s.read_exact(&mut b).unwrap();
+    assert_eq!(&b, b"HTTP/1.1 101");
+}
+
+#[test]
+fn configured_websocket_paths_replace_the_default() {
+    let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).expect("bind relay");
+    relay.set_ws_paths(vec!["/ov".into()]).unwrap();
+    assert!(relay.set_ws_paths(vec!["no-slash".into()]).is_err());
+    let addr = relay.local_addr();
+    thread::spawn(move || {
+        let _ = relay.serve(None);
+    });
+    assert!(http(addr, UPGRADE).starts_with("HTTP/1.1 404"));
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(UPGRADE.replace("/relay", "/ov").as_bytes())
+        .unwrap();
+    let mut b = [0u8; 12];
+    s.read_exact(&mut b).unwrap();
+    assert_eq!(&b, b"HTTP/1.1 101");
 }

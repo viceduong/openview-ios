@@ -46,7 +46,7 @@ impl TerminalSession {
     /// (a raw 1080p BGRA frame is ~8 MB ≈ 240 Mbps at 30 fps).
     ///
     /// The default chunk size (when `chunk_size` is 0) is 8 KiB — small enough
-    /// that the 29-byte record overhead (header + tag + opcode) keeps each
+    /// that the 33-byte record overhead (header + tag + opcode) keeps each
     /// chunk's record far under the tightest carrier's DATA-frame limit (the
     /// relay tunnel caps a frame at `0xFFFF - 3` ≈ 64 KiB, the direct TCP
     /// carrier at `0xFFFF`), and small enough to give the viewer low-latency

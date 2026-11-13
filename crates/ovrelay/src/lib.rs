@@ -56,6 +56,8 @@ use ovtransport::{encode_frame, DISCONNECT, MAX_FRAME, PUNCH_ACK};
 
 mod ws;
 
+pub use ws::DEFAULT_WS_PATH;
+
 /// Pipe read buffer: one read is forwarded as one write (one WebSocket
 /// message for a WebSocket destination), so this also caps a message.
 const PIPE_BUF: usize = 64 * 1024;
@@ -290,6 +292,8 @@ struct Shared {
     limits: RelayLimits,
     /// Open connections (total + per IP).
     conns: Mutex<ConnTable>,
+    /// Request paths accepted for a WebSocket upgrade.
+    ws_paths: Vec<String>,
 }
 
 impl Shared {
@@ -396,6 +400,7 @@ impl Relay {
                 timeout: Duration::from_secs(30),
                 limits: RelayLimits::DEFAULT,
                 conns: Mutex::new(ConnTable::default()),
+                ws_paths: vec![DEFAULT_WS_PATH.to_owned()],
             }),
         })
     }
@@ -421,6 +426,26 @@ impl Relay {
         Arc::get_mut(&mut self.shared)
             .expect("set_limits before serve: no client threads hold Shared yet")
             .limits = limits;
+    }
+
+    /// Set the request paths accepted for a WebSocket upgrade (default
+    /// [`DEFAULT_WS_PATH`], `/relay`). Each must start with `/`; an empty
+    /// list keeps the default. Call before [`serve`](Self::serve).
+    pub fn set_ws_paths(&mut self, paths: Vec<String>) -> Result<(), RelayError> {
+        if let Some(bad) = paths
+            .iter()
+            .find(|p| !p.starts_with('/') || p.contains('?'))
+        {
+            return Err(RelayError::Protocol(format!(
+                "WebSocket path `{bad}` must start with `/` and have no query"
+            )));
+        }
+        if !paths.is_empty() {
+            Arc::get_mut(&mut self.shared)
+                .expect("set_ws_paths before serve: no client threads hold Shared yet")
+                .ws_paths = paths;
+        }
+        Ok(())
     }
 
     /// Accept loop: one thread per client. Runs forever: a failed `accept`
@@ -490,7 +515,7 @@ fn handle_client(
     let mut first = [0u8; 1];
     let ws = matches!(stream.peek(&mut first), Ok(1)) && first[0] == b'G';
     if ws {
-        match ws::handshake(&mut stream, deadline).map_err(RelayError::Io)? {
+        match ws::handshake(&mut stream, deadline, &shared.ws_paths).map_err(RelayError::Io)? {
             ws::Upgrade::Accepted => {}
             ws::Upgrade::Answered => return Ok(()), // plain HTTP (health check)
         }

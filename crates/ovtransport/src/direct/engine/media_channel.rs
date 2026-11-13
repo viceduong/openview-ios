@@ -252,7 +252,7 @@ impl DirectEngine {
                     ms.stats.bad_rx += 1;
                     return;
                 };
-                if !ms.replay.check(pn) {
+                if ms.replay.check(pn).is_err() {
                     ms.stats.replayed_rx += 1;
                     return;
                 }

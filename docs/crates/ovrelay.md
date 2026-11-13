@@ -50,8 +50,9 @@ pub enum RelayError { Bind(io::Error), Io(io::Error), Protocol(String) }
 `handle_client` peeks the first byte, with a pre-session read timeout of `HANDSHAKE_TIMEOUT` = 15 s.
 
 - **`'G'`** → HTTP. `ws::handshake` reads the head one byte at a time, at most `MAX_HEAD` = 16 KiB.
-  - If it has `Upgrade: websocket` **and** a `Sec-WebSocket-Key`: reply `101 Switching Protocols` with `Sec-WebSocket-Accept = base64(SHA1(key ‖ 258EAFA5-E914-47DA-95CA-C5AB0DC85B11))` (`ovtransport::ws::accept_key`). The request path is **not** checked; any path with the upgrade headers works.
-  - Otherwise, `GET / ` or `GET /health ` gets `200 OK` with body `ovrelay\n`, and anything else gets `426 Upgrade Required`. The connection then closes. This is the health check.
+  - A WebSocket upgrade (`Upgrade: websocket`) is accepted only as `GET <path> HTTP/1.1` where `<path>` (query stripped) is one of the configured WebSocket paths (default `/relay`, `--ws-path` / `Relay::set_ws_paths`), with `Sec-WebSocket-Version: 13`, `Connection: Upgrade` and a `Sec-WebSocket-Key`: reply `101 Switching Protocols` with `Sec-WebSocket-Accept = base64(SHA1(key ‖ 258EAFA5-E914-47DA-95CA-C5AB0DC85B11))` (`ovtransport::ws::accept_key`).
+  - Refusals (then close): another path `404 Not Found`; another or a missing version `426 Upgrade Required` with `Sec-WebSocket-Version: 13` (RFC 6455 §4.4); a missing key or `Connection: Upgrade`, another method or HTTP version `400 Bad Request`.
+  - Without an upgrade, `GET /` or `GET /health` gets `200 OK` with body `ovrelay\n` (the health check), a WebSocket path `426`, anything else `404`.
 - **Anything else** → a raw relay client. Its first bytes must be a CONNECT line.
 
 ### 4.2 Control lines
@@ -80,7 +81,7 @@ Because pairing removes the entry, the same ID is immediately free again. An act
 
 **Where session IDs come from.** The relay never derives them; that is client-side.
 
-- **Attended:** the first 4 ASCII bytes of the host's 6-digit pairing code, as u32 BE (`crates/ovffi/src/relay.rs` `relay_session_id`; `ovview/examples/input_smoke.rs`; the tests).
+- **Attended:** the 4 public rendezvous digits of the host's 10-digit one-time pairing code, as ASCII u32 BE (`ovcore::pairing::relay_session_id`). The remaining 6 digits are the SPAKE2 secret and never reach the relay.
 - **Unattended:** the low 32 bits of the host's device ID (`crates/ovapp/tests/unattended_over_relay.rs` `session_id_of`).
 
 The relay has **no authentication**. Anyone who knows or guesses a session ID can park on it. The end-to-end handshake ([ovcore.md](ovcore.md)) is what authenticates the peers.
@@ -125,12 +126,14 @@ Closing a slot means: a WebSocket CLOSE (status 1000) if it is a WebSocket clien
 
 ```
 ovrelay [--bind HOST:PORT] [--timeout SECS] [--max-connections N] [--max-per-ip N]
-        [--max-pending N] [-v|-vv] [--log-level FILTER]
+        [--max-pending N] [--ws-path PATH]... [-v|-vv] [--log-level FILTER]
   --bind HOST:PORT        listen address (default 0.0.0.0:4569, the clients' default)
   --timeout SECS          seconds an unmatched session waits (default 30)
   --max-connections N     simultaneous client connections (default 1024)
   --max-per-ip N          simultaneous connections per source IP, loopback exempt (default 32)
   --max-pending N         parked (unpaired) sessions (default 512)
+  --ws-path PATH          WebSocket upgrade path, repeatable (default /relay;
+                          e.g. --ws-path / behind a proxy that forwards the root)
   -v / -vv                debug / trace logging
   --log-level FILTER      tracing EnvFilter directive (overrides -v and OPENVIEW_LOG)
   -h, --help / -V, --version
@@ -182,7 +185,6 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 
 ## 10. Known limitations
 
-1. **CONNECT is unauthenticated** and session IDs are low-entropy rendezvous names (four ASCII digits, or the low 32 bits of the device ID). Someone who guesses an ID can park on it first (denial of service only; the handshake protects the session). Widening the ID to 64 bits was deferred — it changes every client and adds no secrecy (see WIRE_PROTOCOL §2.1).
+1. **CONNECT is unauthenticated** and session IDs are low-entropy rendezvous names (a pairing code's four public digits, or the low 32 bits of the device ID). Someone who guesses an ID can park on it first (denial of service only; the handshake protects the session). Widening the ID to 64 bits was deferred — it changes every client and adds no secrecy (see WIRE_PROTOCOL §2.1).
 2. **A same-role duplicate CONNECT** is rejected after `'O'` (the capacity check now runs before `'O'`, the role check cannot without racing the pairing peer's `A` line).
-3. **Lenient upgrade handling.** The server does not check the request path, `Sec-WebSocket-Version`, or `Connection: Upgrade` (client frames must be masked).
-4. **Stale diagram.** The module-doc diagram in `src/lib.rs` shows the `A` line as `A sid` only; it also carries 6 address bytes (`attach_line`). See [../WIRE_PROTOCOL.md](../WIRE_PROTOCOL.md) §2.3.
+3. **Stale diagram.** The module-doc diagram in `src/lib.rs` shows the `A` line as `A sid` only; it also carries 6 address bytes (`attach_line`). See [../WIRE_PROTOCOL.md](../WIRE_PROTOCOL.md) §2.3.

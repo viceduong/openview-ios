@@ -353,7 +353,7 @@ Receiver behaviour:
 - After a SYNC: records are delivered strictly in index order. Early ones are held in `pending` (up to `PENDING_LIMIT` = 65 536 entries). Duplicates are dropped and counted in `duplicates_dropped`.
 - A received `SYNC_DOWN` while the receiver still has a link makes it demote too (`"peer fell back to relay"`).
 
-**Replay buffer.** Every record sent directly is kept until a DACK covers it, capped at `REPLAY_LIMIT` = 64 MiB; past the cap the oldest records are dropped, which would desync the session if a demotion followed. The buffer is also cleared once the rudp link has nothing in flight and nothing queued.
+**Replay buffer.** Every record sent directly is kept until a DACK covers it, capped at `REPLAY_LIMIT` = 64 MiB; past the cap the oldest records are dropped, which would lose those records if a demotion followed (the receiver's anti-replay window tolerates the gap; before record format v3 it desynced the session). The buffer is also cleared once the rudp link has nothing in flight and nothing queued.
 
 ### 8.4 Probing and liveness state machine
 
@@ -654,7 +654,7 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
    - `tunnel.rs`: the `DecodedFrame` doc lists only kinds 0–3.
 2. **The datagram limit differs by carrier.** The trait doc says 65 535 bytes, but the relay tunnel accepts at most 65 532. A 65 533–65 535-byte datagram fails on the relay with `FrameTooLarge`.
 3. **`HolePunch` is unused** by the shipped binaries and blocks in `punch()` and `wait_ack()`. It is superseded by `direct/`.
-4. **Replay overflow.** Past `REPLAY_LIMIT` (64 MiB of unacknowledged records), the oldest records are forgotten. The code comment says a later demotion "would desync the session".
+4. **Replay overflow.** Past `REPLAY_LIMIT` (64 MiB of unacknowledged records), the oldest records are forgotten; a later demotion then loses them (the record layer's anti-replay window skips the gap rather than desyncing, but the application sees the loss).
 5. **Theoretical magic collision.** In rudp raw mode, a raw record whose sender device ID starts with the bytes `B7 'R' 'U' '1'` (LE low 32 bits) would be taken for a framed packet. That is about 2⁻³² per device ID, and device IDs are derived from fingerprints.
 6. **`FeedbackRx` truncates the reference time to u32 µs** (it wraps about every 71 minutes). The sender's `unwrap_remote` follows forward wraps only.
 7. **Relay writes can block.** Once more than 256 KiB is queued, `RelayTunnelCarrier` writes block with sleeps (up to a 20 s stall timeout), so a sender can still block on a stalled relay.

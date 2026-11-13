@@ -6,6 +6,7 @@
 use crate::crypto;
 use crate::error::CoreError;
 use crate::framing::{parse_header, HEADER_LEN, MIN_RECORD_LEN, TAG_LEN};
+use crate::replay::ReplayWindow;
 use chacha20poly1305::Nonce;
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -49,7 +50,7 @@ impl fmt::Debug for SessionKeys {
     }
 }
 
-/// Everything the v2 handshake derives from its key material.
+/// Everything the v3 handshake derives from its key material.
 pub(crate) struct HandshakeKeys {
     /// `encrypt` = client key, `decrypt` = server key (client's view).
     pub(crate) keys: SessionKeys,
@@ -61,22 +62,22 @@ pub(crate) struct HandshakeKeys {
 
 /// Derives the [`SessionKeys`].
 ///
-/// Handshake v2 (see `docs/WIRE_PROTOCOL.md` §3.6):
+/// Handshake v3 (see `docs/WIRE_PROTOCOL.md` §3.6):
 ///
 /// ```text
 ///   IKM  = X25519(eph, peer_eph) || X25519(static, peer_static) [|| PAKE key]
 ///   PRK  = HKDF-Extract(salt = transcript hash, IKM)
-///   client key      = HKDF-Expand(PRK, "ov2 client key", 32)
-///   server key      = HKDF-Expand(PRK, "ov2 server key", 32)
-///   client finished = HKDF-Expand(PRK, "ov2 client finished", 32)
-///   server finished = HKDF-Expand(PRK, "ov2 server finished", 32)
+///   client key      = HKDF-Expand(PRK, "ov3 client key", 32)
+///   server key      = HKDF-Expand(PRK, "ov3 server key", 32)
+///   client finished = HKDF-Expand(PRK, "ov3 client finished", 32)
+///   server finished = HKDF-Expand(PRK, "ov3 server finished", 32)
 /// ```
 pub struct KeySchedule;
 
 impl KeySchedule {
     /// Single-secret derivation (`salt = 0^32`, labels `ov-client-key` /
     /// `ov-server-key`). Kept for tests and tools that build keys from a bare
-    /// shared secret; the handshake uses the v2 schedule. Returns the
+    /// shared secret; the handshake uses the v3 schedule. Returns the
     /// client-view keys and the PRK.
     #[must_use]
     pub fn derive(ikm: &[u8]) -> (SessionKeys, [u8; 32]) {
@@ -88,17 +89,17 @@ impl KeySchedule {
         (keys, master)
     }
 
-    /// The v2 handshake schedule (see the type docs). `ikm` is the
+    /// The v3 handshake schedule (see the type docs). `ikm` is the
     /// concatenated key material, `transcript_hash` the SHA-256 transcript.
-    pub(crate) fn derive_v2(ikm: &[u8], transcript_hash: &[u8; 32]) -> HandshakeKeys {
+    pub(crate) fn derive_v3(ikm: &[u8], transcript_hash: &[u8; 32]) -> HandshakeKeys {
         let prk = Zeroizing::new(crypto::hkdf_extract(transcript_hash, ikm));
         HandshakeKeys {
             keys: SessionKeys {
-                encrypt: expand32(&prk[..], b"ov2 client key"),
-                decrypt: expand32(&prk[..], b"ov2 server key"),
+                encrypt: expand32(&prk[..], b"ov3 client key"),
+                decrypt: expand32(&prk[..], b"ov3 server key"),
             },
-            client_finished: Zeroizing::new(expand32(&prk[..], b"ov2 client finished")),
-            server_finished: Zeroizing::new(expand32(&prk[..], b"ov2 server finished")),
+            client_finished: Zeroizing::new(expand32(&prk[..], b"ov3 client finished")),
+            server_finished: Zeroizing::new(expand32(&prk[..], b"ov3 server finished")),
         }
     }
 }
@@ -124,13 +125,23 @@ pub struct Session {
     pub(crate) recv_nonce_base: [u8; 12],
     pub(crate) sender_id: u64,
     pub(crate) target_id: u64,
-    /// Monotonic record counters, one per direction (the anti-desync tag is
-    /// derived from the low 32 bits). Send and receive sequence numbers are
-    /// independent streams: an outgoing record must never advance the counter
-    /// the peer's incoming records are validated against.
+    /// Our record counter: the next record's sequence number (header field
+    /// and AEAD nonce counter). Never reused.
     send_seq: u64,
-    recv_seq: u64,
+    /// Anti-replay window over the peer's sequence numbers (stored as
+    /// `seq + 1`, since the window reserves 0).
+    recv_window: RecvWindow,
+    /// Records dropped as duplicates / too old (diagnostics).
+    replayed: u64,
 }
+
+/// Records the receiver can accept out of order (IPsec-style window). Large
+/// enough for any reordering a datagram path produces at screen-update
+/// rates; ordered carriers never need it.
+pub const RECORD_REPLAY_WINDOW: u64 = 2048;
+
+/// The record layer's anti-replay window ([`RECORD_REPLAY_WINDOW`] records).
+type RecvWindow = ReplayWindow<{ (RECORD_REPLAY_WINDOW / 64) as usize }>;
 
 impl fmt::Debug for Session {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -139,7 +150,8 @@ impl fmt::Debug for Session {
             .field("sender_id", &self.sender_id)
             .field("target_id", &self.target_id)
             .field("send_seq", &self.send_seq)
-            .field("recv_seq", &self.recv_seq)
+            .field("recv_top", &self.recv_window.top())
+            .field("replayed", &self.replayed)
             .finish_non_exhaustive()
     }
 }
@@ -179,7 +191,8 @@ impl Session {
             sender_id,
             target_id,
             send_seq: 0,
-            recv_seq: 0,
+            recv_window: RecvWindow::new(),
+            replayed: 0,
         }
     }
 
@@ -208,15 +221,27 @@ impl Session {
         &self.keys
     }
 
+    /// Fuzzing: jump our send counter forward (never backward).
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(crate) fn skip_to(&mut self, seq: u64) {
+        self.send_seq = self.send_seq.max(seq);
+    }
+
+    /// Records dropped as duplicates or too old for the replay window.
+    #[must_use]
+    pub fn replayed(&self) -> u64 {
+        self.replayed
+    }
+
     fn nonce(&self, base: &[u8; 12], counter: u64) -> Nonce {
         crypto::chacha_nonce(base, counter)
     }
 
-    /// Build the 12-byte record header for the next outgoing record.
+    /// Build the 16-byte record header for the next outgoing record.
     /// (The channel rides in the AAD, not the header.)
     #[must_use]
-    pub fn next_header(&self, _channel: u8) -> [u8; 12] {
-        crate::framing::header_bytes(self.sender_id, (self.send_seq & 0xFFFF_FFFF) as u32)
+    pub fn next_header(&self, _channel: u8) -> [u8; HEADER_LEN] {
+        crate::framing::header_bytes(self.sender_id, self.send_seq)
     }
 
     /// AAD = the record header (which embeds the sender ID) + channel byte.
@@ -238,11 +263,20 @@ impl Session {
         out.extend_from_slice(&header);
         out.extend_from_slice(&ct);
         out.extend_from_slice(&tag);
-        self.send_seq = self.send_seq.wrapping_add(1);
+        // 2^64 records are out of reach; saturating means the nonce can
+        // never wrap back onto a used value.
+        self.send_seq = self.send_seq.saturating_add(1);
         out
     }
 
-    /// Decrypt a record, validating sender ID + sequence + channel. Returns the plaintext.
+    /// Decrypt a record, validating sender ID, the anti-replay window, the
+    /// channel and the tag. Returns the plaintext.
+    ///
+    /// Records may arrive out of order (datagram paths) as long as they are
+    /// within [`RECORD_REPLAY_WINDOW`] of the newest one; a duplicate or an
+    /// older record fails with [`CoreError::Replay`] (drop it, count it).
+    /// The window only advances once the tag verified, so forged or
+    /// wrong-channel records change nothing.
     pub fn decrypt_record(&mut self, channel: u8, data: &[u8]) -> Result<Vec<u8>, CoreError> {
         if data.len() < MIN_RECORD_LEN {
             return Err(CoreError::RecordTooShort(data.len()));
@@ -255,20 +289,17 @@ impl Session {
         if sender != self.target_id {
             return Err(CoreError::InvalidSender(sender));
         }
-        // Anti-desync/replay guard: the header's low-32 sequence
-        // must match our expected counter.
-        let expected = (self.recv_seq & 0xFFFF_FFFF) as u32;
-        if expected != hseq {
-            return Err(CoreError::SequenceDesync {
-                expected,
-                got: hseq,
-            });
+        let slot = hseq.checked_add(1).ok_or(CoreError::Aead)?;
+        if let Err(kind) = self.recv_window.check(slot) {
+            self.replayed += 1;
+            tracing::debug!(seq = hseq, ?kind, "record dropped by the replay window");
+            return Err(CoreError::Replay { seq: hseq, kind });
         }
         let aad = Self::aad_with_channel(header, channel);
-        let nonce = self.nonce(&self.recv_nonce_base, self.recv_seq);
+        let nonce = self.nonce(&self.recv_nonce_base, hseq);
         let pt = crypto::aead_open(&self.keys.decrypt, &nonce, &aad, ct, tag16)
             .ok_or(CoreError::Aead)?;
-        self.recv_seq = self.recv_seq.wrapping_add(1);
+        self.recv_window.commit(slot);
         Ok(pt)
     }
 }
@@ -279,17 +310,77 @@ mod tests {
     use x25519_dalek::{PublicKey, StaticSecret};
 
     #[test]
-    fn v2_schedule_binds_transcript_and_ikm() {
-        let a = KeySchedule::derive_v2(&[1u8; 64], &[2u8; 32]);
-        let b = KeySchedule::derive_v2(&[1u8; 64], &[2u8; 32]);
+    fn v3_schedule_binds_transcript_and_ikm() {
+        let a = KeySchedule::derive_v3(&[1u8; 64], &[2u8; 32]);
+        let b = KeySchedule::derive_v3(&[1u8; 64], &[2u8; 32]);
         assert_eq!(a.keys.encrypt, b.keys.encrypt);
         assert_eq!(*a.client_finished, *b.client_finished);
-        let c = KeySchedule::derive_v2(&[1u8; 64], &[3u8; 32]);
+        let c = KeySchedule::derive_v3(&[1u8; 64], &[3u8; 32]);
         assert_ne!(a.keys.encrypt, c.keys.encrypt, "transcript-bound");
-        let d = KeySchedule::derive_v2(&[9u8; 64], &[2u8; 32]);
+        let d = KeySchedule::derive_v3(&[9u8; 64], &[2u8; 32]);
         assert_ne!(a.keys.decrypt, d.keys.decrypt, "ikm-bound");
         assert_ne!(*a.client_finished, *a.server_finished);
         assert_ne!(a.keys.encrypt, *a.client_finished);
+    }
+
+    /// A synced server/client pair (the helper draws random nonce bases).
+    fn pair() -> (Session, Session) {
+        let mut srv = Session::new(true, [5u8; 32], 100, 200);
+        let cli = Session::new(false, [5u8; 32], 200, 100);
+        srv.send_nonce_base = cli.recv_nonce_base;
+        srv.recv_nonce_base = cli.send_nonce_base;
+        (srv, cli)
+    }
+
+    fn is_kind(r: Result<Vec<u8>, CoreError>, want: crate::replay::Replay) -> bool {
+        matches!(r, Err(CoreError::Replay { kind, .. }) if kind == want)
+    }
+
+    #[test]
+    fn replay_window_duplicate_and_reorder() {
+        use crate::replay::Replay;
+        let (mut srv, mut cli) = pair();
+        let recs: Vec<Vec<u8>> = (0..10u8).map(|i| srv.encrypt_record(0, &[i])).collect();
+        // Reordered inside the window: all accepted, in any order.
+        for i in [3usize, 0, 2, 1, 9, 4, 8, 5, 7, 6] {
+            assert_eq!(cli.decrypt_record(0, &recs[i]).unwrap(), [i as u8]);
+        }
+        // Each again: a duplicate, dropped and counted.
+        for r in &recs {
+            assert!(is_kind(cli.decrypt_record(0, r), Replay::Duplicate));
+        }
+        assert_eq!(cli.replayed(), 10);
+    }
+
+    #[test]
+    fn records_beyond_the_window_are_dropped_inside_are_kept() {
+        use crate::replay::Replay;
+        let (mut srv, mut cli) = pair();
+        let recs: Vec<Vec<u8>> = (0..RECORD_REPLAY_WINDOW + 2)
+            .map(|i| srv.encrypt_record(0, &i.to_le_bytes()))
+            .collect();
+        // Deliver the newest first: seq N+1 is the top, so seq 0 and 1 fall
+        // out of the window while seq 2 is the oldest one kept.
+        let newest = recs.len() - 1;
+        cli.decrypt_record(0, &recs[newest]).unwrap();
+        assert!(is_kind(cli.decrypt_record(0, &recs[0]), Replay::TooOld));
+        assert!(is_kind(cli.decrypt_record(0, &recs[1]), Replay::TooOld));
+        assert!(cli.decrypt_record(0, &recs[2]).is_ok(), "oldest kept");
+        assert!(is_kind(cli.decrypt_record(0, &recs[2]), Replay::Duplicate));
+    }
+
+    #[test]
+    fn forged_or_wrong_channel_records_do_not_advance_the_window() {
+        let (mut srv, mut cli) = pair();
+        let rec = srv.encrypt_record(3, b"tile");
+        // Wrong channel: AEAD fails, window untouched; the right one still works.
+        assert_eq!(cli.decrypt_record(0, &rec), Err(CoreError::Aead));
+        // A forged header claiming a far-future seq fails AEAD without sliding.
+        let mut forged = rec.clone();
+        forged[8..16].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        assert_eq!(cli.decrypt_record(3, &forged), Err(CoreError::Aead));
+        assert_eq!(cli.decrypt_record(3, &rec).unwrap(), b"tile");
+        assert_eq!(cli.replayed(), 0);
     }
 
     #[test]

@@ -195,69 +195,9 @@ pub(crate) fn open(key: &[u8; 32], d: &[u8]) -> Option<(u64, Vec<u8>)> {
     Some((pn, pt))
 }
 
-/// Sliding anti-replay window over packet numbers (RFC 6479 style bitmap).
-#[derive(Debug, Clone)]
-pub(crate) struct ReplayWindow {
-    top: u64,
-    bits: [u64; (REPLAY_WINDOW / 64) as usize],
-}
-
-impl Default for ReplayWindow {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ReplayWindow {
-    pub fn new() -> Self {
-        Self {
-            top: 0,
-            bits: [0; (REPLAY_WINDOW / 64) as usize],
-        }
-    }
-
-    fn bit(pn: u64) -> (usize, u64) {
-        let i = (pn % REPLAY_WINDOW) as usize;
-        (i / 64, 1u64 << (i % 64))
-    }
-
-    /// Whether `pn` would be accepted (not seen, not too old; 0 is never
-    /// valid).
-    pub fn check(&self, pn: u64) -> bool {
-        if pn == 0 {
-            return false;
-        }
-        if pn > self.top {
-            return true;
-        }
-        if self.top - pn >= REPLAY_WINDOW {
-            return false;
-        }
-        let (w, b) = Self::bit(pn);
-        self.bits[w] & b == 0
-    }
-
-    /// Mark `pn` seen (call only after the tag verified and [`check`]
-    /// passed).
-    ///
-    /// [`check`]: Self::check
-    pub fn commit(&mut self, pn: u64) {
-        if pn > self.top {
-            let advance = pn - self.top;
-            if advance >= REPLAY_WINDOW {
-                self.bits = [0; (REPLAY_WINDOW / 64) as usize];
-            } else {
-                for p in self.top + 1..pn {
-                    let (w, b) = Self::bit(p);
-                    self.bits[w] &= !b;
-                }
-            }
-            self.top = pn;
-        }
-        let (w, b) = Self::bit(pn);
-        self.bits[w] |= b;
-    }
-}
+/// Sliding anti-replay window over packet numbers: the shared
+/// [`ovcore::replay::ReplayWindow`] sized to [`REPLAY_WINDOW`].
+pub(crate) type ReplayWindow = ovcore::replay::ReplayWindow<{ (REPLAY_WINDOW / 64) as usize }>;
 
 // ---------------------------------------------------------------------------
 // Video FEC

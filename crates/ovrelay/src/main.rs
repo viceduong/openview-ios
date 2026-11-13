@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! ovrelay [--bind HOST:PORT] [--timeout SECS] [--max-connections N]
-//!         [--max-per-ip N] [--max-pending N] [-v|-vv] [--log-level FILTER]
+//!         [--max-per-ip N] [--max-pending N] [--ws-path PATH]... [-v|-vv]
+//!         [--log-level FILTER]
 //! ```
 //!
 //! Logging goes to stderr through `tracing` (filter: `--log-level`, else
@@ -48,6 +49,11 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = RelayLimits::DEFAULT.max_pending)]
     max_pending: usize,
 
+    /// Request path accepted for WebSocket upgrades (repeat for several).
+    /// Clients dial `wss://host<PATH>`; other paths get 404.
+    #[arg(long = "ws-path", value_name = "PATH", default_value = ovrelay::DEFAULT_WS_PATH)]
+    ws_paths: Vec<String>,
+
     /// More log output on stderr (-v debug, -vv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -76,6 +82,10 @@ fn main() -> ExitCode {
         max_pending: cli.max_pending,
         ..RelayLimits::DEFAULT
     });
+    if let Err(e) = relay.set_ws_paths(cli.ws_paths.clone()) {
+        tracing::error!("{e}");
+        return ExitCode::FAILURE;
+    }
     tracing::info!(
         "listening on {} (park timeout {}s, max {} connections / {} per IP / {} pending)",
         relay.local_addr(),
@@ -102,6 +112,9 @@ mod tests {
         let c = Cli::try_parse_from(["ovrelay"]).unwrap();
         assert_eq!(c.bind, DEFAULT_BIND.parse::<SocketAddr>().unwrap());
         assert_eq!(c.timeout, 30);
+        assert_eq!(c.ws_paths, vec!["/relay".to_owned()]);
+        let c = Cli::try_parse_from(["ovrelay", "--ws-path", "/a", "--ws-path", "/"]).unwrap();
+        assert_eq!(c.ws_paths, vec!["/a".to_owned(), "/".to_owned()]);
         let c = Cli::try_parse_from([
             "ovrelay",
             "--bind",

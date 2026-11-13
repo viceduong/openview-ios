@@ -21,7 +21,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let auth = match sel % 3 {
         0 => Auth::Pin(psk()),
-        1 => Auth::PairingCode("123456".into()),
+        1 => Auth::PairingCode("1234567890".into()),
         _ => Auth::DirectDevice,
     };
     let role = if sel & 0x80 == 0 {

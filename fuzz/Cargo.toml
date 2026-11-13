@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ovcore = { path = "../crates/ovcore" }
+ovcore = { path = "../crates/ovcore", features = ["fuzzing"] }
 ovapp = { path = "../crates/ovapp" }
 ovrelay = { path = "../crates/ovrelay", features = ["fuzzing"] }
 
@@ -45,6 +45,20 @@ bench = false
 [[bin]]
 name = "ws_frames"
 path = "fuzz_targets/ws_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_open"
+path = "fuzz_targets/record_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replay_window"
+path = "fuzz_targets/replay_window.rs"
 test = false
 doc = false
 bench = false

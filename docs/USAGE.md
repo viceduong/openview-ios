@@ -150,7 +150,7 @@ former `OV_*` / `OVHOST_*` environment variables, which are no longer read)
 ### `ovview`
 
 ```text
-ovview --code <6-digit> [--relay ADDR]
+ovview --code <10-digit code> [--relay ADDR]
 ovview --id <device_id> [--lan-addr IP:PORT] [--relay-fallback --relay ADDR]   # LAN, PIN as below
 ovview --connect <device_id> [--relay ADDR]           # PIN from OPENVIEW_PIN (or --pin)
 ovview --info <file.ovrec>
@@ -163,7 +163,7 @@ ovview --play <file.ovrec> [--loop]
 
 | Flag | Meaning |
 |---|---|
-| `--code <code>` | Join a host by pairing code through the relay |
+| `--code <code>` | Join a host by its one-time 10-digit pairing code through the relay (spaces / dashes allowed, e.g. `1234 567890`). The first four digits name the relay slot; the rest is the secret, never sent |
 | `--id <device_id>` | LAN access without the relay: look the unattended host up on the local network by mDNS (up to 3 s), then run the PIN handshake and the session over direct UDP to its LAN port. Spaces and dashes in the ID are ignored. Needs the PIN like `--connect`. |
 | `--lan-addr IP:PORT[,IP:PORT]` | With `--id`: dial these host addresses (its LAN port, default 4571) instead of the mDNS lookup |
 | `--relay-fallback` | With `--id`: when nobody answers on the LAN, dial the host through `--relay` like `--connect` (a wrong PIN is not retried) |
@@ -245,11 +245,11 @@ All commands assume release binaries in `target\release` (for example
 # Relay (anywhere both sides can reach over TCP)
 ovrelay --bind 0.0.0.0:4569
 
-# Host: logs "pairing code NNNNNN" (stderr) and prints {"event":"pairing_code",...} (stdout)
+# Host: logs "pairing code NNNNNNNNNN" (stderr) and prints {"event":"pairing_code",...} (stdout)
 ovhost --relay 192.168.1.10:4569 --screen
 
 # Viewer: use the code the host printed
-ovview --code NNNNNN --relay 192.168.1.10:4569
+ovview --code NNNNNNNNNN --relay 192.168.1.10:4569
 ```
 
 Without `--screen` the host runs the terminal loop: chat echo, files,
@@ -300,7 +300,7 @@ shows `via direct <addr>` or `via relay`.
 ```powershell
 ovrelay --bind 0.0.0.0:4569
 ovhost  --relay 192.168.1.10:4569 --screen          # direct path on UDP 4570
-ovview  --code NNNNNN --relay 192.168.1.10:4569 --rtt-log
+ovview  --code NNNNNNNNNN --relay 192.168.1.10:4569 --rtt-log
 ```
 
 * Allow UDP 4570 inbound on the host's firewall, or choose another port with
@@ -370,7 +370,7 @@ ovview --connect 123456789012 --relay <relay-ip>:4569
 ### 2.6 Recording and playback
 
 ```powershell
-ovview --code NNNNNN --relay 1.2.3.4:4569 --record-dir C:\rec   # press F6 to start/stop
+ovview --code NNNNNNNNNN --relay 1.2.3.4:4569 --record-dir C:\rec   # press F6 to start/stop
 ovview --info   C:\rec\ovview-20261112-101500-123.ovrec
 ovview --export C:\rec\ovview-....ovrec --out C:\frames               # all frames
 ovview --export C:\rec\ovview-....ovrec --out C:\frames --frame 42    # one frame
@@ -407,7 +407,7 @@ as `clipboard write failed (peer text dropped)`.
 
 ```powershell
 ovhost --relay 1.2.3.4:4569 --screen --send-file C:\notes.txt     # host -> viewer
-ovview --code NNNNNN --relay 1.2.3.4:4569 --send-file C:\report.pdf # viewer -> host
+ovview --code NNNNNNNNNN --relay 1.2.3.4:4569 --send-file C:\report.pdf # viewer -> host
 ```
 
 * `--send-file` is a hidden test switch on both binaries; it sends one file

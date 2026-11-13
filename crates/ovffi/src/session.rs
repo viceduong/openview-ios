@@ -82,8 +82,12 @@ fn device_id_from_fp(fp: [u8; 16]) -> u64 {
 /// Create a session.
 ///
 /// * `is_server`: 0 = client (dials), 1 = server (listens).
-/// * `pairing_code`: for a server, **our own** 6-digit code (clients must
-///   present it); for a client, **the peer's** code we are dialing.
+/// * `pairing_code`: the attended host's one-time 10-digit code
+///   (`ovcore::pairing`; grouping spaces / dashes are ignored): for a
+///   server, **our own** code; for a client, **the peer's** code we are
+///   dialing. It is the SPAKE2 password and never crosses the wire; its
+///   first four digits name the relay slot (`ov_relay_session_id`).
+///   Unattended sessions pass any placeholder and use `ov_session_begin_pin`.
 ///
 /// Returns null on invalid arguments.
 ///
@@ -107,7 +111,7 @@ pub unsafe extern "C" fn ov_session_create(
             identity,
             device_id,
             is_server: is_server != 0,
-            pairing_code: code.to_string(),
+            pairing_code: ovcore::pairing::normalize(code).unwrap_or_else(|| code.to_string()),
             pin_psk: None,
             handshake: None,
             session: None,

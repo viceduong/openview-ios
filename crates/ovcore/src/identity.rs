@@ -89,7 +89,12 @@ impl Identity {
             .collect::<Vec<_>>()
             .join(" ")
     }
-    /// A short 6-digit display code (pairing aid; the QR blob carries the real identity).
+    /// A short 6-digit code derived from the **public** fingerprint (shown
+    /// next to the fingerprint and carried in the public blob).
+    ///
+    /// Not a secret and not a credential: anyone who sees this identity's
+    /// public key can compute it. Attended sessions authenticate with a
+    /// random one-time code from [`crate::pairing::generate`] instead.
     pub fn pairing_code(&self) -> String {
         let f = self.fingerprint();
         let n = ((f[0] as u64) << 56)

@@ -51,12 +51,15 @@ fn establish_pair() -> (TerminalSession, TerminalSession) {
     );
     server.expect_device(dev_c);
 
-    // Client HELLO is emitted at construction; in-memory is lossless so one
-    // flush-pump round converges immediately.
+    // Client HELLO is emitted at construction; in-memory is lossless so the
+    // three flights converge immediately.
     flush(&mut client, &mut cc);
     pump(&mut sc, &mut server);
     flush(&mut server, &mut sc);
     pump(&mut cc, &mut client);
+    // Pairing codes are a PAKE: the client's CONFIRM completes the server.
+    flush(&mut client, &mut cc);
+    pump(&mut sc, &mut server);
 
     assert!(client.is_established(), "client: {:?}", client.failed());
     assert!(server.is_established(), "server: {:?}", server.failed());
@@ -175,6 +178,9 @@ fn establish_pair_chat() -> (ChatSession, ChatSession) {
     pump(&mut sc, &mut server);
     flush(&mut server, &mut sc);
     pump(&mut cc, &mut client);
+    // Pairing codes are a PAKE: the client's CONFIRM completes the server.
+    flush(&mut client, &mut cc);
+    pump(&mut sc, &mut server);
 
     let client_session = client.take_session().expect("client session");
     let server_session = server.take_session().expect("server session");

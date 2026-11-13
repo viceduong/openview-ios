@@ -81,8 +81,11 @@ pub unsafe extern "C" fn ov_identity_fingerprint_pine(
     })
 }
 
-/// Write the 6-digit pairing code (NUL terminated) into `out`. Same return
-/// convention as [`ov_identity_fingerprint_pine`].
+/// Write the identity's 6-digit **fingerprint short code** (NUL terminated)
+/// into `out`. Same return convention as [`ov_identity_fingerprint_pine`].
+///
+/// Public (derived from the public key) and not a credential: attended
+/// sessions authenticate with a random one-time code from the host instead.
 ///
 /// # Safety
 /// `id` must be null or a live identity from [`ov_identity_create`]; `out`

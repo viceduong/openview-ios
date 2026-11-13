@@ -26,7 +26,8 @@ fn main() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("bad relay: {e}"))?;
     let code = args.next().ok_or("usage: input_smoke RELAY_ADDR CODE")?;
-    let sid = u32::from_be_bytes(code.as_bytes()[..4].try_into().map_err(|_| "short code")?);
+    let code = ovcore::pairing::normalize(&code).ok_or("a pairing code is 10 digits")?;
+    let sid = ovcore::pairing::relay_session_id(&code);
     let mut carrier = RelayTunnelCarrier::connect(relay, sid, TunnelRole::Initiator)
         .map_err(|e| format!("relay connect: {e}"))?;
     if !carrier

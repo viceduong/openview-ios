@@ -649,8 +649,9 @@ struct PinPromptView: View {
 
 // MARK: - Pairing
 
-/// The pairing-code flow (one-off sessions, never saved): this device's
-/// own pairing code, and the partner's code + transport.
+/// The pairing-code flow (one-off sessions, never saved): the host's
+/// one-time code + transport. Codes are 10 digits (`1234 567890`): the first
+/// four name the relay slot, the rest is the secret (never sent).
 struct PairView: View {
     @EnvironmentObject private var app: AppModel
     let onDone: () -> Void
@@ -662,11 +663,14 @@ struct PairView: View {
     @State private var lanPort = String(ConnectionTransport.defaultLanPort)
 
     private var codeBinding: Binding<String> {
-        Binding(get: { code }, set: { code = String(DeviceID.digits($0).prefix(6)) })
+        Binding(get: { code }, set: { code = String(DeviceID.digits($0).prefix(Self.codeDigits)) })
     }
 
+    /// Digits in a pairing code (`ovcore::pairing::CODE_DIGITS`).
+    static let codeDigits = 10
+
     private var canConnect: Bool {
-        guard code.count == 6 else { return false }
+        guard code.count == Self.codeDigits else { return false }
         if useLan {
             return UInt16(lanPort) != nil && !lanHost.isEmpty
         }
@@ -676,21 +680,9 @@ struct PairView: View {
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("Your pairing code"),
-                        footer: Text("Share this code with someone who wants to connect to this device.")) {
-                    Text(PairingState.shared.code.isEmpty ? "—" : PairingState.shared.code)
-                        .font(.system(.largeTitle, design: .monospaced).weight(.semibold))
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .textSelection(.enabled)
-                    if !PairingState.shared.pine.isEmpty {
-                        Text(PairingState.shared.pine)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                    }
-                }
-                Section(header: Text("Partner's pairing code")) {
-                    TextField("6-digit code", text: codeBinding)
+                Section(header: Text("Partner's pairing code"),
+                        footer: Text("The 10-digit one-time code shown on the host.")) {
+                    TextField("10-digit code", text: codeBinding)
                         .keyboardType(.numberPad)
                         .font(.title3.monospacedDigit())
                 }

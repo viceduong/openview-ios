@@ -78,17 +78,23 @@ fn run_relay(
     addr: &RelayAddr,
     options: SessionOptions,
 ) -> Result<(), String> {
-    info!("dialing relay {addr} with pairing code {code}");
+    let code = ovcore::pairing::normalize(&code).ok_or_else(|| {
+        format!(
+            "a pairing code is {} digits (the host shows it as `1234 567890`)",
+            ovcore::pairing::CODE_DIGITS
+        )
+    })?;
+    info!(
+        "dialing relay {addr} with pairing code {}",
+        ovcore::pairing::display(&code)
+    );
     status::emit(&StatusEvent::Connecting {
         relay: addr.to_string(),
         target: code.clone(),
     });
-    // The relay session id is the code's first 4 bytes (matches ovhost).
-    let session_id = u32::from_be_bytes(
-        code.as_bytes()[..4]
-            .try_into()
-            .map_err(|_| "pairing code shorter than 4 bytes".to_owned())?,
-    );
+    // The relay session id comes from the code's public rendezvous digits
+    // (matches ovhost); the rest is the SPAKE2 password, never sent.
+    let session_id = ovcore::pairing::relay_session_id(&code);
     let mut carrier = dial_relay(addr, session_id, ATTACH_WAIT)?;
 
     let mut hs = Handshake::new(Role::Client, my_dev, me, Auth::PairingCode(code));

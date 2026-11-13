@@ -22,13 +22,10 @@ use crate::transport::Transport;
 /// 1 MiB from the socket), bounding one call's work under a flood.
 const PUMP_RELAY_MAX_POLLS: usize = 8;
 
-/// u32 BE from the first 4 bytes of a pairing code (relay session id).
+/// u32 BE from the first 4 bytes of a pairing code — its public rendezvous
+/// digits (relay session id; see `ovcore::pairing`).
 pub(crate) fn relay_session_id(code: &str) -> u32 {
-    let bytes = code.as_bytes();
-    let mut b = [0u8; 4];
-    let n = bytes.len().min(4);
-    b[..n].copy_from_slice(&bytes[..n]);
-    u32::from_be_bytes(b)
+    ovcore::pairing::relay_session_id(code)
 }
 
 /// Resolve `host:port` to its first socket address.

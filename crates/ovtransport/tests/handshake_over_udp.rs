@@ -49,7 +49,7 @@ fn handshake_over_udp_then_records_both_ways() {
     let server_id = Identity::generate();
     let (dev_c, dev_s) = (0x00AA_0001u64, 0x00BB_0002u64);
 
-    let server_code = server_id.pairing_code();
+    let server_code = ovcore::pairing::generate();
     let mut client = Handshake::new(
         Role::Client,
         dev_c,
@@ -137,18 +137,58 @@ fn handshake_over_udp_then_records_both_ways() {
         .expect("client decrypts server record");
     assert_eq!(pt, b"and back");
 
-    // Traffic accounting: handshake = 1 datagram client->server, 2
-    // server->client (HELLO + READY); plus one record each way. The HELLO
-    // re-send only fires on loss, so on loopback the counts are exact.
+    // Traffic accounting: handshake = 2 datagrams client->server (HELLO +
+    // CONFIRM: pairing codes are a PAKE), 2 server->client (HELLO + READY);
+    // plus one record each way. The HELLO re-send only fires on loss, so on
+    // loopback the counts are exact.
     let cs = client_carrier.stats();
-    assert_eq!(cs.sent_datagrams, 2, "client: hello + record");
+    assert_eq!(cs.sent_datagrams, 3, "client: hello + confirm + record");
     assert_eq!(
         cs.recv_datagrams, 3,
         "client: server hello + ready + record"
     );
     let ss = server_carrier.stats();
     assert_eq!(ss.sent_datagrams, 3, "server: hello + ready + record");
-    assert_eq!(ss.recv_datagrams, 2, "server: client hello + record");
+    assert_eq!(
+        ss.recv_datagrams, 3,
+        "server: client hello + confirm + record"
+    );
+
+    // A datagram path may reorder and duplicate: records sent in reverse
+    // order over raw UDP are all accepted (anti-replay window), and a
+    // duplicate is dropped as a replay, not an AEAD failure.
+    let recs: Vec<Vec<u8>> = (0..8u8)
+        .map(|i| {
+            client
+                .session_mut()
+                .expect("client session")
+                .encrypt_record(0, &[i])
+        })
+        .collect();
+    for r in recs.iter().rev() {
+        client_carrier.send(r).expect("send record");
+    }
+    client_carrier.send(&recs[3]).expect("send duplicate");
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while got.len() < 9 && std::time::Instant::now() < deadline {
+        let _ = server_carrier.poll_recv(&mut |d| got.push(d.to_vec()));
+    }
+    assert_eq!(got.len(), 9, "loopback delivers every datagram");
+    let server_session = server.session_mut().expect("server session");
+    let mut plain = Vec::new();
+    let mut replays = 0;
+    for d in &got {
+        match server_session.decrypt_record(0, d) {
+            Ok(p) => plain.push(p[0]),
+            Err(e) if e.is_replay() => replays += 1,
+            Err(e) => panic!("unexpected record error: {e}"),
+        }
+    }
+    plain.sort_unstable();
+    assert_eq!(plain, (0..8u8).collect::<Vec<_>>());
+    assert_eq!(replays, 1);
+    assert_eq!(server_session.replayed(), 1);
 
     client_carrier.close().expect("close client carrier");
     server_carrier.close().expect("close server carrier");

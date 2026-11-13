@@ -21,8 +21,8 @@ Per-crate details: [ovcore](crates/ovcore.md) · [ovtransport](crates/ovtranspor
  ┌──────────────────────────────────────────────────────────────────────────┐
  │ Application commands (ovapp::terminal — see crates/ovapp.md)             │
  ├──────────────────────────────────────────────────────────────────────────┤
- │ Record layer: [sender_id LE8][seq LE4][ChaCha20-Poly1305 ct][tag16]      │  ovcore::session
- │ (before it: handshake datagrams HELLO / READY, cleartext)                │  ovcore::handshake
+ │ Record layer: [sender_id LE8][seq LE8][ChaCha20-Poly1305 ct][tag16]      │  ovcore::session
+ │ (before it: handshake datagrams HELLO / READY / CONFIRM, cleartext)      │  ovcore::handshake
  ├──────────────────────────────────────────────────────────────────────────┤
  │ Carrier datagram (opaque, ≤ 64 KiB), delivered in order and lossless:    │
  │  • relay tunnel:  TCP/WebSocket → 'C'/'O'/'A'/'XT' lines + [kind][len][…]│  ovtransport::relay/tunnel, ovrelay
@@ -46,21 +46,23 @@ The relay keys pairing on a u32 that clients choose:
 
 | Mode | session_id | Source |
 |---|---|---|
-| Attended (6-digit code) | first 4 ASCII bytes of the code, as u32 BE (e.g. `"123456"` → `0x31323334`) | `crates/ovffi/src/relay.rs` `relay_session_id`, `ovview/examples/input_smoke.rs`, tests |
+| Attended (10-digit one-time code) | the code's 4 **public rendezvous digits** as ASCII, u32 BE (e.g. `"1234567890"` → `0x31323334`) | `ovcore::pairing::relay_session_id` (used by `ovhost`, `ovview`, `ovffi` `relay_session_id`) |
 | Unattended (device ID) | `device_id & 0xFFFF_FFFF` | `crates/ovapp/tests/unattended_over_relay.rs` `session_id_of` |
 
 The device ID is `u64::from_be_bytes([0, 0, 0, fp[0], fp[1], fp[2], fp[3], fp[4]])`, where `fp` is the identity fingerprint (`device_id_from_fp` in `crates/ovffi/src/session.rs`, the same recipe in `ovview` and `ovhost`). Its top 3 bytes are always zero, and §6.3 depends on that.
 
-**The session ID is a rendezvous name, not a secret.** Both sides derive it from what the user has (a pairing code or device ID), so it cannot be random; widening it would not add secrecy. Confidentiality and peer authentication come entirely from the handshake (§3). What a guessed or squatted session ID allows is denial of service (parking on someone else's ID); the relay bounds that with per-IP and pending-session caps (§2.3). Widening the field to 64 bits (full device ID, 40 bits in use) is a possible later compatible-break change; it was deferred because it touches every client and the gain is only less accidental collision.
+**The session ID is a rendezvous name, not a secret.** Both sides derive it from what the user has (a pairing code or device ID), so it cannot be random; widening it would not add secrecy.
+
+**Pairing codes are split for this reason.** A code is `RRRR SSSSSS`: four rendezvous digits (public — the relay and anyone watching the relay connection see them) and six secret digits that are only ever the SPAKE2 password (§3.4). Deriving the session ID from the secret digits instead — even through a slow or keyed hash — would hand every observer an offline-checkable value over 10^6 candidates, which is exactly what the PAKE prevents; a public rendezvous part costs four extra digits and leaks nothing. Codes are random (`ovcore::pairing::generate`) and one-shot: the host shows a new code after any attempt. Confidentiality and peer authentication come entirely from the handshake (§3). What a guessed or squatted session ID allows is denial of service (parking on someone else's ID); the relay bounds that with per-IP and pending-session caps (§2.3). Widening the field to 64 bits (full device ID, 40 bits in use) is a possible later compatible-break change; it was deferred because it touches every client and the gain is only less accidental collision.
 
 ### 2.2 Transport to the relay
 
 - **TCP:** connect to the relay port (default 4569 for the relay binary and every client; see [ovrelay.md §7](crates/ovrelay.md)).
-- **WebSocket:** `GET <any path> HTTP/1.1` with `Upgrade: websocket` and `Sec-WebSocket-Key`. The relay replies `101` with the RFC 6455 accept key. After that, the relay byte stream below travels inside WebSocket binary messages. Message boundaries carry no meaning, and the stream may be split anywhere.
+- **WebSocket:** `GET /relay HTTP/1.1` (the path is configurable with `ovrelay --ws-path`) with `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Key` and `Sec-WebSocket-Version: 13`. The relay replies `101` with the RFC 6455 accept key; an upgrade on another path gets `404`, another or a missing version `426` with `Sec-WebSocket-Version: 13`, a missing key or `Connection: Upgrade` `400`. After that, the relay byte stream below travels inside WebSocket binary messages. Message boundaries carry no meaning, and the stream may be split anywhere.
   - Client frames may be at most 128 KiB and must be masked (RFC 6455 §5.1); an unmasked client frame closes the connection.
   - Clients: the iOS app owns its WebSocket and feeds the stream to `RelayTunnelCarrier::connect_bridge`; `ovhost` and `ovview` (`--relay ws://…` / `wss://…`) use `RelayTunnelCarrier::connect_ws`, which sends each chunk as one masked binary message of at most 64 KiB (see [ovtransport.md §6.4](crates/ovtransport.md)). The codec on both sides is `ovtransport::ws`.
   - The relay sends WebSocket PINGs (`"ov"`) every 15 s while paired.
-  - `GET /` and `GET /health` without an upgrade return `200 ovrelay\n`. Any other plain GET returns `426`.
+  - `GET /` and `GET /health` without an upgrade return `200 ovrelay\n`; a plain GET of the WebSocket path returns `426`, anything else `404`.
 
 ### 2.3 Control lines
 
@@ -99,9 +101,9 @@ Kinds above `0x05`, or a length above 65 532, are a fatal framing error for both
 
 ---
 
-## 3. Handshake (cleartext, over any carrier) — version 2
+## 3. Handshake (cleartext, over any carrier) — version 3
 
-Implemented in `ovcore::handshake`; see [crates/ovcore.md §4](crates/ovcore.md) for the state machine. Version 2 replaced the v1 PIN proof (an HMAC keyed by a PBKDF2 hash of the PIN, which anyone reaching the host could brute-force offline) with SPAKE2, and is **not** wire-compatible with v1.
+Implemented in `ovcore::handshake`; see [crates/ovcore.md §4](crates/ovcore.md) for the state machine. Version 2 replaced the v1 PIN proof (an HMAC keyed by a PBKDF2 hash of the PIN, which anyone reaching the host could brute-force offline) with SPAKE2. Version 3 also moves pairing codes onto SPAKE2 (v2 sent the code in cleartext) and goes with the v3 record format (§4). Neither is wire-compatible with its predecessor.
 
 Each handshake message is one carrier datagram:
 
@@ -117,16 +119,16 @@ Flights:
 client                         server
 HELLO        ───────────────►
              ◄───────────────  HELLO, READY        (two datagrams)
-CONFIRM      ───────────────►                      (PIN mode only)
+CONFIRM      ───────────────►                      (PIN and pairing-code modes)
 ```
 
-Pairing-code and direct-device sessions are established after two flights (the server right after the client HELLO, so it may send records behind READY). In PIN mode the client is established after READY and the server only after CONFIRM. The handshake itself never retransmits; a PIN-mode server re-answers a byte-identical repeated client HELLO.
+Direct-device sessions are established after two flights (the server right after the client HELLO, so it may send records behind READY). In the credential modes — PIN and pairing code — the client is established after READY and the server only after CONFIRM. The handshake itself never retransmits; a server waiting for CONFIRM re-answers a byte-identical repeated client HELLO.
 
 ### 3.1 HELLO body (both directions)
 
 | Field | Encoding |
 |---|---|
-| version | u8 = `2` |
+| version | u8 = `3` |
 | device_id | u64 BE |
 | X25519 static public key | lp(32) |
 | X25519 ephemeral public key | lp(32) |
@@ -134,7 +136,7 @@ Pairing-code and direct-device sessions are established after two flights (the s
 | static_sig = Ed25519(x25519_static_pk) | lp(64) |
 | kex_sig = Ed25519(eph_pk ‖ device_id BE8) | lp(64) |
 | auth_mode | u8: 0 pairing code, 1 direct device, 2 mutual TLS (rejected: not implemented), 3 PIN |
-| auth blob | lp(N): pairing = the server's 6 ASCII digits; direct = empty; PIN = 33-byte SPAKE2 message |
+| auth blob | lp(N): pairing code and PIN = the 33-byte SPAKE2 message; direct = empty |
 | clock_offset_ms | i64 BE (0 in practice) |
 
 - Both sides must use the same auth mode.
@@ -145,28 +147,35 @@ Pairing-code and direct-device sessions are established after two flights (the s
 | Field | Encoding |
 |---|---|
 | server device_id | u64 BE |
-| ready_sig = Ed25519_server(`"ov2 ready"` ‖ TH) | lp(64) |
-| server finished MAC | lp(32) in PIN mode, lp(0) otherwise |
+| ready_sig = Ed25519_server(`"ov3 ready"` ‖ TH) | lp(64) |
+| server finished MAC | lp(32) in the credential modes, lp(0) otherwise |
 
-### 3.3 CONFIRM body (client → server, PIN mode)
+### 3.3 CONFIRM body (client → server, credential modes)
 
 | Field | Encoding |
 |---|---|
 | client finished MAC | lp(32) |
 
-### 3.4 Transcript and key confirmation
+### 3.4 Transcript, PAKE and key confirmation
 
 ```
-TH         = SHA-256("openview handshake v2" ‖ u32 BE len ‖ client HELLO body ‖ u32 BE len ‖ server HELLO body)
-server MAC = HMAC-SHA256(server_finished, "ov2 server finished" ‖ TH)
-client MAC = HMAC-SHA256(client_finished, "ov2 client finished" ‖ TH)
+TH         = SHA-256("openview handshake v3" ‖ u32 BE len ‖ client HELLO body ‖ u32 BE len ‖ server HELLO body)
+server MAC = HMAC-SHA256(server_finished, "ov3 server finished" ‖ TH)
+client MAC = HMAC-SHA256(client_finished, "ov3 client finished" ‖ TH)
 ```
 
 TH covers every HELLO field — device IDs, static, ephemeral and Ed25519 keys, signatures, auth mode, the PAKE messages and the clock field — so the identities are bound into the PAKE result and the session keys, and any in-flight change makes the READY signature or a MAC fail.
 
-**PIN mode (SPAKE2).** `spake2` crate (RustCrypto), Ed25519 group; the client is side A, the server side B; identities `"openview/v2/client"` / `"openview/v2/server"`; password = `PBKDF2-HMAC-SHA256(PIN, "openview-pin-v1", 10000, 32)`. Each side's SPAKE2 message travels as its HELLO auth blob. A passive observer learns nothing that allows testing PIN guesses offline; an active attacker (either role) tests exactly one guess per handshake, and learns only whether it was right. Wrong PIN: the client cannot verify the server MAC, sends REJECT(auth failed) and fails; the server fails on that REJECT (or on a bad client MAC).
+**SPAKE2.** `spake2` crate (RustCrypto), Ed25519 group; the client is side A, the server side B. Each side's SPAKE2 message travels as its HELLO auth blob.
 
-**Rate limiting.** The host counts every PIN attempt as a failure when it sends READY and undoes it on a valid CONFIRM. After 10 failures host-wide (5 per source address, when known) it locks for 30 s, doubling per further failure up to 15 min; a locked host answers PIN HELLOs with REJECT(rate limited, retry-after) without running the PAKE.
+| Mode | password | identities (A / B) |
+|---|---|---|
+| PIN | `PBKDF2-HMAC-SHA256(PIN, "openview-pin-v1", 10000, 32)` | `"openview/v3/pin-client"` / `"openview/v3/pin-server"` |
+| pairing code | the 10 ASCII digits of the code | `"openview/v3/pair-client"` / `"openview/v3/pair-server"` |
+
+The distinct identities keep a PIN and a pairing code from ever being interchangeable. A passive observer learns nothing that allows testing guesses offline; an active attacker (either role) tests exactly one guess per handshake and learns only whether it was right. In particular **no byte of a pairing code is sent** (its four public rendezvous digits only appear as the relay session ID, §2.1). Wrong credential: the client cannot verify the server MAC, sends REJECT(auth failed) and fails; the server fails on that REJECT (or on a bad client MAC).
+
+**Online guessing.** The host counts an attempt as a failure unless the client's CONFIRM verifies — a wrong guess, a timeout or a dropped connection all count; successful logins never do. After 10 failures host-wide (5 per source address, when known) it locks for 30 s, doubling per further failure up to 15 min; a locked host answers credential HELLOs with REJECT(rate limited, retry-after) without running the PAKE. A pairing code is also **burned** after one attempt: the attended host generates a new identity and a new code for the next session.
 
 ### 3.5 REJECT body (either direction)
 
@@ -175,17 +184,17 @@ TH covers every HELLO field — device IDs, static, ephemeral and Ed25519 keys, 
 | code | u8: 1 incompatible version, 2 authentication failed, 3 rate limited, 4 auth mode mismatch, 5 malformed |
 | retry_after_secs | u32 BE (rate limited; 0 otherwise) |
 
-REJECT is unauthenticated and only ever ends a handshake. **Version mismatch:** a v2 server answers a v1 HELLO (tag `0x01`) or a HELLO with another version byte with REJECT(1). A v1 peer fails immediately on the unknown v2 tags (`unknown handshake tag 0x11` / `0x1f`) instead of hanging.
+REJECT is unauthenticated and only ever ends a handshake. **Version mismatch:** a v3 server answers a HELLO with another version byte (a v2 peer) or a v1 HELLO (tag `0x01`) with REJECT(1); the client reports `IncompatibleVersion` ("update both apps"; FFI `OV_ERR_INCOMPATIBLE_VERSION`). A v2 server likewise REJECTs a v3 HELLO; a v1 peer fails immediately on the unknown tags instead of hanging.
 
 ### 3.6 Keys
 
 ```
-IKM    = X25519(eph_sk, peer_eph_pk) ‖ X25519(static_sk, peer_static_pk) [‖ SPAKE2 key in PIN mode]
+IKM    = X25519(eph_sk, peer_eph_pk) ‖ X25519(static_sk, peer_static_pk) [‖ SPAKE2 key in the credential modes]
 PRK    = HKDF-Extract(salt = TH, IKM)
-client_key      = HKDF-Expand(PRK, "ov2 client key", 32)        client→server records
-server_key      = HKDF-Expand(PRK, "ov2 server key", 32)        server→client records
-client_finished = HKDF-Expand(PRK, "ov2 client finished", 32)
-server_finished = HKDF-Expand(PRK, "ov2 server finished", 32)
+client_key      = HKDF-Expand(PRK, "ov3 client key", 32)        client→server records
+server_key      = HKDF-Expand(PRK, "ov3 server key", 32)        server→client records
+client_finished = HKDF-Expand(PRK, "ov3 client finished", 32)
+server_finished = HKDF-Expand(PRK, "ov3 server finished", 32)
 nonce_base(dir) = HMAC-SHA256(dir_key, sender_dev BE8 ‖ receiver_dev BE8)[..12]
 ```
 
@@ -200,21 +209,24 @@ Keys derived from the record keys:
 
 ---
 
-## 4. Record layer
+## 4. Record layer (record format v3)
 
 Each record is one carrier datagram:
 
 | Offset | Len | Field |
 |---|---|---|
 | 0 | 8 | sender device_id, u64 **LE** |
-| 8 | 4 | seq, u32 **LE** = low 32 bits of the 64-bit per-direction counter |
-| 12 | N | ChaCha20-Poly1305 ciphertext |
-| 12+N | 16 | tag |
+| 8 | 8 | seq, u64 **LE**: the sender's per-direction record counter, starting at 0 |
+| 16 | N | ChaCha20-Poly1305 ciphertext |
+| 16+N | 16 | tag |
 
-- **Nonce:** the 12-byte direction base with the 64-bit counter, LE, XORed into bytes 4..12.
-- **AAD:** `header (12 B) ‖ channel (1 B)`. The channel byte is chosen by the application and **never sent**, so both ends must agree on it.
-- **Receiver checks:** sender_id == the peer's device ID, then seq == the expected counter, then the tag.
-- **No loss, reordering, or duplication is tolerated.** Any gap desyncs the session permanently. Every carrier below therefore delivers records losslessly and in order.
+Overhead: 32 bytes per record (`ovcore::framing::MIN_RECORD_LEN`; `ovapp::terminal::RECORD_OVERHEAD`).
+
+- **Nonce:** the 12-byte direction base with `seq` (64-bit, LE) XORed into bytes 4..12. A sender never reuses a `seq`.
+- **AAD:** `header (16 B) ‖ channel (1 B)`. The channel byte is chosen by the application and **never sent**, so both ends must agree on it. The header — and so `seq` — is authenticated.
+- **Receiver checks, in order:** length ≥ 32; sender_id == the peer's device ID; the **anti-replay window**; the tag. Only after the tag verified does the window record `seq`, so forged or wrong-channel records change nothing.
+- **Anti-replay window** (`ovcore::replay`, RFC 4303 / RFC 6479 style): the receiver keeps the highest accepted `seq` and a bitmap of the 2048 below it. A record above the top, or inside the window and unseen, is accepted — so reordering by a datagram path (direct UDP, LAN) is tolerated; a duplicate, or a record more than 2048 behind the newest, is **dropped silently** (`CoreError::Replay`; counted in `Session::replayed` / `TerminalStats::replayed`, logged at `debug`). On ordered carriers (TCP, relay, rudp) records simply arrive in order. A record delivered twice across a direct-path switch is now harmless instead of desyncing the session.
+- The direct-path media channel (§7) uses the same window implementation (4096 packets) over its own packet numbers.
 
 The plaintext is the application message format: [crates/ovapp.md](crates/ovapp.md).
 

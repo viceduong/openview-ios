@@ -21,5 +21,10 @@ zeroize.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
 
+[features]
+# `ovcore::fuzzing`: record-layer entry points for the cargo-fuzz targets
+# in `fuzz/` (and the deterministic smoke tests).
+fuzzing = []
+
 [lints]
 workspace = true

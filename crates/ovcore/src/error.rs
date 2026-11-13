@@ -138,17 +138,28 @@ pub enum CoreError {
     /// The header names a sender other than our peer.
     #[error("invalid sender ID {0}")]
     InvalidSender(u64),
-    /// The header sequence is not the one we expect (loss / replay / reorder).
-    #[error("sequence desync: expected {expected} got {got}")]
-    SequenceDesync {
-        /// Low 32 bits of our receive counter.
-        expected: u32,
-        /// The header's sequence field.
-        got: u32,
+    /// The record's sequence number was already accepted, or is older than
+    /// the anti-replay window. Not an attack signal on its own (a path
+    /// switch can deliver a record twice): drop it and count it.
+    #[error("replayed record (seq {seq}, {kind:?})")]
+    Replay {
+        /// The record's sequence number.
+        seq: u64,
+        /// Duplicate, or too old for the window.
+        kind: crate::replay::Replay,
     },
     /// AEAD authentication failed (wrong key, channel, or tampering).
     #[error("AEAD open failed (auth)")]
     Aead,
+}
+
+impl CoreError {
+    /// `true` for [`CoreError::Replay`]: a duplicate / stale record that a
+    /// receiver drops silently (it only counts it).
+    #[must_use]
+    pub fn is_replay(&self) -> bool {
+        matches!(self, Self::Replay { .. })
+    }
 }
 
 impl From<CoreError> for String {

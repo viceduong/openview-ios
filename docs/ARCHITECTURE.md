@@ -69,7 +69,7 @@ stdout into UI state; their human-readable logs (stderr) go to log files
 
 | Crate | Kind | Responsibility | Reference |
 |---|---|---|---|
-| `ovcore` | lib | Identity (`OVID1` seed → Ed25519 + X25519), fingerprint & 6-digit pairing code, versioned handshake (HELLO / READY / CONFIRM), SPAKE2 PIN authentication + attempt throttling, HKDF transcript key schedule, AEAD record `Session`, typed errors | [ovcore.md](crates/ovcore.md) |
+| `ovcore` | lib | Identity (`OVID1` seed → Ed25519 + X25519) & fingerprint, one-time pairing codes, versioned handshake (HELLO / READY / CONFIRM), SPAKE2 authentication of PINs and pairing codes + attempt throttling, HKDF transcript key schedule, AEAD record `Session` with an anti-replay window, typed errors | [ovcore.md](crates/ovcore.md) |
 | `ovtransport` | lib | `Carrier` trait and implementations; RUDP; direct-path engine (probes, candidates, REBIND); delay-based CC; unreliable FEC media channel; relay client over TCP (IP or hostname) or WebSocket (`ws://` / `wss://`, feature `ws-client`); RFC 6455 codec (`ws`) shared with `ovrelay` | [ovtransport.md](crates/ovtransport.md) |
 | `ovrelay` | lib + bin | Pairs two parties by session ID, then relays tunnel frames opaquely; RFC 6455 listener; connection / per-IP / pending caps | [ovrelay.md](crates/ovrelay.md) |
 | `ovdiscovery` | lib | STUN binding (public mapping), UPnP IGD port mapping, mDNS/DNS-SD | [ovdiscovery.md](crates/ovdiscovery.md) |
@@ -145,23 +145,30 @@ and post events to the UI; Job Object ties children to the GUI's lifetime.
 ## 6. Security model
 
 - **Identity:** 32-byte master seed → Ed25519 (signing) + X25519; fingerprint
-  = SHA-256(Ed25519 pub)[..16]; pairing code derived from the fingerprint.
-- **Handshake (v2):** ephemeral + static X25519 → HKDF-SHA256 per-direction
+  = SHA-256(Ed25519 pub)[..16].
+- **Handshake (v3):** ephemeral + static X25519 → HKDF-SHA256 per-direction
   keys salted with the transcript hash; READY is an Ed25519 signature over the
-  transcript; attended sessions bind the pairing code. Unattended sessions
-  authenticate the PIN with **SPAKE2** (balanced PAKE): the PAKE key is mixed
+  transcript. Both credentials — the unattended PIN and the attended random
+  one-time 10-digit pairing code — are authenticated with **SPAKE2**
+  (balanced PAKE, separate identities per credential): the PAKE key is mixed
   into the key schedule and confirmed by MACs in both directions, so nothing
-  on the wire allows an offline PIN guess and each attempt tests one guess.
-  The host rate-limits PIN attempts (lockout from 30 s doubling to 15 min)
-  and tells clients "too many attempts" with a retry-after. Old (v1) peers
-  get an explicit incompatible-version error.
+  on the wire allows an offline guess and each attempt tests one guess. A
+  pairing code's first four digits are a public relay rendezvous name; the
+  secret six never leave the two machines, and the host burns a code after
+  one attempt. The host rate-limits attempts (lockout from 30 s doubling to
+  15 min) and tells clients "too many attempts" with a retry-after. Older
+  peers get an explicit incompatible-version error.
+- **Records:** a 64-bit sequence number in the authenticated header and a
+  2048-record anti-replay window: duplicates and stale records are dropped,
+  reordering on datagram paths is accepted.
 - **Hostile input:** handshake, record, command, band-container and
   WebSocket parsers are bounds-checked and covered by smoke-fuzz tests and
   cargo-fuzz targets (`fuzz/`); received files are capped (4 concurrent,
   256 MiB buffered) and their names sanitized; the relay caps connections
   (total, per IP) and parked sessions.
-- **Records:** ChaCha20-Poly1305 with per-direction sequence counters; no
-  reorder window, so lower layers must deliver in order.
+- **Records:** ChaCha20-Poly1305 with per-direction keys; the record layer
+  tolerates reordering within its window, the application above expects
+  ordered delivery from its carriers.
 - **iOS:** direct-path host keys pinned trust-on-first-use; PINs in Keychain.
 - **Windows GUI:** PINs in Credential Manager.
 - Open issues: [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#security).

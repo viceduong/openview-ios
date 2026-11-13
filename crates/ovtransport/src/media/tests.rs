@@ -36,18 +36,21 @@ fn seal_open_and_tamper() {
 #[test]
 fn replay_window_rejects_duplicates_and_stale() {
     let mut w = ReplayWindow::new();
-    assert!(!w.check(0));
+    assert!(w.check(0).is_err());
     for pn in [1u64, 3, 2, 10] {
-        assert!(w.check(pn));
+        assert!(w.check(pn).is_ok());
         w.commit(pn);
     }
-    assert!(!w.check(3));
-    assert!(w.check(9));
+    assert!(w.check(3).is_err());
+    assert!(w.check(9).is_ok());
     w.commit(10 + REPLAY_WINDOW);
-    assert!(!w.check(10), "older than the window");
-    assert!(w.check(11), "inside the window, unseen");
-    assert!(!w.check(10 + REPLAY_WINDOW), "the top itself was seen");
-    assert!(w.check(12 + REPLAY_WINDOW));
+    assert!(w.check(10).is_err(), "older than the window");
+    assert!(w.check(11).is_ok(), "inside the window, unseen");
+    assert!(
+        w.check(10 + REPLAY_WINDOW).is_err(),
+        "the top itself was seen"
+    );
+    assert!(w.check(12 + REPLAY_WINDOW).is_ok());
 }
 
 fn unit(n: usize, seed: u8) -> Vec<u8> {

@@ -1,18 +1,19 @@
 //! Binary framing for the OpenView encrypted record layer.
 //!
-//! Wire format (matches `session.rs` exactly):
-//!   header (12 B) || ciphertext (N B) || tag (16 B)
-//! where header = [sender_id u64 LE][seq u32 LE] (seq = low 32 bits of the
-//! session counter) and the AAD binds the header plus a channel byte. The
-//! seq field is the anti-desync/reorder guard: the
-//! receiver rejects a record whose seq doesn't match its expected counter.
+//! Wire format (record format v3, matches `session.rs` exactly):
+//!   header (16 B) || ciphertext (N B) || tag (16 B)
+//! where header = [sender_id u64 LE][seq u64 LE] and the AAD binds the
+//! header plus a channel byte. `seq` is the sender's full 64-bit record
+//! counter: it is the AEAD nonce counter, and the receiver checks it against
+//! a sliding anti-replay window ([`crate::replay`]) — duplicates and records
+//! older than the window are rejected, reordering inside it is accepted.
 //!
 //! `record` is a re-export of this module (historical name).
 
 use crate::session::Session;
 
-/// Record header length: `[sender_id u64][seq u32]`.
-pub const HEADER_LEN: usize = 12;
+/// Record header length: `[sender_id u64 LE][seq u64 LE]`.
+pub const HEADER_LEN: usize = 16;
 /// Poly1305 tag length.
 pub const TAG_LEN: usize = 16;
 /// Smallest well-formed record (header + tag, empty payload).
@@ -32,28 +33,19 @@ pub fn w64(o: &mut Vec<u8>, v: u64) {
     o.extend_from_slice(&v.to_le_bytes());
 }
 
-/// Encode the 12-byte record header.
-pub fn header_bytes(sender_id: u64, seq: u32) -> [u8; HEADER_LEN] {
+/// Encode the 16-byte record header.
+pub fn header_bytes(sender_id: u64, seq: u64) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..8].copy_from_slice(&sender_id.to_le_bytes());
-    h[8..12].copy_from_slice(&seq.to_le_bytes());
+    h[8..16].copy_from_slice(&seq.to_le_bytes());
     h
 }
 
-/// Parse a record header. Returns (sender_id, seq).
-pub fn parse_header(header: &[u8]) -> Option<(u64, u32)> {
-    if header.len() < HEADER_LEN {
-        return None;
-    }
-    let sid = u64::from_le_bytes(header[0..8].try_into().ok()?);
-    let seq = u32::from_le_bytes(header[8..12].try_into().ok()?);
+/// Parse a record header. Returns (sender_id, seq); `None` if short.
+pub fn parse_header(header: &[u8]) -> Option<(u64, u64)> {
+    let sid = u64::from_le_bytes(header.get(0..8)?.try_into().ok()?);
+    let seq = u64::from_le_bytes(header.get(8..16)?.try_into().ok()?);
     Some((sid, seq))
-}
-
-/// Anti-desync guard: the header's seq must equal the low 32 bits of the
-/// receiver's expected counter (wrapping semantics).
-pub fn seq_matches(expected_counter: u64, header_seq: u32) -> bool {
-    (expected_counter & 0xFFFF_FFFF) as u32 == header_seq
 }
 
 /// A thin record writer/reader bound to a Session.
@@ -85,21 +77,11 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let h = header_bytes(0x0102_0304_0506_0708, 0xdead_beef);
+        let h = header_bytes(0x0102_0304_0506_0708, 0x1122_3344_dead_beef);
         let (sid, seq) = parse_header(&h).unwrap();
         assert_eq!(sid, 0x0102_0304_0506_0708);
-        assert_eq!(seq, 0xdead_beef);
-        assert!(parse_header(&h[..11]).is_none());
-    }
-
-    #[test]
-    fn seq_guard_rejects_mismatch() {
-        assert!(seq_matches(0xdead_beef, 0xdead_beef));
-        assert!(seq_matches(
-            0x0100_0000_0000_0000u64 | 0xdead_beef,
-            0xdead_beef
-        )); // wrapping low-32
-        assert!(!seq_matches(0xdead_beef, 0xdead_bee0));
+        assert_eq!(seq, 0x1122_3344_dead_beef);
+        assert!(parse_header(&h[..15]).is_none());
     }
 
     #[test]
@@ -129,7 +111,7 @@ mod tests {
         srv.recv_nonce_base = cli.send_nonce_base;
         let mut sr = Recorder::new(&mut srv);
         let rec = sr.write(0, b"integrity");
-        // flip a ciphertext byte (offset 12 = first ciphertext byte)
+        // flip the first ciphertext byte
         let mut bad = rec;
         bad[HEADER_LEN] ^= 0x01;
         let mut cr = Recorder::new(&mut cli);
@@ -137,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn desync_detected() {
+    fn replayed_record_is_rejected() {
         let shared = [5u8; 32];
         let mut srv = Session::new(true, shared, 1, 2);
         let mut cli = Session::new(false, shared, 2, 1);
@@ -145,10 +127,12 @@ mod tests {
         srv.recv_nonce_base = cli.send_nonce_base;
         let mut sr = Recorder::new(&mut srv);
         let rec = sr.write(0, b"one");
-        // receiver's expected counter is 0 but the record claims seq 0 -> ok
         let mut cr = Recorder::new(&mut cli);
         assert!(cr.read(0, &rec).is_ok());
-        // now the receiver is out of sync (its seq advanced, re-send same record)
-        assert!(cr.read(0, &rec).is_err());
+        // The same record again is a replay.
+        assert!(matches!(
+            cr.read(0, &rec),
+            Err(crate::error::CoreError::Replay { seq: 0, .. })
+        ));
     }
 }

@@ -9,12 +9,13 @@ pub const CHANNEL: u8 = 0;
 /// Largest record (datagram) every carrier accepts: UDP over IPv4 caps a
 /// payload at 65 507 bytes, the relay tunnel at 65 532, TCP at 65 535.
 pub const MAX_RECORD_LEN: usize = 65_507;
-/// Per-record overhead: 12-byte header + 16-byte AEAD tag.
-pub const RECORD_OVERHEAD: usize = 28;
+/// Per-record overhead: 16-byte header + 16-byte AEAD tag.
+pub const RECORD_OVERHEAD: usize = ovcore::framing::MIN_RECORD_LEN;
 /// Largest encoded command (`[1B opcode][payload]`) that fits in one record.
 /// [`TerminalSession::send`](super::TerminalSession::send) rejects anything larger *before* encrypting, so
-/// an oversized command never consumes a send sequence number (which would
-/// permanently desync the peer's record counter).
+/// an oversized command never consumes a send sequence number (a record the
+/// carrier then refuses would leave a gap the peer's replay window has to
+/// skip).
 pub const MAX_COMMAND_LEN: usize = MAX_RECORD_LEN - RECORD_OVERHEAD;
 /// Text payload cap for CLIPBOARD / TYPE commands (leaves headroom under
 /// [`MAX_COMMAND_LEN`] for the opcode and the per-command prefix bytes).
