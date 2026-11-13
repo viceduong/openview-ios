@@ -346,7 +346,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
     private var offset: CGPoint = .zero
     /// The preset the viewport follows when the view / frame size changes
     /// (nil = free zoom, kept as is).
-    private var followPreset: ZoomPreset? = .fit
+    private var followPreset: ZoomPreset? = .halfHeight
     private var lastBoundsSize: CGSize = .zero
     /// Bottom edge (window y) of the top chrome (stats chip), 0 = none:
     /// the image is laid out below it (`safeInsets`).
@@ -718,7 +718,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
             CATransaction.commit()
             video?.layout(in: container.bounds)
             input.frameSize = size
-            if followPreset == nil { followPreset = .fit }
+            if followPreset == nil { followPreset = .halfHeight }
             refit()
         }
         if tick != frameTick {
@@ -908,6 +908,12 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         return max(bounds.width / frameSize.width, bounds.height / frameSize.height)
     }
 
+    /// The remote screen's height fills half of the view's height.
+    private var halfHeightScale: CGFloat {
+        guard frameSize.height > 0, bounds.height > 0 else { return 0 }
+        return bounds.height * 0.5 / frameSize.height
+    }
+
     /// One remote pixel = one device pixel.
     private var nativeScale: CGFloat {
         1 / displayScale
@@ -930,6 +936,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         case .fit: return fitScale
         case .fill: return clampScale(fillScale)
         case .native: return clampScale(nativeScale)
+        case .halfHeight: return clampScale(halfHeightScale)
         }
     }
 
@@ -1118,7 +1125,7 @@ final class RemoteSurfaceView: UIView, UIGestureRecognizerDelegate, RemoteKeyCom
         let f = fitScale
         guard f > 0 else { return }
         if scale <= 0 {
-            followPreset = .fit
+            followPreset = .halfHeight
         }
         if let preset = followPreset {
             scale = scaleFor(preset)
