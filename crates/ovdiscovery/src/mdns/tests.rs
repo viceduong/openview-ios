@@ -42,7 +42,7 @@ fn names_and_txt() {
     assert_eq!(host_name(42), "openview-42.local");
     let entries = cfg().txt_entries();
     assert_eq!(entries[0], format!("id={ID}").into_bytes());
-    assert_eq!(entries[1], b"v=2".to_vec());
+    assert_eq!(entries[1], b"v=3".to_vec());
     assert_eq!(entries[2], b"name=Office PC".to_vec());
 }
 
@@ -204,7 +204,7 @@ fn response_round_trips_into_a_discovered_host() {
     let h = &hosts[0];
     assert_eq!(h.device_id, ID);
     assert_eq!(h.name, "Office PC");
-    assert_eq!(h.version, Some(2));
+    assert_eq!(h.version, Some(3));
     assert!(h.is_compatible());
     assert_eq!(
         h.addrs,

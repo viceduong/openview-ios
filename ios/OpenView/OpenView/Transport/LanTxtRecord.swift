@@ -10,7 +10,7 @@ import Foundation
 
 struct LanTxtRecord: Equatable {
     /// The handshake protocol version this app speaks.
-    static let protocolVersion = 2
+    static let protocolVersion = 3
 
     /// Device ID digits (`id=`), nil when absent or not a number.
     var deviceID: String?

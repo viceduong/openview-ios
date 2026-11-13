@@ -15,18 +15,18 @@ final class LanTxtRecordTests: XCTestCase {
     }
 
     func testParsesHostRecord() {
-        let txt = LanTxtRecord(rdata: rdata(["id=123456789012", "v=2", "name=Office PC"]))
+        let txt = LanTxtRecord(rdata: rdata(["id=123456789012", "v=3", "name=Office PC"]))
         XCTAssertEqual(txt.deviceID, "123456789012")
-        XCTAssertEqual(txt.version, 2)
+        XCTAssertEqual(txt.version, 3)
         XCTAssertEqual(txt.name, "Office PC")
         XCTAssertTrue(txt.isCompatible)
         XCTAssertEqual(txt.displayName(instanceName: "123456789012"), "Office PC")
     }
 
     func testDictionaryKeysAreCaseInsensitive() {
-        let txt = LanTxtRecord(dictionary: ["ID": "42", "V": "3", "Name": "  Den  "])
+        let txt = LanTxtRecord(dictionary: ["ID": "42", "V": "4", "Name": "  Den  "])
         XCTAssertEqual(txt.deviceID, "42")
-        XCTAssertEqual(txt.version, 3)
+        XCTAssertEqual(txt.version, 4)
         XCTAssertFalse(txt.isCompatible)
         XCTAssertEqual(txt.name, "Den")
     }

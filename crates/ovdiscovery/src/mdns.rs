@@ -103,7 +103,7 @@ pub const DEFAULT_LAN_PORT: u16 = 4571;
 /// Handshake protocol version advertised in TXT `v=` by default (matches
 /// `ovcore::handshake::PROTOCOL_VERSION`; this crate does not depend on
 /// `ovcore`, so callers should set [`AdvertiseConfig::version`] from it).
-pub const TXT_PROTOCOL_VERSION: u8 = 2;
+pub const TXT_PROTOCOL_VERSION: u8 = 3;
 
 /// DNS-SD service-type enumeration name (RFC 6763 §9).
 const META_SERVICES: &str = "_services._dns-sd._udp.local";

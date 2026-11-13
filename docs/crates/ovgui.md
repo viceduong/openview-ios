@@ -259,6 +259,9 @@ Other environment variables:
 | `OPENVIEW_DATA_DIR` | Override the data directory (both modes) |
 | `OPENVIEW_BIN_DIR` | Development: folder holding `ovhost.exe`, `ovrelay.exe`, `ovview.exe` |
 | `SLINT_BACKEND`, `SLINT_DISABLE_D3D11`, `SLINT_USE_SOFTWARE` | Renderer selection (§1) |
+| `OPENVIEW_SCREENSHOT=1` | Test mode only: documentation screenshots. Normal title, no "TEST MODE" badge, demo device id `123 456 789 012`, demo relay `wss://relay.example.com/relay` (status, Settings field, outgoing relay), and only LAN hosts named `DEMO-…` (start a scratch `ovhost` with `COMPUTERNAME=DEMO-PC`) |
+| `OPENVIEW_SCREENSHOT_PAGE` | With `OPENVIEW_SCREENSHOT`: start page `remote` (default), `settings` or `about` |
+| `OPENVIEW_SCREENSHOT_THEME` | With `OPENVIEW_SCREENSHOT`: force `light` or `dark` (default: follow Windows) |
 
 The theme follows the Windows app theme (`AppsUseLightTheme`) and reacts to
 `ImmersiveColorSet` changes.

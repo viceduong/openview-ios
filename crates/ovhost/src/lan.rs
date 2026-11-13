@@ -171,6 +171,16 @@ fn is_hello(d: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The LAN advert's TXT `v=` default and the handshake must agree, or
+    /// every viewer labels this host as "different version".
+    #[test]
+    fn advertised_txt_version_matches_the_handshake() {
+        assert_eq!(
+            ovdiscovery::mdns::TXT_PROTOCOL_VERSION,
+            ovcore::handshake::PROTOCOL_VERSION
+        );
+    }
     use super::*;
 
     #[test]
