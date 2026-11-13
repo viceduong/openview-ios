@@ -1,8 +1,7 @@
 //! UDP point-to-point carrier — the primary OpenView transport path
 //! (direct P2P after hole punching, or LAN via a discovered address).
-//! Spec §5 / implementation status v0.3; Phase 4 reliability.
 //!
-//! Phase 4 fixed the three reasons raw UDP lost most of every frame:
+//! Three measures keep raw UDP from losing most of every frame:
 //!
 //! - **Socket buffers**: `SO_RCVBUF`/`SO_SNDBUF` are raised to
 //!   [`SOCKET_BUFFER`] (the default ~64 KB could not hold one 400 KB burst).
@@ -11,7 +10,7 @@
 //!   <= 1.2 KB fragments (no IP fragmentation), selective ACKs, fast
 //!   retransmit + RTO, a congestion window and a pacing token bucket, and
 //!   in-order delivery (the record layer requires it). Before that the link
-//!   is in raw mode: byte-identical to the old carrier, for old peers.
+//!   is in raw mode: byte-identical to plain UDP, for peers without `CAP_RUDP`.
 //! - **Event-driven waits**: the socket is non-blocking for life, so it is
 //!   exposed via [`Carrier::raw_socket`] and loops block on it instead of
 //!   polling every 2 ms.

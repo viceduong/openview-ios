@@ -8,43 +8,28 @@
 //! receiver rejects a record whose seq doesn't match its expected counter.
 //!
 //! `record` is a re-export of this module (historical name).
-#![allow(dead_code)]
 
 use crate::session::Session;
 
+/// Record header length: `[sender_id u64][seq u32]`.
 pub const HEADER_LEN: usize = 12;
+/// Poly1305 tag length.
 pub const TAG_LEN: usize = 16;
+/// Smallest well-formed record (header + tag, empty payload).
 pub const MIN_RECORD_LEN: usize = HEADER_LEN + TAG_LEN;
 
-pub const fn not32(v: u32) -> u32 {
-    !v
-}
-
-// --- Little-endian byte writer/reader helpers (used by commands.rs) ---
+// --- Little-endian byte writers (used by commands.rs) ---
+/// Append `v` as 2 little-endian bytes.
 pub fn w16(o: &mut Vec<u8>, v: u16) {
     o.extend_from_slice(&v.to_le_bytes());
 }
+/// Append `v` as 4 little-endian bytes.
 pub fn w32(o: &mut Vec<u8>, v: u32) {
     o.extend_from_slice(&v.to_le_bytes());
 }
+/// Append `v` as 8 little-endian bytes.
 pub fn w64(o: &mut Vec<u8>, v: u64) {
     o.extend_from_slice(&v.to_le_bytes());
-}
-/// Little-endian readers: `None` on short input (never panic on peer bytes).
-pub(crate) fn r16(b: &[u8], off: &mut usize) -> Option<u16> {
-    let v = u16::from_le_bytes(b.get(*off..off.checked_add(2)?)?.try_into().ok()?);
-    *off += 2;
-    Some(v)
-}
-pub(crate) fn r32(b: &[u8], off: &mut usize) -> Option<u32> {
-    let v = u32::from_le_bytes(b.get(*off..off.checked_add(4)?)?.try_into().ok()?);
-    *off += 4;
-    Some(v)
-}
-pub(crate) fn r64(b: &[u8], off: &mut usize) -> Option<u64> {
-    let v = u64::from_le_bytes(b.get(*off..off.checked_add(8)?)?.try_into().ok()?);
-    *off += 8;
-    Some(v)
 }
 
 /// Encode the 12-byte record header.
@@ -73,10 +58,12 @@ pub fn seq_matches(expected_counter: u64, header_seq: u32) -> bool {
 
 /// A thin record writer/reader bound to a Session.
 pub struct Recorder<'a> {
+    /// The session whose keys and counters seal/open the records.
     pub session: &'a mut Session,
 }
 
 impl<'a> Recorder<'a> {
+    /// Bind a recorder to `session`.
     pub fn new(session: &'a mut Session) -> Self {
         Self { session }
     }
@@ -103,18 +90,6 @@ mod tests {
         assert_eq!(sid, 0x0102_0304_0506_0708);
         assert_eq!(seq, 0xdead_beef);
         assert!(parse_header(&h[..11]).is_none());
-    }
-
-    #[test]
-    fn readers_reject_short_input() {
-        let b = [1u8, 0, 0, 0, 0, 0, 0, 0];
-        let mut off = 0;
-        assert_eq!(r16(&b, &mut off), Some(1));
-        assert_eq!(r32(&b, &mut off), Some(0));
-        assert_eq!(r64(&b, &mut off), None, "only 2 bytes left");
-        assert_eq!(off, 6, "a failed read does not advance");
-        let mut huge = usize::MAX;
-        assert_eq!(r16(&b, &mut huge), None, "no overflow panic");
     }
 
     #[test]

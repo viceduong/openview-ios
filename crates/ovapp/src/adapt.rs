@@ -1,4 +1,4 @@
-//! `ovapp::adapt` — change detection + adaptive capture rate (v0.14).
+//! `ovapp::adapt` — change detection + adaptive capture rate.
 //!
 //! Desktops are mostly static; re-capturing and re-sending an unchanged
 //! screen at full fps wastes GDI cycles, DEFLATE encode time and bandwidth.
@@ -146,7 +146,7 @@ impl RateGovernor {
         self.interval
     }
 
-    /// Retarget the full-motion rate (v0.17): the auto-quality loop calls
+    /// Retarget the full-motion rate: the auto-quality loop calls
     /// this every capture tick with the RTT-derived (or manually requested)
     /// base fps. Only the base target changes — the current interval and the
     /// idle streak are left alone, so the idle ease-out continues smoothly
@@ -220,7 +220,7 @@ pub struct QualityDecision {
     pub degraded: bool,
 }
 
-/// Auto-quality rule (AUTO mode; replaces the v0.17 RTT bands), in the
+/// Auto-quality rule (AUTO mode), in the
 /// spirit of RustDesk's `video_qos`: it is driven by the **excess queueing
 /// delay** the link pacer measures ([`crate::pacing::LinkPacer::queue_delay`],
 /// RTT above the path's minimum) — never by the raw RTT, so a long but
@@ -251,6 +251,7 @@ impl Default for AutoQuality {
 }
 
 impl AutoQuality {
+    /// A fresh controller at full rate and full bitrate.
     pub fn new() -> Self {
         Self {
             ratio: 1.0,

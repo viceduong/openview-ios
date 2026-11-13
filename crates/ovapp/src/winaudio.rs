@@ -1,9 +1,8 @@
-//! WinMM audio devices shared by `ovhost` and `ovview` (Phase 4).
+//! WinMM audio devices shared by `ovhost` and `ovview`.
 //!
-//! Before Phase 4 each binary carried its own copy of a `waveIn` mic and a
-//! `waveOut` speaker, both polling a single header's `WHDR_DONE` bit with
-//! `sleep(2)` (a non-volatile read of memory the driver writes). This module
-//! replaces them with **event-driven** devices:
+//! Both devices are **event-driven** (no polling of a header's `WHDR_DONE`
+//! bit with sleeps, which would also be a non-volatile read of memory the
+//! driver writes):
 //!
 //! - [`WinmmMic`]: `CALLBACK_EVENT` + a ring of [`MIC_BUFFERS`] x 20 ms
 //!   buffers (200 ms of slack). `read_tick` blocks on the event until the
@@ -11,8 +10,8 @@
 //!   always has buffers to fill and no captured audio is ever dropped — a
 //!   reader that stalls < 200 ms just drains several completed buffers back
 //!   to back. Headers are re-queued with `WHDR_PREPARED` intact (clearing
-//!   all flags, as the old code did, makes `waveInAddBuffer` refuse them).
-//! - [`WinmmSpeaker`] + [`spawn_playback`]: [`SPEAKER_BUFFERS`] rotating
+//!   all flags makes `waveInAddBuffer` refuse them).
+//! - [`WinmmSpeaker`] + [`spawn_playback`]: `SPEAKER_BUFFERS` rotating
 //!   20 ms headers; the playback thread refills every completed header from
 //!   the [`AudioBus`] jitter buffer and sleeps on the device event in
 //!   between, so the device never starves while the thread is asleep.
@@ -27,11 +26,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::{AudioBus, MicSource, SAMPLE_RATE, TICK_SAMPLES};
+use crate::error::AppError;
 
 /// waveIn buffers in the capture ring (x 20 ms = 200 ms of slack).
 pub const MIC_BUFFERS: usize = 10;
 /// waveOut buffers rotating under playback (x 20 ms).
-pub const SPEAKER_BUFFERS: usize = 3;
+pub(crate) const SPEAKER_BUFFERS: usize = 3;
 
 #[allow(non_snake_case, clippy::upper_case_acronyms, dead_code)]
 mod ffi {
@@ -132,11 +132,11 @@ mod ffi {
 struct Event(ffi::Handle);
 
 impl Event {
-    fn new() -> Result<Self, String> {
+    fn new() -> Result<Self, AppError> {
         // SAFETY: plain object creation; closed in Drop.
         let h = unsafe { ffi::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         if h == 0 {
-            return Err("CreateEventW failed".into());
+            return Err(AppError::platform("CreateEventW failed"));
         }
         Ok(Self(h))
     }
@@ -236,7 +236,7 @@ unsafe impl Send for WinmmMic {}
 impl WinmmMic {
     /// Open the default input device. Errors (no device, denied access)
     /// surface as `Err`, never a panic.
-    pub fn open() -> Result<Self, String> {
+    pub fn open() -> Result<Self, AppError> {
         let event = Event::new()?;
         let fmt = ffi::pcm_format();
         let mut hwi: usize = 0;
@@ -252,7 +252,9 @@ impl WinmmMic {
             )
         };
         if err != ffi::MMSYSERR_NOERROR {
-            return Err(format!("waveInOpen failed (error {err}) — no microphone?"));
+            return Err(AppError::platform(format!(
+                "waveInOpen failed (error {err}) — no microphone?"
+            )));
         }
         let mic = Self {
             hwi,
@@ -264,18 +266,24 @@ impl WinmmMic {
             // SAFETY: header + buffer live in `mic.ring` (stable addresses).
             let err = unsafe { ffi::waveInPrepareHeader(hwi, h, ffi::HDR_SIZE) };
             if err != ffi::MMSYSERR_NOERROR {
-                return Err(format!("waveInPrepareHeader failed (error {err})"));
+                return Err(AppError::platform(format!(
+                    "waveInPrepareHeader failed (error {err})"
+                )));
             }
             // SAFETY: prepared header we own.
             let err = unsafe { ffi::waveInAddBuffer(hwi, h, ffi::HDR_SIZE) };
             if err != ffi::MMSYSERR_NOERROR {
-                return Err(format!("waveInAddBuffer failed (error {err})"));
+                return Err(AppError::platform(format!(
+                    "waveInAddBuffer failed (error {err})"
+                )));
             }
         }
         // SAFETY: handle from a successful open.
         let err = unsafe { ffi::waveInStart(hwi) };
         if err != ffi::MMSYSERR_NOERROR {
-            return Err(format!("waveInStart failed (error {err})"));
+            return Err(AppError::platform(format!(
+                "waveInStart failed (error {err})"
+            )));
         }
         Ok(mic)
     }
@@ -329,7 +337,7 @@ impl Drop for WinmmMic {
 }
 
 /// The default output device: WinMM `waveOut`, 48 kHz mono s16le, with
-/// [`SPEAKER_BUFFERS`] rotating headers and a completion event.
+/// `SPEAKER_BUFFERS` rotating headers and a completion event.
 pub struct WinmmSpeaker {
     hwo: usize,
     event: Event,
@@ -342,7 +350,7 @@ unsafe impl Send for WinmmSpeaker {}
 
 impl WinmmSpeaker {
     /// Open the default output device.
-    pub fn open() -> Result<Self, String> {
+    pub fn open() -> Result<Self, AppError> {
         let event = Event::new()?;
         let fmt = ffi::pcm_format();
         let mut hwo: usize = 0;
@@ -358,7 +366,9 @@ impl WinmmSpeaker {
             )
         };
         if err != ffi::MMSYSERR_NOERROR {
-            return Err(format!("waveOutOpen failed (error {err}) — no speaker?"));
+            return Err(AppError::platform(format!(
+                "waveOutOpen failed (error {err}) — no speaker?"
+            )));
         }
         let spk = Self {
             hwo,
@@ -370,7 +380,9 @@ impl WinmmSpeaker {
             // SAFETY: header + buffer live in `spk.ring`.
             let err = unsafe { ffi::waveOutPrepareHeader(hwo, h, ffi::HDR_SIZE) };
             if err != ffi::MMSYSERR_NOERROR {
-                return Err(format!("waveOutPrepareHeader failed (error {err})"));
+                return Err(AppError::platform(format!(
+                    "waveOutPrepareHeader failed (error {err})"
+                )));
             }
         }
         Ok(spk)
@@ -388,7 +400,7 @@ impl WinmmSpeaker {
 
     /// Queue one tick produced by `fill` into a free header, if any.
     /// Returns `Ok(false)` when every header is still playing.
-    pub fn feed(&mut self, fill: impl FnOnce(&mut [i16])) -> Result<bool, String> {
+    pub fn feed(&mut self, fill: impl FnOnce(&mut [i16])) -> Result<bool, AppError> {
         let Some(i) = self.free_slot() else {
             return Ok(false);
         };
@@ -398,7 +410,9 @@ impl WinmmSpeaker {
         // SAFETY: prepared header we own, not queued.
         let err = unsafe { ffi::waveOutWrite(self.hwo, self.ring.hdrs[i], ffi::HDR_SIZE) };
         if err != ffi::MMSYSERR_NOERROR {
-            return Err(format!("waveOutWrite failed (error {err})"));
+            return Err(AppError::platform(format!(
+                "waveOutWrite failed (error {err})"
+            )));
         }
         self.queued[i] = true;
         Ok(true)

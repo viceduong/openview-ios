@@ -11,28 +11,44 @@ relative to the repository root.
 
 | File | Role |
 |---|---|
-| `crates/ovhost/src/main.rs` | Argument parsing, session setup, relay parking, handshake, the serve loops, capture thread, quality control |
+| `crates/ovhost/src/main.rs` | Process lifecycle: logging, data dir, cleanup and desktop-effects recovery, direct-path start, the one-shot or `--service` loop |
+| `crates/ovhost/src/cli.rs` | `clap` options (`--relay` parses into `ovcommon::relay_addr::RelayAddr`) |
+| `crates/ovhost/src/settings.rs` | Process-wide switches set once from the command line |
+| `crates/ovhost/src/session/mod.rs` | `listen_once`: identity, waiting for a viewer (`acquire`: relay park with `dial` for TCP or WebSocket relays, and the LAN listener), handshake, choice of serve loop; clipboard poll |
+| `crates/ovhost/src/lan.rs` | `LanListener`: the LAN session port (UDP, default 4571) that takes a viewer's HELLO without the relay |
+| `crates/ovhost/src/session/screen.rs` | `serve_screen` / `screen_session_loop`: capture and mic threads, the session thread that owns the wire |
+| `crates/ovhost/src/session/capture_loop.rs` (+ `capture_loop/tests.rs`) | The capture thread: grab, tile / H.264 encode, rate and quality control, metrics |
+| `crates/ovhost/src/session/terminal.rs` | `serve_terminal`: the terminal-mode loop |
+| `crates/ovhost/src/session/hooks.rs` (+ `hooks/tests.rs`) | `HostHooks`: the inbound-command hook shared by both loops (input, CAPS, quality, clipboard, audio, files, chat) |
+| `crates/ovhost/src/session/liveness.rs` | Keepalive PONG bookkeeping and the dead / gone verdicts |
+| `crates/ovhost/src/session/files.rs` | Saving received files and iOS diagnostic log uploads |
+| `crates/ovhost/src/session/fx.rs` | Per-session desktop effects (`SessionFx`) and their exit guarantee |
+| `crates/ovhost/src/session/direct.rs` | Direct-path event reporting (log and status events) |
 | `crates/ovhost/src/capture.rs` | `ScreenSource`: DXGI-or-GDI capture with fallback, plus the synthetic `--test-pattern` screens |
-| `crates/ovhost/src/dxgi.rs` | DXGI Desktop Duplication backend (Windows only) |
-| `crates/ovhost/src/cursor.rs` | Cursor position/shape tracking for the cursor overlay channel |
-| `crates/ovhost/src/input.rs` | Wire input commands into `SendInput` (plus a dry-run backend) |
+| `crates/ovhost/src/dxgi.rs` (+ `dxgi/tests.rs`) | DXGI Desktop Duplication backend (Windows only) |
+| `crates/ovhost/src/cursor/mod.rs` | Cursor position/shape tracking for the cursor overlay channel |
+| `crates/ovhost/src/cursor/shape.rs`, `cursor/win32.rs`, `cursor/tests.rs` | Pure shape composition; Win32 polling and shape rendering; tests |
+| `crates/ovhost/src/input/mod.rs` | Wire input commands into `SendInput` (plus a dry-run backend) |
+| `crates/ovhost/src/input/geometry.rs`, `input/controller.rs`, `input/backend.rs`, `input/win32.rs`, `input/tests.rs` | Pure coordinate mapping; `InputController`; the backends and `sas_capability`; Win32 calls; tests |
+| `crates/ovhost/src/unattended.rs` | The persisted unattended identity and the device ID |
 | `crates/ovhost/src/mic.rs` | Microphone capture (re-exports the shared `ovapp` sources) |
 | `crates/ovhost/src/sysaudio.rs` | `--system-audio`: WASAPI loopback capture (Windows only) |
 | `crates/ovhost/src/speaker.rs` | `--audio`: plays the viewer's microphone |
 | `crates/ovhost/src/clipboard_os.rs` | Win32 clipboard read/write and sequence number |
-| `crates/ovhost/src/desktop_fx.rs` | Hide wallpaper / disable animations during a session, with crash recovery |
+| `crates/ovhost/src/desktop_fx.rs` (+ `desktop_fx/tests.rs`) | Hide wallpaper / disable animations during a session, with crash recovery |
 | `crates/ovhost/src/cleanup.rs` | Cleanup actions that run on exit, Ctrl-C, console close or panic |
 | `crates/ovhost/src/direct_net.rs` | Direct UDP path: socket, candidate gathering, STUN, UPnP |
 | `crates/ovhost/build.rs` | Includes `assets/winres.rs`: embeds the icon, an application manifest (asInvoker, supportedOS Windows 10/11, PerMonitorV2 DPI with the `true/pm` fallback) and VERSIONINFO (CompanyName "OpenView contributors", ProductName "OpenView", FileVersion = `CARGO_PKG_VERSION`); links `/DELAYLOAD:mfplat.dll` + `delayimp.lib` |
 
-The package is described in its manifest as *"OpenView listener service:
-accepts inbound terminal sessions (relay tunnel or direct UDP)"*. It depends on
-`ovcore`, `ovtransport`, `ovapp` (with the `zstd-encode`, `opus` and `mf`
-features: C zstd encoding, libopus and Media Foundation are host-only),
-`ovdiscovery`, `ovcommon` (feature `logging`: data dir, status events,
-logging), `clap`, `tracing`, `ovrelay` (used only by tests) and, on Windows, the `windows`
-0.58 crate for DXGI/D3D11, IP Helper, WASAPI and COM
-(`crates/ovhost/Cargo.toml`).
+The package is described in its manifest as *"OpenView host: makes this PC
+reachable through a relay (and a direct UDP path) and streams its screen"*. It
+depends on `ovcore`, `ovtransport` (feature `ws-client`: `ws://` / `wss://`
+relays), `ovapp` (with the `zstd-encode`, `opus` and `mf` features: C zstd
+encoding, libopus and Media Foundation are host-only), `ovdiscovery`,
+`ovcommon` (feature `logging`: data dir, relay addresses, status events,
+logging), `hex`, `clap`, `tracing` and, on Windows, the `windows` crate for
+DXGI/D3D11, IP Helper, WASAPI and COM. `ovrelay` is a dev-dependency used only
+by tests (`crates/ovhost/Cargo.toml`).
 
 For every flag, see [`../USAGE.md`](../USAGE.md#ovhost).
 
@@ -40,12 +56,12 @@ For every flag, see [`../USAGE.md`](../USAGE.md#ovhost).
 
 ## 1. Process lifecycle
 
-`main()` (`src/main.rs`) runs in this order:
+`main()` and `run()` (`src/main.rs`) run in this order:
 
 1. It parses the command line with `clap` (`Cli`; `--help`, `--version`;
    development switches are `hide = true`). Usage errors exit with code 2.
 2. `ovcommon::logging::init(-v count, --log-level)`: `tracing` to stderr
-   (see [ovcommon.md](ovcommon.md) §4). There is no runtime DPI call: the
+   (see [ovcommon.md](ovcommon.md) §5). There is no runtime DPI call: the
    embedded manifest declares PerMonitorV2, so capture, cursor, monitor and
    input coordinates are physical pixels.
 3. It stores the global switches (`--dry-input`, `--gdi`, `--h264`,
@@ -62,8 +78,11 @@ For every flag, see [`../USAGE.md`](../USAGE.md#ovhost).
 5. The PIN comes from `--pin` or the `OPENVIEW_PIN` environment variable
    (clap `env`); an empty PIN counts as none. A PIN implies `--unattended`;
    `--unattended` without one fails with `--unattended needs a PIN
-   (OPENVIEW_PIN or --pin)`. The relay is `--relay`, default `127.0.0.1:4569`
-   (`DEFAULT_RELAY`); no environment variable is read for it.
+   (OPENVIEW_PIN or --pin)`. The relay is `--relay <ADDR>`, default
+   `127.0.0.1:4569` (`DEFAULT_RELAY`); no environment variable is read for
+   it. `clap` parses it into `ovcommon::relay_addr::RelayAddr`, so it accepts
+   an IP, `hostname[:port]` (default port 4569, bare or bracketed IPv6 too) or
+   a `ws://` / `wss://` URL (see [ovcommon.md](ovcommon.md) §3).
 6. It creates the data dir (`--data-dir`, else the `ovcommon::paths` rule:
    `%LOCALAPPDATA%\OpenView`, or `<exe dir>\data` in portable mode).
 7. `cleanup::install()`, then `DesktopFx::recover_stale()` for the marker in
@@ -74,7 +93,16 @@ For every flag, see [`../USAGE.md`](../USAGE.md#ovhost).
    If this fails, ovhost warns `direct path disabled (UDP <port>: <err>)`,
    emits a `direct_path` / `disabled` status event and continues on the relay
    only.
-9. It enters one of two loops:
+9. `start_lan()`, unless `--no-lan` is set: binds the **LAN session port**
+   (`--lan-port`, default 4571; `0` = any free port). In unattended mode it
+   also starts an `ovdiscovery::mdns::Advertiser` for the process lifetime
+   (unless `--no-mdns`): instance `<device-id>._openview._udp.local`, SRV
+   port = the bound LAN port, TXT `id`, `v` (handshake version), `name`
+   (computer name). Its stop (the mDNS goodbye) is registered with the exit
+   cleanup. A `lan` status event reports `port` and `mdns`; if the port
+   cannot be bound, LAN sessions are off (`lan` without `port`, with
+   `detail`) and the host continues relay-only.
+10. It enters one of two loops:
    * **default**: one call to `listen_once()`, then exit. (`--listen` is a
      hidden no-op kept for compatibility.)
    * **`--service`**: calls `listen_once()` forever. After an error it sleeps
@@ -82,15 +110,16 @@ For every flag, see [`../USAGE.md`](../USAGE.md#ovhost).
      30 s (warning `session failed: <e>; retrying in <d>` plus a
      `session_failed` status event). A successful session resets the backoff
      to 1 s.
-10. On exit `cleanup::run_all()` deletes the UPnP mapping; a fatal error is
+11. On exit `cleanup::run_all()` deletes the UPnP mapping and sends the mDNS
+    goodbye; a fatal error is
     logged and emitted as an `error` status event, and the exit code is
     non-zero.
 
 ### Output: status events and logs
 
 stdout carries only JSON-lines status events (`ovcommon::status`, schema in
-[ovcommon.md](ovcommon.md) §3): `device_id` / `pairing_code`, `waiting`,
-`ready`, `peer_connected`, `peer_disconnected`, `direct_path`, `upnp`,
+[ovcommon.md](ovcommon.md) §4): `device_id` / `pairing_code`, `waiting`,
+`ready`, `peer_connected`, `peer_disconnected`, `direct_path`, `upnp`, `lan`,
 `session_failed`, `error`. Human logs go to stderr. At the default `info`
 level only lifecycle lines appear (startup, device ID or pairing code,
 waiting / `ready: parked on relay`, peer connected / disconnected, direct
@@ -104,9 +133,31 @@ kbps, media summary) are `debug` (`-v`); per-input-event lines are `trace`
 1. **Identity and authentication** (see §10).
 2. It logs the device ID (unattended) or the fingerprint and pairing code
    (attended), and emits the matching `device_id` / `pairing_code` status
-   event. `ovhost` never advertises over mDNS: its only `ovdiscovery` uses
-   are `stun` and `upnp`.
-3. **Relay park** (`park_until_attached`). It connects as the tunnel
+   event.
+3. **Wait for a viewer** (`acquire`): the relay park below and, when the LAN
+   listener runs, a viewer's HELLO on the LAN port (`LanListener::poll`,
+   checked every 200 ms while parked). Datagrams that queued up on the LAN
+   port during the previous session are discarded first. A LAN viewer wins
+   over an idle park (the relay slot is closed). With a LAN listener a relay
+   that cannot be reached is **not** an error: the host reports
+   `session_failed`, keeps serving the LAN port and retries the relay with a
+   backoff of 1 s doubling to 30 s.
+
+   **LAN viewer:** only a datagram starting with a handshake HELLO tag
+   (`0x11`, or the v1 `0x01`, which is answered with REJECT(incompatible))
+   is taken. The listener socket is handed to the session as a
+   `UdpP2pCarrier` connected to the viewer (raw datagrams, then the
+   reliable-UDP framing once both sides advertise `CAP_RUDP`); the HELLO is
+   fed to the server handshake and `set_auth_source(viewer IP)` enables the
+   per-source PIN attempt limit. After the session the port is bound again.
+   From here on the session is identical to a relayed one, including the
+   direct-path upgrade (the LAN carrier plays the relay's part).
+
+   **Relay park.** `dial()` opens the relay carrier:
+   a `Tcp` address through `RelayTunnelCarrier::connect_host` (hostnames
+   resolved, every address tried), a `WebSocket` address through
+   `RelayTunnelCarrier::connect_ws` (TLS for `wss://` through SChannel; see
+   [ovtransport.md](ovtransport.md) §6.4). It connects as the tunnel
    `Responder` and waits up to `PARK_WAIT` = 35 s to be attached. The relay
    drops an unclaimed park after its own 30 s window (the `XT` reply). That
    counts as normal idle time: the host parks again at once with the same
@@ -134,7 +185,7 @@ kbps, media summary) are `debug` (`-v`); per-input-event lines are `trace`
 
 | Thread | Created in | Owns / does |
 |---|---|---|
-| main / **session thread** | `main` → `serve_screen` / `serve_terminal` | Owns the `TerminalSession`. Pumps inbound traffic (the command hook injects input as soon as it is decoded), sends with priority, runs keepalive and liveness checks, polls the clipboard and cursor, encodes audio. |
+| main / **session thread** | `main` → `session::listen_once` → `serve_screen` / `serve_terminal` | Owns the `TerminalSession`. Pumps inbound traffic (the command hook injects input as soon as it is decoded), sends with priority, runs keepalive and liveness checks, polls the clipboard and cursor, encodes audio. |
 | `ovhost-capture` | `serve_screen` | Owns the `ScreenSource`, since GDI DCs and the DXGI device must stay on the thread that created them. Runs `capture_loop`: grab → `UpdateEncoder` (tiles) and `VideoSession` (H.264) → single-slot `FrameMailbox`. Registered with MMCSS under the task name `"Capture"` (`AvSetMmThreadCharacteristicsW`). |
 | mic thread | `spawn_mic` (only with `--mic`, `--mic-synth` or `--system-audio`) | Runs `ovapp::audio::run_mic_loop`. Sends PCM ticks over an `mpsc` channel and wakes the session thread. |
 | speaker thread | `speaker::spawn` (only with `--audio`) | Drains the `AudioBus` jitter buffer into WinMM `waveOut`. It is joined when `HostHooks` is dropped, so it does not outlive the session. |
@@ -143,25 +194,25 @@ kbps, media summary) are `debug` (`-v`); per-input-event lines are `trace`
 The session thread does not sleep on a fixed timer. It blocks in
 `ovapp::netwait::Wakeup::wait`, which wakes on socket readability, a mailbox
 wake (new frame), a mic tick, or a computed deadline (cursor poll, pacer,
-transport retransmit timer). The constants in `src/main.rs` are:
+transport retransmit timer). The constants (in `src/session/`) are:
 
-| Constant | Value | Meaning |
-|---|---|---|
-| `CLIPBOARD_POLL` | 50 ms | OS clipboard sequence-number poll |
-| `CURSOR_POLL` | 8 ms | Cursor poll while the cursor is idle |
-| `CURSOR_POLL_ACTIVE` | 4 ms | Cursor poll while it is moving (keeps the 120 Hz cap reachable) |
-| `CURSOR_ACTIVE_FOR` | 250 ms | How long after the last move the fast poll continues |
-| `UNWATCHED_WAIT` | 2 ms | Longest wait when the socket cannot be watched |
-| `TERMINAL_IDLE_WAIT` | 50 ms | Longest idle wait in terminal mode |
-| (screen mode cap) | 50 ms | Longest idle wait in screen mode when the socket is watched |
-| `METRICS_EVERY` | 30 s | Interval between capture, pacing and media metric lines |
-| `IDLE_FPS` | 4 | Governor rate for a static screen |
-| `VIDEO_FPS` | 30 | Minimum capture rate while a region streams as H.264 (AUTO only) |
-| `FRAME_CHUNK` | `ovapp::sendq::DEFAULT_CHUNK` = 4096 B | FRAME_DATA chunk size |
+| Constant | File | Value | Meaning |
+|---|---|---|---|
+| `CLIPBOARD_POLL` | `mod.rs` | 50 ms | OS clipboard sequence-number poll |
+| `CURSOR_POLL` | `screen.rs` | 8 ms | Cursor poll while the cursor is idle |
+| `CURSOR_POLL_ACTIVE` | `screen.rs` | 4 ms | Cursor poll while it is moving (keeps the 120 Hz cap reachable) |
+| `CURSOR_ACTIVE_FOR` | `screen.rs` | 250 ms | How long after the last move the fast poll continues |
+| `UNWATCHED_WAIT` | `mod.rs` | 2 ms | Longest wait when the socket cannot be watched |
+| `TERMINAL_IDLE_WAIT` | `terminal.rs` | 50 ms | Longest idle wait in terminal mode |
+| (screen mode cap) | `screen.rs` | 50 ms | Longest idle wait in screen mode when the socket is watched |
+| `METRICS_EVERY` | `capture_loop.rs` | 30 s | Interval between capture, pacing and media metric lines |
+| `IDLE_FPS` | `capture_loop.rs` | 4 | Governor rate for a static screen |
+| `VIDEO_FPS` | `capture_loop.rs` | 30 | Minimum capture rate while a region streams as H.264 (AUTO only) |
+| `FRAME_CHUNK` | `screen.rs` | `ovapp::sendq::DEFAULT_CHUNK` = 4096 B | FRAME_DATA chunk size |
 
 ### Send priority (screen mode)
 
-`screen_session_loop` uses `ovapp::sendq::PrioritySender`. **Control traffic
+`screen_session_loop` (`session/screen.rs`) uses `ovapp::sendq::PrioritySender`. **Control traffic
 is always sent first**: PONG, PING, CURSOR/CURSOR_SHAPE, AUDIO (when the media
 channel is closed), CLIPBOARD, chat echo and MONITORS_INFO. After that it sends
 **one** frame record per loop turn, with at most one frame in flight, and goes
@@ -175,7 +226,8 @@ Two hidden A/B switches exist for benchmarks only:
 
 * `--no-media`: clears `CAP_MEDIA`, so there is no media channel and no v2
   congestion control.
-* `--no-pacing`: disables the link pacer (the pre-Phase-4 behaviour).
+* `--no-pacing`: disables the link pacer, so frames are sent as fast as the
+  transport accepts them.
 
 ---
 
@@ -268,7 +320,7 @@ before the first frame.
 
 ## 4. Encoding and quality control
 
-This is driven by `capture_loop` (`src/main.rs`). The codecs themselves live
+This is driven by `capture_loop` (`src/session/capture_loop.rs`). The codecs themselves live
 in `ovapp`.
 
 * **Tile updates**: `ovapp::sendq::UpdateEncoder` diffs each capture against
@@ -276,14 +328,14 @@ in `ovapp`.
   nothing. The viewer's CAPS select what is allowed (tiles, zstd, LZ4 bands,
   copy-rect moves). A viewer that never sent CAPS (peer caps 0) gets full
   DEFLATE frames only.
-* **Wave 2 lossy-first**: image-like tiles go out as JPEG at quality
+* **Lossy-first tiles**: image-like tiles go out as JPEG at quality
   `--lossy Q` (default `ovapp::lossy::DEFAULT_QUALITY` = 75), but only to a
   viewer with `CAP_LOSSY`. Settled lossy tiles are then *refined* to exact
   pixels by a "refinement lane" that sends small exact chunks whenever the
   mailbox is free, without needing a capture. `--lossless` disables lossy
   tiles. A tile cache (`CACHE REF`/`STORE`, `CAP_CACHE`) is on by default;
   `--no-tile-cache` disables it.
-* **H.264 for motion (Phase 5)**: `ovapp::video::VideoSession` finds
+* **H.264 for motion**: `ovapp::video::VideoSession` finds
   high-motion regions and streams them as H.264 through Media Foundation
   (`ovapp::mfcodec::MfVideoEncoder`). Conditions: the viewer advertised
   `CAP_H264` and `--h264` is not `off`. Encoder preference: `auto` (hardware
@@ -322,7 +374,7 @@ IDR).
 
 ---
 
-## 5. Cursor overlay (`src/cursor.rs`)
+## 5. Cursor overlay (`src/cursor/`)
 
 The cursor is tracked separately from frames. The idea is that cheap `CURSOR`
 (position) and `CURSOR_SHAPE` (bitmap) commands let the viewer draw the cursor
@@ -351,14 +403,14 @@ on top of frames that may arrive at only 4 fps when the screen is idle.
 
 ---
 
-## 6. Input injection (`src/input.rs`)
+## 6. Input injection (`src/input/`)
 
 Input is injected **only in screen mode**. In terminal mode the input hook has
 no controller, so pointer and key commands are only logged (at `trace`, `-vv`).
 
 The work is split into three layers:
 
-1. **Pure mapping** (unit-tested):
+1. **Pure mapping** (`input/geometry.rs`, unit-tested):
    * `map_to_region` turns a normalised 0..=65535 point into a pixel inside the
      captured `Region`.
    * `to_virtual_desk` turns that pixel into
@@ -366,7 +418,7 @@ The work is split into three layers:
      whole virtual screen, including negative origins.
    * `VirtualScreen::query()` uses `GetSystemMetrics(SM_*VIRTUALSCREEN)` and
      falls back to 1x1 when the metrics are unusable.
-2. **`InputController`** translates wire commands into `InputOp`s:
+2. **`InputController`** (`input/controller.rs`) translates wire commands into `InputOp`s:
    * Legacy commands: `POINTER` (left button only) and `KEY` (VK only).
    * Input v2 (`CAP_INPUT2`, always advertised by this host):
      * `POINTER_EX`: absolute or relative moves. A relative move is clamped to
@@ -386,7 +438,7 @@ The work is split into three layers:
      * when the controller is dropped;
      * after **`STUCK_RELEASE_AFTER` = 30 s** with no input while something is
        still held (`released N stuck key(s)/button(s) after 30s without input`).
-3. **Backends**:
+3. **Backends** (`input/backend.rs`, Win32 calls in `input/win32.rs`):
    * `SendInputBackend` performs the real `SendInput`, `GetCursorPos` and
      `SendSAS` calls. If the OS refuses a batch, the hook logs `input injection
      refused (blocked desktop / UIPI?)`.
@@ -482,8 +534,8 @@ demotion and probe events are logged as `direct: <event>`.
   The socket(s) are bound once per process (`DirectSockets::bind`, IPv4 and
   IPv6 when available) and cloned for each session.
 * **Candidates**, de-duplicated:
-  1. Every unicast IPv4 address of every operational adapter
-     (`GetAdaptersAddresses`), plus the default-route address toward 8.8.8.8.
+  1. Every usable LAN IPv4 address (`ovdiscovery::netif`, built on
+     `GetAdaptersAddresses`), the default-route address toward 8.8.8.8 first.
   2. `127.0.0.1:<port>`.
   3. A global IPv6 address (2000::/3) toward `2001:4860:4860::8888`, if an IPv6
      socket exists.
@@ -505,6 +557,8 @@ demotion and probe events are logged as `direct: <event>`.
 * The hidden `--direct-advertise A:P[,A:P]` **replaces** the gathered list and also
   disables UPnP. It is meant for benchmarks and network emulators.
 * `--no-direct` keeps the session on the relay only.
+* **LAN addresses** (candidate 1) come from `ovdiscovery::netif::lan_ipv4s()`:
+  loopback, link-local, tunnel and host-only virtual adapters are left out.
 
 The log line `direct path on UDP <port> (candidates: ...)` shows what
 will be offered; the socket state is also emitted as a `direct_path` status
@@ -521,7 +575,7 @@ auth modes in `listen_once()`:
 
 | | Attended (default) | Unattended (a PIN via `OPENVIEW_PIN` or `--pin`; `--unattended` is implied) |
 |---|---|---|
-| Identity | `Identity::generate()`: a **fresh identity on every `listen_once`**, so `--service` without a PIN gets a new code for each session | Loaded from or created in **`<data dir>\ovhost-unattended.id`** (`load_or_create_unattended_identity`; default `%LOCALAPPDATA%\OpenView`), so it stays the same across runs. A file left next to the exe by an older release is copied over once (`ovcommon::paths::migrate_file`), so the device ID survives the upgrade |
+| Identity | `Identity::generate()`: a **fresh identity on every `listen_once`**, so `--service` without a PIN gets a new code for each session | Loaded from or created in **`<data dir>\ovhost-unattended.id`** (`unattended::load_or_create_identity`; default `%LOCALAPPDATA%\OpenView`), so it stays the same across runs. A file left next to the exe by an older release is copied over once (`ovcommon::paths::migrate_file`), so the device ID survives the upgrade |
 | What the operator shares | The **pairing code** (log `pairing code <code>`, status event `pairing_code`, a short 6-digit display code from `Identity::pairing_code`) | The **device ID** (log `device id <n> (unattended)`, status event `device_id`) and the PIN |
 | Relay session ID | The code's first 4 ASCII bytes as a big-endian `u32` | The low 32 bits of the device ID |
 | Handshake auth | `Auth::PairingCode(code)` | `Auth::Pin(psk)`, where `psk = ovcore::pin::pin_psk(pin)`: PBKDF2-HMAC-SHA256, 10 000 iterations, salt `openview-pin-v1` |
@@ -546,7 +600,8 @@ auth modes in `listen_once()`:
 ### "Service" / unattended operation
 
 There is **no Windows Service (SCM) integration** in `ovhost`. `--service` is a
-loop with backoff: "the Windows-service stand-in for the demo" (module doc).
+loop with backoff ("serve sessions forever (back off after errors) instead of
+exactly one", `cli.rs`).
 Unattended start-up is done in one of two ways:
 
 * starting `ovrelay` and `ovhost --service` with `OPENVIEW_PIN` set
@@ -569,7 +624,7 @@ Unattended start-up is done in one of two ways:
 * **Files**:
   * The hidden `--send-file <path>` sends one file straight after the
     handshake.
-  * Received files (file-ID-keyed v0.24 transfers) are saved to
+  * Received files (file-ID-keyed transfers, `session/files.rs`) are saved to
     **`Downloads\OpenView\<sanitized name>`** (`ovcommon::paths::received_files_dir`,
     the Downloads known folder), never overwriting an existing file
     (`unique_path`: `name (2).ext`, ...).
@@ -599,19 +654,19 @@ Every decoded inbound record, of any kind, refreshes liveness.
 
 | Constant | Where | Value |
 |---|---|---|
-| `DEFAULT_RELAY` | `main.rs` | `127.0.0.1:4569` |
-| `PARK_WAIT` | `main.rs` | 35 s |
-| `HANDSHAKE_AFTER_ATTACH` | `main.rs` | 10 s |
-| `MIN_PARK` | `main.rs` | 2 s |
-| `MAX_AUTO_FPS` | `main.rs` | 60 by default (`--max-fps`, clamped to 240) |
-| `--fps` default | `main.rs` | 10 |
+| `DEFAULT_RELAY` | `cli.rs` | `127.0.0.1:4569` |
+| `PARK_WAIT` | `session/mod.rs` | 35 s |
+| `HANDSHAKE_AFTER_ATTACH` | `session/mod.rs` | 10 s |
+| `MIN_PARK` | `session/mod.rs` | 2 s |
+| `MAX_AUTO_FPS` | `settings.rs` | 60 by default (`--max-fps`, clamped to 240) |
+| `--fps` default | `cli.rs` | 10 |
 | `DXGI_RETRY` | `capture.rs` | 2 s |
 | `DXGI_INITIAL_WAIT_MS` | `capture.rs` | 1000 |
 | `MAX_RECT_COPIES` | `dxgi.rs` | 32 |
 | `FULL_REFRESH_EVERY` | `dxgi.rs` | 300 |
-| `CURSOR_MAX_HZ` | `cursor.rs` | 120 |
-| `MAX_GDI_CURSOR_DIM` | `cursor.rs` | 1024 |
-| `STUCK_RELEASE_AFTER` | `input.rs` | 30 s |
+| `CURSOR_MAX_HZ` | `cursor/mod.rs` | 120 |
+| `MAX_GDI_CURSOR_DIM` | `cursor/win32.rs` | 1024 |
+| `STUCK_RELEASE_AFTER` | `input/mod.rs` | 30 s |
 | `PERIOD_HNS` | `sysaudio.rs` | 100 000 (10 ms) |
 | `DEFAULT_DIRECT_PORT` | `direct_net.rs` | 4570 |
 | `UPNP_LEASE` | `direct_net.rs` | 3600 s, refreshed every 60 s |
@@ -636,23 +691,30 @@ Network:
 
 | Direction | Port | Purpose |
 |---|---|---|
-| Outbound TCP | `--relay` (default `127.0.0.1:4569`) | Park on the relay |
-| Inbound UDP | `0.0.0.0:4570` and `[::]:4570` (`--direct-port`) | Direct path; the only inbound port the host needs. UPnP maps it on the router unless `--no-upnp`. |
+| Outbound TCP | `--relay` (default `127.0.0.1:4569`; a `ws://` / `wss://` URL uses its port, 80 / 443 by default) | Park on the relay |
+| Inbound UDP | `0.0.0.0:4570` and `[::]:4570` (`--direct-port`) | Direct path; the only inbound port the host needs from the Internet. UPnP maps it on the router unless `--no-upnp`. |
+| Inbound UDP | `0.0.0.0:4571` (`--lan-port`; `--no-lan` turns it off) | LAN sessions without the relay (viewers on the same network) |
+| UDP 5353 (shared) | `224.0.0.251:5353` | mDNS announcements and answers (unattended mode; `--no-mdns` turns it off) |
 | Outbound UDP | `--stun` (default `stun.cloudflare.com:3478`) | Public address discovery |
 
 ## 15. Tests in the crate
 
-`src/main.rs` unit tests cover:
+Session unit tests (`src/session/`) cover:
 
-* the AUTO fps rule;
-* the peer-state classification;
-* `capture_hold`;
-* re-parking after a relay `XT` (against a real in-process `ovrelay::Relay`);
-* the static-screen idle behaviour;
-* CAPS, keyframe and IDR propagation;
-* input v1 and v2 reaching the controller;
-* `QUALITY_SET`.
+* the AUTO fps rule, `capture_hold`, the static-screen idle behaviour and the
+  metrics line format (`capture_loop/tests.rs`);
+* the peer-state classification (`liveness.rs`);
+* re-parking after a relay `XT` against a real in-process `ovrelay::Relay`
+  (`mod.rs`);
+* the LAN path end to end: mDNS advertise of a scratch device ID → resolve →
+  PIN handshake and datagram exchange over the LAN carrier, with an
+  unreachable relay (`mod.rs`); the LAN listener's HELLO filter, hand-over
+  and re-bind (`lan.rs`);
+* CAPS, keyframe and IDR propagation, input v1 and v2 reaching the
+  controller, `QUALITY_SET` and chat payloads (`hooks/tests.rs`);
+* received-file handling (`files.rs`).
 
-`capture.rs`, `dxgi.rs`, `cursor.rs`, `input.rs`, `desktop_fx.rs`,
-`cleanup.rs` and `sysaudio.rs` each have their own tests. The DXGI and WASAPI
+`capture.rs`, `dxgi/tests.rs`, `cursor/tests.rs`, `input/tests.rs`,
+`desktop_fx/tests.rs`, `cleanup.rs`, `direct_net.rs`, `mic.rs`, `speaker.rs`
+and `sysaudio.rs` have their own tests. The DXGI and WASAPI
 tests are CI-safe: they degrade gracefully when no device exists.

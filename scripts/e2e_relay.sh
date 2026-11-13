@@ -17,7 +17,8 @@
 #   * ovhost exits 0 and its log shows "peer connected" and the decrypted line
 #
 # Usage:  scripts/e2e_relay.sh [PORT]
-#   PORT  optional relay port (default 14569).
+#   PORT  optional relay port (default 14569); the host's direct UDP path
+#         uses PORT+1.
 #
 # Cross-platform: builds the Windows .exe under git-bash/MSYS, the plain
 # binary under Linux/macOS. Run from anywhere; it locates the workspace root.
@@ -89,7 +90,11 @@ done
 
 # --- 2. host (publishes the pairing code) ----------------------------------
 echo "[2/4] starting host (listener) on relay $RELAY"
-"$BIN/ovhost$EXE" --listen --relay "$RELAY" >"$TMP/host.log" 2>&1 &
+# Scratch direct-path port (never the default UDP 4570, which a running
+# OpenView host on this machine owns), no LAN listener (UDP 4571) and no
+# router / STUN traffic.
+"$BIN/ovhost$EXE" --listen --relay "$RELAY" --direct-port "$((PORT + 1))" \
+  --no-lan --no-upnp --no-stun --data-dir "$TMP/hostdata" >"$TMP/host.log" 2>&1 &
 HOST_PID=$!
 code=""
 for _ in $(seq 1 75); do

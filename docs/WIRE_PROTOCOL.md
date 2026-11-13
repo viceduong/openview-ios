@@ -34,7 +34,7 @@ Per-crate details: [ovcore](crates/ovcore.md) · [ovtransport](crates/ovtranspor
  └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-The shells use these combinations: **relay tunnel** (always the first path), **relay + direct upgrade** (`DirectCarrier`), and the LAN/TCP carriers. A session is a handshake followed by records. Records do not depend on the path, so the direct path can take over sending without a re-handshake.
+The shells use these combinations: **relay tunnel** (the first path for remote sessions), **LAN UDP P2P** (a viewer on the host's network dials its LAN port directly, no relay), **relay or LAN + direct upgrade** (`DirectCarrier`), and the TCP carrier. A session is a handshake followed by records. Records do not depend on the path, so the direct path can take over sending without a re-handshake.
 
 ---
 
@@ -46,10 +46,10 @@ The relay keys pairing on a u32 that clients choose:
 
 | Mode | session_id | Source |
 |---|---|---|
-| Attended (6-digit code) | first 4 ASCII bytes of the code, as u32 BE (e.g. `"123456"` → `0x31323334`) | `crates/ovffi/src/lib.rs` `relay_session_id`, `ovview/examples/input_smoke.rs`, tests |
+| Attended (6-digit code) | first 4 ASCII bytes of the code, as u32 BE (e.g. `"123456"` → `0x31323334`) | `crates/ovffi/src/relay.rs` `relay_session_id`, `ovview/examples/input_smoke.rs`, tests |
 | Unattended (device ID) | `device_id & 0xFFFF_FFFF` | `crates/ovapp/tests/unattended_over_relay.rs` `session_id_of` |
 
-The device ID is `u64::from_be_bytes([0, 0, 0, fp[0], fp[1], fp[2], fp[3], fp[4]])`, where `fp` is the identity fingerprint (`ovffi::device_id_from_fp`, the same recipe in `ovview` and `ovhost`). Its top 3 bytes are always zero, and §6.3 depends on that.
+The device ID is `u64::from_be_bytes([0, 0, 0, fp[0], fp[1], fp[2], fp[3], fp[4]])`, where `fp` is the identity fingerprint (`device_id_from_fp` in `crates/ovffi/src/session.rs`, the same recipe in `ovview` and `ovhost`). Its top 3 bytes are always zero, and §6.3 depends on that.
 
 **The session ID is a rendezvous name, not a secret.** Both sides derive it from what the user has (a pairing code or device ID), so it cannot be random; widening it would not add secrecy. Confidentiality and peer authentication come entirely from the handshake (§3). What a guessed or squatted session ID allows is denial of service (parking on someone else's ID); the relay bounds that with per-IP and pending-session caps (§2.3). Widening the field to 64 bits (full device ID, 40 bits in use) is a possible later compatible-break change; it was deferred because it touches every client and the gain is only less accidental collision.
 
@@ -58,6 +58,7 @@ The device ID is `u64::from_be_bytes([0, 0, 0, fp[0], fp[1], fp[2], fp[3], fp[4]
 - **TCP:** connect to the relay port (default 4569 for the relay binary and every client; see [ovrelay.md §7](crates/ovrelay.md)).
 - **WebSocket:** `GET <any path> HTTP/1.1` with `Upgrade: websocket` and `Sec-WebSocket-Key`. The relay replies `101` with the RFC 6455 accept key. After that, the relay byte stream below travels inside WebSocket binary messages. Message boundaries carry no meaning, and the stream may be split anywhere.
   - Client frames may be at most 128 KiB and must be masked (RFC 6455 §5.1); an unmasked client frame closes the connection.
+  - Clients: the iOS app owns its WebSocket and feeds the stream to `RelayTunnelCarrier::connect_bridge`; `ovhost` and `ovview` (`--relay ws://…` / `wss://…`) use `RelayTunnelCarrier::connect_ws`, which sends each chunk as one masked binary message of at most 64 KiB (see [ovtransport.md §6.4](crates/ovtransport.md)). The codec on both sides is `ovtransport::ws`.
   - The relay sends WebSocket PINGs (`"ov"`) every 15 s while paired.
   - `GET /` and `GET /health` without an upgrade return `200 ovrelay\n`. Any other plain GET returns `426`.
 
@@ -91,8 +92,8 @@ relay  → client: 'X' 'T' | session_id u32 BE                (park timeout / re
 | 0x01 | PING | 8-byte nonce (u64 BE) | far **carrier** auto-replies PONG with the same payload |
 | 0x02 | PONG | echoed nonce | sets `last_pong` |
 | 0x03 | DISCONNECT | empty | relay forwards it, then closes both sides; carrier → `Closed` |
-| 0x04 | PROBE | u16 BE local UDP port | v0.5 hole-punch helper (tests only) |
-| 0x05 | PUNCH_ACK | u16 BE echoed port | v0.5 hole-punch helper (tests only) |
+| 0x04 | PROBE | u16 BE local UDP port | relay-assisted hole-punch helper (tests only) |
+| 0x05 | PUNCH_ACK | u16 BE echoed port | relay-assisted hole-punch helper (tests only) |
 
 Kinds above `0x05`, or a length above 65 532, are a fatal framing error for both the relay (`FrameCursor`) and the carrier (`FrameReader`). Clean EOF or a WebSocket CLOSE on one side makes the relay send `DISCONNECT` to the other side and then EOF.
 
@@ -362,7 +363,8 @@ The FEC ratio is `clamp(0.10 + 4·loss, 0.10, 0.30)`. Feedback drives a GCC-like
 | Item | Wire |
 |---|---|
 | `TcpCarrier` | `[len u16 BE][datagram]`, len ≤ 65 535 |
-| v0.5 hole punch (tests only) | PROBE / PUNCH_ACK tunnel frames; punch datagram = the single byte `0xFE`, 10 times at 100 ms |
+| Relay-assisted hole punch (tests only) | PROBE / PUNCH_ACK tunnel frames; punch datagram = the single byte `0xFE`, 10 times at 100 ms |
 | STUN (host candidate gathering) | RFC 5389 Binding Request (20 B, cookie `0x2112A442`); XOR-MAPPED-ADDRESS, falling back to MAPPED-ADDRESS; default server `stun.cloudflare.com:3478` |
 | UPnP | SSDP M-SEARCH to `239.255.255.250:1900` (plus unicast to `x.y.z.1`), then SOAP `AddPortMapping` / `GetExternalIPAddress` / `DeletePortMapping` on WANIPConnection:2/1 or WANPPPConnection:1 |
-| mDNS | `_openview._udp.local` (instance `openview-<fp4hex>`), `ov-<code>._openview._tcp.local`, TXT `id=<32 hex>`; PTR queries to `224.0.0.251:5353`. Browse only in shipped code; see [ovdiscovery.md §10](crates/ovdiscovery.md) |
+| mDNS / DNS-SD | Instance `<device-id>._openview._udp.local`: SRV port = the host's LAN session port (UDP 4571), target `openview-<id>.local`; TXT `id=<device id>`, `v=<handshake version>`, `name=<computer name>`; A/AAAA = the host's LAN addresses. Group `224.0.0.251:5353`; browsers query from an ephemeral port (legacy-unicast replies). See [ovdiscovery.md §3](crates/ovdiscovery.md) |
+| LAN session | The viewer sends its handshake HELLO (`0x11`) to the host's LAN port; the session then runs on that UDP 4-tuple exactly like a UDP P2P carrier (raw datagrams, rudp once `CAP_RUDP` is negotiated), PIN auth (or pairing code for an attended host); the direct upgrade may follow |

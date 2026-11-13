@@ -1,4 +1,4 @@
-//! Session liveness (v0.16): keepalive pacing, RTT measurement, dead-peer
+//! Session liveness: keepalive pacing, RTT measurement, dead-peer
 //! detection and link-health statistics.
 //!
 //! A low-rate PING keeps the

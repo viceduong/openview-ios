@@ -1,4 +1,4 @@
-//! Line-based chat over the terminal command channel (spec v0.6 phase 1).
+//! Line-based chat over the terminal command channel.
 //!
 //! One chat line = one [`Command::Type`] record: the line's UTF-8 bytes ride
 //! in the TYPE payload with key code `0` and modifier bits `0` (a "synthetic"

@@ -1,4 +1,4 @@
-//! Integration test: the v0.6 demo path end-to-end through a live relay —
+//! Integration test: the basic demo path end-to-end through a live relay —
 //! exactly what `ovview --code` / `ovhost --listen` do: both ends dial the
 //! relay with the pairing code as session id, handshake (client/server),
 //! then chat + terminal commands over the relayed carrier.

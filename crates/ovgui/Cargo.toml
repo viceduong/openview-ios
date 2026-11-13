@@ -30,6 +30,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Data-dir rule + the JSON status events ovhost/ovview print on stdout.
 ovcommon = { path = "../ovcommon" }
+# LAN discovery ("Computers on this network").
+ovdiscovery = { path = "../ovdiscovery" }
 
 anyhow = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }

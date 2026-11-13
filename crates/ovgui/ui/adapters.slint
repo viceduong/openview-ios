@@ -6,12 +6,20 @@ export enum Page { Remote, Settings, About }
 export enum HostStatus { Starting, Ready, Connected, Paused, Error, External }
 
 export struct Connection {
-    id: string,        // formatted "309 731 599 215"
+    id: string,        // formatted "123 456 789 012"
     raw-id: string,    // digits only
     name: string,
     subtitle: string,  // "Last connected 2 hours ago"
     favorite: bool,
     has-pin: bool,
+}
+
+// An OpenView computer found on this network (mDNS / Bonjour).
+export struct LanHost {
+    id: string,        // formatted "123 456 789 012"
+    raw-id: string,    // digits only
+    name: string,      // computer name
+    hint: string,      // "" or e.g. "different OpenView version"
 }
 
 export global App {
@@ -55,6 +63,10 @@ export global App {
     callback connection-toggle-favorite(string);
     callback connection-remove(string);
     callback list-filter-changed();
+    in property <[LanHost]> lan-hosts: [];
+    in property <bool> lan-browsing: false;      // the LAN browser runs
+    callback lan-select(string);                  // raw id
+    callback lan-connect(string);                 // raw id
 
     // ---- settings ----
     in-out property <bool> start-at-login: false;

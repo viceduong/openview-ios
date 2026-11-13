@@ -329,9 +329,13 @@ impl Gateway {
 
 /// A live UDP port mapping; deleted on drop.
 pub struct PortMapping {
+    /// The gateway that holds the mapping.
     pub gateway: Gateway,
+    /// The public address peers can reach (gateway external IP + port).
     pub external: SocketAddr,
+    /// The local UDP port the mapping forwards to.
     pub internal_port: u16,
+    /// The granted lease duration (zero = permanent).
     pub lease: Duration,
     refreshed: Instant,
 }

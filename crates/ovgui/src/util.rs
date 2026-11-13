@@ -7,7 +7,7 @@ pub fn digits(s: &str) -> String {
     s.chars().filter(char::is_ascii_digit).collect()
 }
 
-/// Group a device id in threes from the left: "309731599215" -> "309 731 599 215".
+/// Group a device id in threes from the left: "123456789012" -> "123 456 789 012".
 pub fn group_id(s: &str) -> String {
     let d = digits(s);
     let mut out = String::with_capacity(d.len() + d.len() / 3);
@@ -51,6 +51,7 @@ pub fn ago(then: u64, now: u64) -> String {
 pub fn local_hhmm() -> String {
     #[cfg(windows)]
     {
+        // SAFETY: `GetLocalTime` has no preconditions; it only returns a struct.
         let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
         format!("{:02}:{:02}", t.wHour, t.wMinute)
     }
@@ -111,7 +112,7 @@ mod tests {
 
     #[test]
     fn groups_ids() {
-        assert_eq!(group_id("309731599215"), "309 731 599 215");
+        assert_eq!(group_id("123456789012"), "123 456 789 012");
         assert_eq!(group_id("309 73"), "309 73");
         assert_eq!(group_id("12a3-4"), "123 4");
         assert_eq!(group_id(""), "");

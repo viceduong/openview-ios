@@ -1,0 +1,10 @@
+OpenView portable mode
+======================
+
+While this file sits next to OpenView.exe, OpenView keeps all of its data
+(settings, saved partners, logs and this PC's device ID) in the "data"
+folder next to the executables instead of %LOCALAPPDATA%\OpenView.
+
+Delete this file to use %LOCALAPPDATA%\OpenView instead.
+
+PINs are always stored in Windows Credential Manager, not in this folder.

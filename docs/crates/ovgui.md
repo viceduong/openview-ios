@@ -12,11 +12,14 @@ binaries as child processes:
   parses the host's JSON-lines status events (stdout, `ovcommon::status`)
   into a status, and restarts them with backoff.
 * **Control another computer**: it launches `ovview.exe --connect <id>
-  --relay <addr>` as a detached process.
+  --relay <addr>` as a detached process, or `ovview.exe --id <id> --lan-addr
+  <addrs> [--relay-fallback --relay <addr>]` when that computer was found on
+  this network.
 
 The PIN is always handed over in the `OPENVIEW_PIN` environment variable,
-never on a command line (which other processes can read). The only OpenView
-crate it links is `ovcommon` (data dir, status-event schema).
+never on a command line (which other processes can read). The OpenView
+crates it links are `ovcommon` (data dir, status-event schema) and
+`ovdiscovery` (the mDNS browser behind "Computers on this network").
 
 Everything below comes from `crates/ovgui/`. Paths are relative to
 the repository root.
@@ -67,7 +70,9 @@ the repository root.
 
 | File | Role |
 |---|---|
-| `src/main.rs` | Start-up, the state struct, `sync_ui`, the event drain, UI callbacks (connect, PIN, settings, pause, take-over) |
+| `src/main.rs` | Start-up, the state struct, the event drain |
+| `src/actions.rs` | User actions and the Slint callback wiring: connect, PIN, settings changes (the relay setting is validated with `ovcommon::relay_addr::RelayAddr::is_valid`), pause, take-over |
+| `src/view.rs` | Rendering the state into the window: settings, connection list, host status card, tray tooltip and menu |
 | `src/env.rs` | Normal vs **test mode**, data dir (`ovcommon::paths`) and one-time settings migration, credential and Run-key namespaces, binary paths and the missing-binary error |
 | `src/host.rs` | `Host` supervisor: the ovhost command line and environment (`OPENVIEW_PIN`), relay and host lifecycle, status events → `Phase`, retries, detect / take over an external host |
 | `src/procs.rs` | Spawning children hidden: stdout parsed as status events, stderr copied to a log file; a kill-on-close **job object**; graceful stop via **Ctrl-Break**; process lookup by image path |
@@ -78,6 +83,8 @@ the repository root.
 | `src/instance.rs` | Single instance: a named mutex plus `Show` / `Quit` named events |
 | `src/log.rs` | `logs\openview.log` (start-up, status changes, child exits; truncated at start-up when over 4 MiB) and `logs\panics.log` (panic hook with forced backtrace) |
 | `src/util.rs` | ID grouping, PIN generation and validation, "x minutes ago" formatting |
+| `src/lan.rs` | "Computers on this network": an `ovdiscovery::mdns::Browser` that runs while the window is visible, a 1 s UI-thread timer copying its snapshot (own device excluded) into an in-place model, and the `ovview --id … --lan-addr …` arguments |
+| `src/platform/mod.rs`, `platform/config.rs`, `platform/d3d11/` (`mod.rs`, `platform.rs`, `warp_presenter.rs`, `window_adapter.rs`) | Rendering platform selection and the vendored D3D11 WARP platform |
 
 **Threading**: Slint state is touched only on the UI thread. Child output
 readers, timers and the tray window procedure `post` plain `Event` values, and
@@ -137,7 +144,7 @@ ovhost.exe --unattended --service --relay <host relay> --data-dir <data dir>
 | "Hide wallpaper during sessions" off | `--keep-wallpaper` |
 | "Direct connections" off | `--no-direct` |
 | "Open the router port automatically (UPnP)" off | `--no-upnp` (only when direct is on) |
-| Test mode | `--dry-input --fx-dry-run --no-upnp --no-direct` |
+| Test mode | `--dry-input --fx-dry-run --no-upnp --no-direct --lan-port 0` (LAN listener on any free port; the test identity is announced by mDNS) |
 
 `--screen` is always **last**, because it takes an optional `WxH`.
 `--data-dir` makes the host keep its identity in the GUI's data dir, so both
@@ -171,13 +178,14 @@ in [ovcommon.md](ovcommon.md) §3); its stderr (human logs) only goes to
 
 | ovhost event | GUI phase |
 |---|---|
-| `device_id` | Records the device ID. It is shown grouped in threes ("309 731 599 215") and saved as `last_device_id`. |
+| `device_id` | Records the device ID. It is shown grouped in threes ("123 456 789 012") and saved as `last_device_id`. |
 | `ready` | **Ready**: "Ready — waiting for a connection" |
 | `peer_connected` | **Connected** (first 8 hex chars of the fingerprint, local HH:MM) plus a tray balloon |
 | `peer_disconnected` | Back to Ready plus a balloon |
 | `session_failed` | **Error**, with a friendly message: "Can't reach the relay at ... (connection refused)", "handshake failed (wrong PIN?)", or the raw reason |
 | `error` | Remembered as the reason shown if the host exits |
 | `direct_path` (`listening` / `disabled` / `active` / `fallback`), `upnp` | Status detail, e.g. "Relay 127.0.0.1:4569 · direct UDP 4570 · router port open (UPnP)" |
+| `lan` | Logged to `openview.log` (LAN port, mDNS on/off) |
 
 Every status change is also written to `logs\openview.log` (`status: <text>
 | <detail> | id <id>`).
@@ -203,18 +211,21 @@ Every status change is also written to `logs\openview.log` (`status: <text>
   stop the other host (it may run as administrator). End ovhost.exe in Task
   Manager, then try again.").
 
-## 5. How the GUI drives the viewer (`main.rs::connect`)
+## 5. How the GUI drives the viewer (`actions.rs::connect`)
 
 1. The partner ID (digits only, at least 6) and PIN are entered by the user,
    or the PIN is taken from Credential Manager under `<prefix>:<id>`.
 2. The GUI checks that `ovview.exe` exists next to `OpenView.exe` (else the
    "... is missing" error).
 3. Relay: the per-connection relay if one was saved, then the "Relay address"
-   setting (test mode: the test relay). With neither, the GUI shows "No relay
-   configured. Enter the relay address in Settings first." and opens
-   Settings.
-4. It spawns `ovview.exe --connect <id> --relay <relay>` with the PIN in
-   `OPENVIEW_PIN`, via `procs::spawn_detached`. The viewer is **not** in the
+   setting (test mode: the test relay).
+4. **On this network?** If the ID is in the "Computers on this network" list,
+   it spawns `ovview.exe --id <id> --lan-addr <addr,addr…>` (plus
+   `--relay-fallback --relay <relay>` when a relay is known): a direct LAN
+   session, no relay needed. Otherwise, without a relay, the GUI shows "No
+   relay configured. Enter the relay address in Settings first." and opens
+   Settings; with one it spawns `ovview.exe --connect <id> --relay <relay>`.
+   Either way the PIN goes in `OPENVIEW_PIN`, via `procs::spawn_detached`. The viewer is **not** in the
    job and does not write into the GUI's pipes, so it survives OpenView
    quitting. Its stderr goes to `logs\ovview-<id>.log`, its stdout (status
    events) to `logs\ovview-<id>.status.jsonl`, which a tail thread reads.
@@ -286,10 +297,19 @@ whitespace. The "Generate" button proposes an 8-character PIN.
   * A notice linking to Settings while no relay address is configured.
   * "End session" and pause/resume.
   * "Connect to a computer" (Partner ID, PIN, Remember PIN).
+  * "Computers on this network": OpenView hosts found by mDNS (name, grouped
+    ID, "different OpenView version" when the TXT `v` differs). Click fills
+    the Connect card (ID and saved PIN); double-click or **Connect** dials
+    it over the LAN. While empty it says "Looking for OpenView computers on
+    this network…" (or "Network discovery is not available." when the
+    browser cannot start). Browsing stops while the window is hidden.
   * "Recent & favorites".
 * **Settings**
-  * Relay (first card): "Relay address (host:port)" (empty by default; a
-    notice shows while it is missing) and "Run a relay on this PC" (default
+  * Relay (first card): "Relay address (IP, hostname[:port] or wss://…)"
+    (empty by default; a notice shows while it is missing). A non-empty value
+    must pass `RelayAddr::is_valid` (see [ovcommon.md](ovcommon.md) §3);
+    otherwise a toast says "Relay must be an IP, hostname[:port] or
+    wss://host/path" and the previous value is restored and "Run a relay on this PC" (default
     on: the bundled relay on TCP 4569, and this PC's host parks on it; off:
     the host parks on the relay address).
   * General: "Start OpenView at sign-in".

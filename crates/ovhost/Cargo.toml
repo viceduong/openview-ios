@@ -10,7 +10,7 @@ description = "OpenView host: makes this PC reachable through a relay (and a dir
 
 [dependencies]
 ovcore = { path = "../ovcore" }
-ovtransport = { path = "../ovtransport" }
+ovtransport = { path = "../ovtransport", features = ["ws-client"] }
 # `zstd-encode`: the host compresses screen payloads with C zstd (host-only;
 # viewers decode with pure-Rust ruzstd).
 # `opus`: Opus audio encode/decode (libopus; host-only C dependency).
@@ -22,7 +22,8 @@ ovcommon = { path = "../ovcommon", features = ["logging"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 tracing = "0.1"
 
-# DXGI Desktop Duplication capture (Phase 3); host-only.
+# Win32 bindings: DXGI Desktop Duplication capture, WASAPI loopback,
+# input injection, clipboard, cursor, desktop effects; host-only.
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
@@ -34,12 +35,22 @@ windows = { workspace = true, features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
-    # Wave 1 `--system-audio`: WASAPI loopback capture.
+    # `--system-audio`: WASAPI loopback capture.
     "Win32_Media_Audio",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

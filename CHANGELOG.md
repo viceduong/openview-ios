@@ -24,8 +24,10 @@ First public release.
   zeroized on drop with redacting `Debug`.
 - Hostile-input hardening: bounded file-transfer reassembly (concurrency,
   in-flight bytes, overlaps) and a path-safe received-file-name sanitizer;
-  bounded band-container decoding; relay connection / per-IP / pending caps
-  and client-frame masking; cargo-fuzz targets in `fuzz/`.
+  bounded band-container decoding and peer-declared frame sizes; bounded
+  FEC shard counts and buffered media per receiver; relay connection /
+  per-IP / pending caps and client-frame masking; cargo-fuzz targets in
+  `fuzz/`.
 - Trust-on-first-use host pinning on iOS.
 
 #### Transport and connectivity
@@ -38,7 +40,22 @@ First public release.
 - Congestion control and an unreliable media channel with Reed-Solomon FEC
   on the direct path.
 - `ovrelay`: std-only rendezvous relay over TCP and WebSocket (`ws(s)://`).
+- One relay address syntax everywhere (`--relay`, the GUI, iOS): an IP or
+  host name with an optional port (default 4569; every resolved address is
+  tried), or a `ws://` / `wss://` URL. `ovhost` / `ovview` reach WebSocket
+  relays (e.g. behind a reverse proxy or a Cloudflare tunnel) with a
+  built-in client, TLS through the Windows TLS stack (SChannel).
 - `ovdiscovery`: STUN binding client, UPnP IGD, mDNS/DNS-SD.
+- LAN sessions without a relay: an unattended host accepts viewers on its
+  network on UDP 4571 (`ovhost --lan-port`, `--no-lan`) and announces itself
+  by mDNS / Bonjour as `<device-id>._openview._udp.local` (TXT `id`, `v`,
+  `name`; real LAN addresses from `GetAdaptersAddresses`; announcements and
+  goodbye; `--no-mdns`). `ovview --id <device id>` resolves it by mDNS (or
+  `--lan-addr`) and runs the PIN handshake over direct UDP
+  (`--relay-fallback` dials the relay when nobody answers). The Windows app
+  lists **Computers on this network**; the iOS app lists **On this
+  network** (NWBrowser). The host keeps serving the LAN while its relay is
+  unreachable. New `lan` status event.
 
 #### Screen streaming
 - DXGI Desktop Duplication capture with dirty/move rects and GDI fallback.
@@ -85,6 +102,24 @@ First public release.
   Troubleshooting card with "Open logs folder", "Made with Slint" on the
   About page.
 
+#### Packaging, CI and documentation
+- Per-user Windows installer (Inno Setup, no administrator rights):
+  installs to `%LOCALAPPDATA%\Programs\OpenView`, optional start at sign-in
+  (the same `Run` value as the in-app switch) and optional firewall rules
+  through a separate UAC prompt; upgrades and uninstalls ask a running
+  OpenView to quit first; the uninstaller optionally removes the data folder
+  and the saved PINs.
+- Portable zip (`portable.txt` keeps data next to the executables),
+  `THIRD_PARTY_LICENSES.txt`, `SHA256SUMS`, and `firewall.cmd` to add or
+  remove the firewall rules; built by `scripts/package.ps1`.
+- GitHub Actions: CI (format, clippy, tests and the three-process relay
+  test on Windows, MSRV check, cargo-deny), iOS build and tests on macOS,
+  and a tag-triggered release workflow publishing the Windows packages and
+  an unsigned iOS `.ipa`.
+- Documentation: new README, install, building and troubleshooting guides,
+  security policy with threat model, contributing guide, code of conduct,
+  issue and pull request templates.
+
 ### Changed
 
 - Data moves to `%LOCALAPPDATA%\OpenView` (host identity, GUI settings,
@@ -101,6 +136,12 @@ First public release.
   statistics are `debug` (`-v`), per-input-event lines `trace` (`-vv`);
   `--log-level` / `OPENVIEW_LOG` set any filter.
 - `ovview --no-window` now really runs without a window.
+- `ovview --id` takes the host's **device ID** and a PIN (it took an
+  identity fingerprint and could only reach `127.0.0.1`).
+- `ovdiscovery`'s mDNS layer is rewritten (device-ID instances, real
+  addresses, RFC 6762 answering, robust browsing that skips malformed
+  packets); the fingerprint-keyed loopback API (`browse`, `Advertiser`,
+  `DiscoveredPeer`) is removed. The iOS app's default LAN port is 4571.
 - Media Foundation (`mfplat.dll`) is delay-loaded: on Windows N/KN without
   the Media Feature Pack, `ovhost` / `ovview` start and use lossless tiles.
   The binaries link the C runtime statically (no VC++ redistributable).
@@ -128,7 +169,14 @@ First public release.
 
 ### Security
 
-- SEC-2: the PIN no longer has to appear on a command line (see
-  `docs/KNOWN_ISSUES.md`).
+- PIN authentication moved to SPAKE2 (handshake v2): the earlier PIN proof
+  allowed offline guessing by anyone who reached the host (SEC-0); the
+  static X25519 key is now mixed into the key schedule (SEC-5).
+- The PIN no longer has to appear on a command line (SEC-2).
+- iOS keeps a saved PIN after transient network errors; only a real
+  authentication failure discards it (SEC-3).
+- Received file names are sanitized against drive-relative paths, alternate
+  data streams and reserved device names (SEC-1); the relay caps
+  connections, per-IP connections and parked sessions (SEC-4).
 
 [0.1.0]: https://github.com/OWNER/openview/releases/tag/v0.1.0

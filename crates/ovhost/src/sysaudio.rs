@@ -1,4 +1,4 @@
-//! System-audio capture (Wave 1, `--system-audio`): WASAPI **loopback** of
+//! System-audio capture (`--system-audio`): WASAPI **loopback** of
 //! the default render endpoint — what the host's speakers play — in
 //! event-driven shared mode with a 10 ms period.
 //!
@@ -38,7 +38,7 @@ enum SampleFmt {
 }
 
 /// Default-render-endpoint loopback capture (see the module docs).
-pub struct LoopbackSource {
+pub(crate) struct LoopbackSource {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     event: HANDLE,
@@ -52,7 +52,7 @@ pub struct LoopbackSource {
     prev: f32,
     /// When the next tick is due if the device stays silent.
     next_due: Instant,
-    pub description: String,
+    pub(crate) description: String,
 }
 
 // SAFETY: the COM objects are created on (and only used from) the mic
@@ -61,7 +61,7 @@ unsafe impl Send for LoopbackSource {}
 
 impl LoopbackSource {
     /// Open the default output device's loopback stream.
-    pub fn open() -> Result<Self, String> {
+    pub(crate) fn open() -> Result<Self, String> {
         let e = |what: &str, err: windows::core::Error| {
             format!("{what}: {:#010x} {}", err.code().0 as u32, err.message())
         };

@@ -1,4 +1,4 @@
-//! Screen-payload codecs (Phase 3): one encoder/decoder pair for every
+//! Screen-payload codecs: one encoder/decoder pair for every
 //! [`FrameCodec`], reusing contexts and buffers frame to frame.
 //!
 //! - **Encode** ([`Compressor`]): zstd level 1 through the C `zstd` crate
@@ -9,17 +9,19 @@
 //!   zstd, `miniz_oxide` (via flate2) for DEFLATE.
 //!
 //! Which codec a host may use is negotiated with the `CAPS` command (see
-//! [`crate::terminal::CAP_ZSTD`]); old peers keep getting DEFLATE.
+//! [`crate::terminal::CAP_ZSTD`]); peers without it keep getting DEFLATE.
 
+use crate::error::AppError;
 use crate::terminal::{compress_frame, decompress_into, FrameCodec};
 
 /// Whether this build can *encode* zstd (the `zstd-encode` feature).
-pub const fn zstd_encode_available() -> bool {
+pub(crate) const fn zstd_encode_available() -> bool {
     cfg!(feature = "zstd-encode")
 }
 
 /// zstd level used for screen payloads (latency over ratio).
-pub const ZSTD_LEVEL: i32 = 1;
+#[cfg(feature = "zstd-encode")]
+pub(crate) const ZSTD_LEVEL: i32 = 1;
 
 /// Reusable payload compressor (one per capture thread).
 #[derive(Default)]
@@ -31,6 +33,7 @@ pub struct Compressor {
 }
 
 impl Compressor {
+    /// A compressor with no codec context yet (created on first use).
     pub fn new() -> Self {
         Self::default()
     }
@@ -48,7 +51,7 @@ impl Compressor {
             },
             // Pure Rust, every build (only for peers with CAP_LZ4).
             FrameCodec::Lz4 => (FrameCodec::Lz4, lz4_flex::block::compress(data)),
-            // Wave 1 band container (CAP_BANDS), no MOVE records.
+            // Band container (CAP_BANDS), no MOVE records.
             FrameCodec::Packed => {
                 let mut out = Vec::new();
                 crate::bands::encode_packed(
@@ -91,6 +94,7 @@ pub struct Decompressor {
 }
 
 impl Decompressor {
+    /// A decompressor with no codec context yet (created on first use).
     pub fn new() -> Self {
         Self::default()
     }
@@ -104,14 +108,22 @@ impl Decompressor {
         data: &[u8],
         expected_len: usize,
         out: &mut Vec<u8>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
+        // `expected_len` is peer-declared: bound it before any codec sizes
+        // `out` for it.
+        if expected_len > crate::bands::MAX_RAW_TOTAL {
+            return Err(AppError::malformed(format!(
+                "declared length {expected_len} exceeds the {} byte frame limit",
+                crate::bands::MAX_RAW_TOTAL
+            )));
+        }
         match codec {
             FrameCodec::Raw => {
                 if data.len() != expected_len {
-                    return Err(format!(
+                    return Err(AppError::malformed(format!(
                         "raw payload {} != declared {expected_len}",
                         data.len()
-                    ));
+                    )));
                 }
                 out.clear();
                 out.extend_from_slice(data);
@@ -130,21 +142,21 @@ impl Decompressor {
                     return if expected_len == 0 {
                         Ok(())
                     } else {
-                        Err("empty zstd stream".into())
+                        Err(AppError::malformed("empty zstd stream"))
                     };
                 }
-                // Wave 1: independent zstd frames (host bands) decode on
+                // Independent zstd frames (host bands) decode on
                 // several cores; anything else takes the sequential path.
                 if let Some(r) = crate::zstd_par::decode_parallel(data, &mut out[..]) {
                     return r;
                 }
                 let n = dec
                     .decode_all(data, &mut out[..])
-                    .map_err(|e| format!("zstd stream corrupt: {e}"))?;
+                    .map_err(|e| AppError::malformed(format!("zstd stream corrupt: {e}")))?;
                 if n != expected_len {
-                    return Err(format!(
+                    return Err(AppError::malformed(format!(
                         "decompressed length {n} != declared {expected_len}"
-                    ));
+                    )));
                 }
                 Ok(())
             }
@@ -154,24 +166,26 @@ impl Decompressor {
                     out.resize(expected_len, 0);
                 }
                 let n = lz4_flex::block::decompress_into(data, &mut out[..])
-                    .map_err(|e| format!("lz4 block corrupt: {e}"))?;
+                    .map_err(|e| AppError::malformed(format!("lz4 block corrupt: {e}")))?;
                 if n != expected_len {
-                    return Err(format!(
+                    return Err(AppError::malformed(format!(
                         "decompressed length {n} != declared {expected_len}"
-                    ));
+                    )));
                 }
                 Ok(())
             }
             FrameCodec::Packed => {
                 let p = crate::bands::parse(data)?;
                 if !p.moves.is_empty() || p.has_extras() {
-                    return Err("band container carries MOVE / cache / lossy records (apply it with a ScreenDecoder)".into());
+                    return Err(AppError::invalid(
+                        "band container carries MOVE / cache / lossy records (apply it with a ScreenDecoder)",
+                    ));
                 }
                 if p.raw_len() != expected_len {
-                    return Err(format!(
+                    return Err(AppError::malformed(format!(
                         "bands decode to {} bytes, declared {expected_len}",
                         p.raw_len()
-                    ));
+                    )));
                 }
                 crate::bands::decode_bands(&p.bands, out)
             }

@@ -95,9 +95,12 @@ The app's bundle id is `$(OV_BUNDLE_ID_PREFIX).remoteview`
 
 ## Relay configuration
 
-OpenView does not ship with a relay. To reach computers outside your local
-network, run your own relay (`ovrelay`, see the main README) and point the
-app at it:
+The app needs a relay that it and the PC can both reach. `OpenView.exe`
+runs one on the PC by default (TCP 4569), which works on your LAN; to reach
+the PC from elsewhere, expose that relay through an HTTPS reverse proxy or
+tunnel, or run `ovrelay` on a server (see
+[Reaching the PC from outside your network](../README.md#reaching-the-pc-from-outside-your-network)).
+Then point the app at it:
 
 - **First launch:** the app asks for a "Relay server". Enter
   `wss://relay.example.com/relay` (WebSocket, works behind an HTTPS reverse

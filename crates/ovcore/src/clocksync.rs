@@ -1,9 +1,9 @@
 //! Two-way clock sync (NTP-style): measures the peer↔local clock offset and the
 //! round-trip time, used for latency stats and aligning media/remote-input timestamps.
-#![allow(dead_code)]
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Peer clock estimate from NTP-style probes: offset and round-trip time.
 pub struct ClockSync {
     offset_ns: i64, // peer_clock - local_clock (positive = peer ahead)
     rtt_ns: i64,
@@ -11,6 +11,7 @@ pub struct ClockSync {
 }
 
 impl ClockSync {
+    /// A fresh estimator with zero offset/RTT and no probe applied yet.
     pub fn new() -> Self {
         Self {
             offset_ns: 0,
@@ -37,15 +38,19 @@ impl ClockSync {
         self.probed = true;
     }
 
+    /// Peer clock minus local clock, in ns (positive = peer ahead).
     pub fn offset_ns(&self) -> i64 {
         self.offset_ns
     }
+    /// Round-trip time of the last probe, in ns.
     pub fn rtt_ns(&self) -> i64 {
         self.rtt_ns
     }
+    /// Round-trip time of the last probe, in ms.
     pub fn rtt_ms(&self) -> f64 {
         self.rtt_ns as f64 / 1e6
     }
+    /// Whether at least one probe reply has been applied.
     pub fn probed(&self) -> bool {
         self.probed
     }

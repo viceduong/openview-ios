@@ -1,8 +1,8 @@
 //! Integration test: the full ovcore handshake + AEAD record exchange over
 //! the `ovrelay` server, with both endpoints using
-//! `ovtransport::RelayTunnelCarrier` — the v0.4 "money test". Proves the
-//! relay is a transparent byte pipe for the framed datagrams the handshake
-//! pump produces, and that the AEAD record layer rides on top of it.
+//! `ovtransport::RelayTunnelCarrier`. Proves the relay is a transparent byte
+//! pipe for the framed datagrams the handshake pump produces, and that the
+//! AEAD record layer rides on top of it.
 
 use std::time::{Duration, Instant};
 

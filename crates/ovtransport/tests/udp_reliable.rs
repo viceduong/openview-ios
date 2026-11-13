@@ -1,4 +1,4 @@
-//! Phase 4: the UDP carrier's reliable framing over real loopback sockets —
+//! The UDP carrier's reliable framing over real loopback sockets —
 //! a whole-frame burst arrives complete and in order, loss/reordering
 //! injected by a proxy is recovered, and an old (raw) peer still works.
 
@@ -61,10 +61,7 @@ fn blast(
 fn framed_burst_arrives_complete_and_in_order() {
     let (mut a, mut b) = direct_pair();
     assert!(a.enable_reliable() && b.enable_reliable());
-    assert!(
-        a.raw_socket().is_some(),
-        "UDP socket is watchable (Phase 4)"
-    );
+    assert!(a.raw_socket().is_some(), "UDP socket is watchable");
     let (rcv, snd) = b.buffer_sizes();
     eprintln!("socket buffers: rcv {rcv} snd {snd}");
     // 357 x 4.1 KB = one ~1.5 MB full frame — the audit's worst case.

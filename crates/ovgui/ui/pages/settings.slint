@@ -36,7 +36,7 @@ export component SettingsPage inherits Rectangle {
                 CardHeader {
                     icon-name: "link";
                     title: "Relay";
-                    subtitle: "Devices meet through a relay server (host:port), then switch to a direct path when the network allows.";
+                    subtitle: "Devices meet through a relay server (IP, hostname[:port] or wss://…), then switch to a direct path when the network allows.";
                 }
                 Rectangle {
                     visible: App.relay-missing;
@@ -59,7 +59,7 @@ export component SettingsPage inherits Rectangle {
                     padding-left: Theme.spacing-xs;
                     padding-right: Theme.spacing-xs;
                     Input {
-                        label: "Relay address (host:port)";
+                        label: "Relay address (IP, hostname[:port] or wss://…)";
                         placeholder: App.default-relay;
                         text <=> App.relay-address;
                         committed => { App.setting-changed("relay"); }

@@ -858,6 +858,9 @@ fn clipboard_get_text() -> Option<String> {
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
+    // SAFETY: plain Win32 clipboard calls; the clipboard is closed on every path
+    // after a successful open, and the locked buffer is read only up to its
+    // NUL terminator (CF_UNICODETEXT is NUL-terminated) before being unlocked.
     unsafe {
         // Check if clipboard has text
         if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_err() {
@@ -917,6 +920,9 @@ fn clipboard_set_text(text: &str) {
     let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let byte_size = utf16.len() * 2;
 
+    // SAFETY: the clipboard is closed on every path after a successful open; the
+    // `byte_size` allocation holds exactly `utf16.len()` u16s, and ownership of
+    // `hmem` passes to the clipboard on a successful `SetClipboardData`.
     unsafe {
         // Open clipboard
         if OpenClipboard(None).is_err() {

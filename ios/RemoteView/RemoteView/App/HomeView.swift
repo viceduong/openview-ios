@@ -2,7 +2,8 @@ import SwiftUI
 import UIKit
 
 // Home: one-tap reconnect to the most recent device with a saved PIN,
-// Quick Connect by device ID, "Pair with code instead", FAVORITES and
+// Quick Connect by device ID, "Pair with code instead", ON THIS NETWORK
+// (OpenView PCs found by Bonjour, LanDiscovery), FAVORITES and
 // RECENT saved connections (tap = connect; swipe Edit / Delete; context
 // menu), empty state and "New connection". On first launch it offers the
 // relay setup sheet.
@@ -13,9 +14,13 @@ struct PinRequest: Identifiable {
     /// Device ID digits.
     let deviceID: String
     let saved: SavedConnection?
+    /// Name to show for an unsaved device (e.g. the PC name from Bonjour).
+    var name: String = ""
+    /// Dial this instead of the default relay (a PC found on the LAN).
+    var transport: ConnectionTransport? = nil
 
     var title: String {
-        saved?.displayName ?? DeviceID.format(deviceID)
+        saved?.displayName ?? (name.isEmpty ? DeviceID.format(deviceID) : name)
     }
 }
 
@@ -45,6 +50,10 @@ struct HomeView: View {
     @State private var quickID = ""
     @State private var search = ""
     @State private var sheet: HomeSheet?
+    @StateObject private var lan = LanDiscovery()
+    /// The LAN device being resolved (its row shows a spinner).
+    @State private var resolvingID: String?
+    @State private var lanError: String?
 
     var body: some View {
         NavigationView {
@@ -57,6 +66,7 @@ struct HomeView: View {
                     }
                 }
                 quickConnectSection
+                lanSection
                 if !favorites.isEmpty {
                     Section(header: Text("Favorites")) {
                         ForEach(favorites) { c in
@@ -85,6 +95,11 @@ struct HomeView: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .alert("Can't reach this PC", isPresented: lanErrorShown) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(lanError ?? "")
+            }
             .navigationTitle("OpenView")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -100,6 +115,12 @@ struct HomeView: View {
         }
         .navigationViewStyle(.stack)
         .onAppear(perform: firstAppear)
+        .onAppear { if !app.sessionActive { lan.start() } }
+        .onDisappear { lan.stop() }
+        .onChange(of: app.sessionActive) { active in
+            // No browsing while a session runs.
+            if active { lan.stop() } else { lan.start() }
+        }
         .sheet(item: $sheet) { which in
             sheetView(which)
                 .environmentObject(app)
@@ -186,6 +207,54 @@ struct HomeView: View {
         }
     }
 
+    // MARK: On this network
+
+    @ViewBuilder
+    private var lanSection: some View {
+        if !lan.hosts.isEmpty {
+            Section(header: Text("On this network"),
+                    footer: Text("OpenView PCs on your Wi-Fi. Tap one to connect directly.")) {
+                ForEach(lan.hosts) { pc in
+                    Button {
+                        connectLan(pc)
+                    } label: {
+                        LanHostRow(pc: pc,
+                                   saved: store.find(deviceId: pc.deviceID),
+                                   resolving: resolvingID == pc.deviceID)
+                    }
+                    .foregroundColor(.primary)
+                    .disabled(resolvingID != nil || app.sessionActive)
+                }
+            }
+        }
+    }
+
+    private var lanErrorShown: Binding<Bool> {
+        Binding(get: { lanError != nil }, set: { if !$0 { lanError = nil } })
+    }
+
+    /// Resolve the PC's Bonjour service to IP:port and dial it directly: a
+    /// saved device keeps its PIN / name / pinned identity, a new one asks
+    /// for the PIN first.
+    private func connectLan(_ pc: DiscoveredPC) {
+        guard !app.sessionActive, resolvingID == nil else { return }
+        resolvingID = pc.deviceID
+        LanDiscovery.resolve(pc) { host, port in
+            resolvingID = nil
+            guard let host, let port, port > 0 else {
+                lanError = "\(pc.name) was found on this network but could not be resolved. Check that both devices are on the same network and try again."
+                return
+            }
+            let transport = ConnectionTransport.lan(host: host, port: port)
+            if let saved = store.find(deviceId: pc.deviceID) {
+                connect(saved, via: transport)
+            } else {
+                sheet = .pin(PinRequest(deviceID: pc.deviceID, saved: nil,
+                                        name: pc.name, transport: transport))
+            }
+        }
+    }
+
     // MARK: Rows
 
     private func row(_ c: SavedConnection) -> some View {
@@ -260,8 +329,14 @@ struct HomeView: View {
     }
 
     /// Connect a saved device: stored PIN (Face ID if protected) or prompt.
-    private func connect(_ c: SavedConnection) {
+    /// `override` dials another transport for this attempt only (a LAN
+    /// address just found); the saved transport is left unchanged.
+    private func connect(_ c: SavedConnection, via override: ConnectionTransport? = nil) {
         guard !app.sessionActive else { return }
+        var c = c
+        if let override {
+            c.transport = override
+        }
         guard !c.transport.isMissingRelay else {
             app.relayMissing = true
             return
@@ -285,7 +360,14 @@ struct HomeView: View {
         if let saved = p.saved {
             req = app.request(for: saved, pin: pin, remember: remember, pinIsStored: false)
         } else {
-            req = app.quickRequest(deviceID: p.deviceID, pin: pin, remember: remember)
+            var quick = app.quickRequest(deviceID: p.deviceID, pin: pin, remember: remember)
+            if let transport = p.transport {
+                quick?.transport = transport
+            }
+            if !p.name.isEmpty {
+                quick?.name = p.name
+            }
+            req = quick
         }
         guard let req else { return }
         quickID = ""
@@ -398,6 +480,48 @@ struct ConnectionRow: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
+    }
+}
+
+/// A PC found on the local network.
+struct LanHostRow: View {
+    let pc: DiscoveredPC
+    let saved: SavedConnection?
+    let resolving: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "desktopcomputer")
+                .font(.system(size: 18))
+                .foregroundColor(.accentColor)
+                .frame(width: 34, height: 34)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.12)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(saved?.displayName ?? pc.name)
+                    .font(.body.weight(.semibold))
+                    .lineLimit(1)
+                Text(pc.isCompatible
+                     ? DeviceID.format(pc.deviceID)
+                     : "\(DeviceID.format(pc.deviceID)) · different OpenView version")
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if resolving {
+                ProgressView()
+            } else if saved?.hasPIN == true {
+                Image(systemName: "key.fill")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .accessibilityLabel("PIN saved")
+            }
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Connects over the local network")
     }
 }
 

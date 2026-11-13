@@ -1,4 +1,4 @@
-//! `ovrelay` — the OpenView relay server (spec v0.4 "relay").
+//! `ovrelay` — the OpenView relay server.
 //!
 //! A thread-per-client TCP server that pipes two [`RelayTunnelCarrier`]s
 //! (see `ovtransport::relay`) together when they announce the same u32
@@ -41,6 +41,9 @@
 //! [`RelayTunnelCarrier`]: ovtransport::RelayTunnelCarrier
 //! [`TunnelRole::Initiator`]: ovtransport::TunnelRole::Initiator
 //! [`TunnelRole::Responder`]: ovtransport::TunnelRole::Responder
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -229,7 +232,7 @@ impl Slot {
         }
     }
 
-    /// Wave 3 follow-up: a WebSocket PING (keeps proxies / tunnels on the
+    /// Send a WebSocket PING (keeps proxies / tunnels on the
     /// path - Cloudflare, VPN apps - from timing an idle-looking socket
     /// out; the client's stack answers it). No-op for raw TCP clients.
     fn try_ping(&self) {

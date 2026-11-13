@@ -6,7 +6,14 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "OpenView Carrier transport layer: UDP P2P, TCP-framed, and in-process datagram carriers"
+description = "OpenView Carrier transport layer: UDP P2P, direct (RUDP + media), relay tunnel (TCP / WebSocket), TCP-framed and in-process datagram carriers"
+
+[features]
+default = []
+# WebSocket relay client (`RelayTunnelCarrier::connect_ws`: `ws://` and
+# `wss://` relays). Enabled by the Windows binaries (ovhost, ovview) only;
+# the iOS staticlib (ovffi) leaves it off — the app owns its WebSocket.
+ws-client = ["dep:rand_core", "dep:native-tls"]
 
 [dependencies]
 ovcore = { path = "../ovcore" }
@@ -14,11 +21,19 @@ thiserror.workspace = true
 # Socket options the std API lacks (SO_RCVBUF/SO_SNDBUF for the UDP
 # carrier). Pure Rust (libc / windows-sys): the iOS staticlib stays C-free.
 socket2 = "0.5"
-# Wave 3: Reed-Solomon FEC for video on the direct path's media channel.
+# Reed-Solomon FEC for video on the direct path's media channel.
 # Pure Rust (runtime SIMD detection on x86 / NEON on aarch64), builds for iOS.
 reed-solomon-simd = "3.1"
-# Wave 3: the media channel's AEAD (same crate/version ovcore uses).
+# The media channel's AEAD (same crate/version ovcore uses).
 chacha20poly1305.workspace = true
+# `ws-client`: WebSocket key and frame masks from the OS RNG.
+rand_core = { workspace = true, features = ["getrandom"], optional = true }
+
+# `ws-client` TLS for `wss://`: the OS stack (SChannel) — no C toolchain,
+# the system certificate store. Windows only; other targets report wss://
+# as unsupported (ws:// works everywhere).
+[target.'cfg(windows)'.dependencies]
+native-tls = { version = "0.2", optional = true }
 
 [dev-dependencies]
 ovrelay = { path = "../ovrelay" }

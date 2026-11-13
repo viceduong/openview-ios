@@ -70,14 +70,14 @@ stdout into UI state; their human-readable logs (stderr) go to log files
 | Crate | Kind | Responsibility | Reference |
 |---|---|---|---|
 | `ovcore` | lib | Identity (`OVID1` seed → Ed25519 + X25519), fingerprint & 6-digit pairing code, versioned handshake (HELLO / READY / CONFIRM), SPAKE2 PIN authentication + attempt throttling, HKDF transcript key schedule, AEAD record `Session`, typed errors | [ovcore.md](crates/ovcore.md) |
-| `ovtransport` | lib | `Carrier` trait and implementations; RUDP; direct-path engine (probes, candidates, REBIND); delay-based CC; unreliable FEC media channel; relay client over TCP or WebSocket | [ovtransport.md](crates/ovtransport.md) |
+| `ovtransport` | lib | `Carrier` trait and implementations; RUDP; direct-path engine (probes, candidates, REBIND); delay-based CC; unreliable FEC media channel; relay client over TCP (IP or hostname) or WebSocket (`ws://` / `wss://`, feature `ws-client`); RFC 6455 codec (`ws`) shared with `ovrelay` | [ovtransport.md](crates/ovtransport.md) |
 | `ovrelay` | lib + bin | Pairs two parties by session ID, then relays tunnel frames opaquely; RFC 6455 listener; connection / per-IP / pending caps | [ovrelay.md](crates/ovrelay.md) |
 | `ovdiscovery` | lib | STUN binding (public mapping), UPnP IGD port mapping, mDNS/DNS-SD | [ovdiscovery.md](crates/ovdiscovery.md) |
 | `ovapp` | lib | `TerminalSession` command bus (36 opcodes), CAPS (16 bits), screen encoder/decoder family, H.264 via Media Foundation, `PrioritySender`/`FrameMailbox`, `LinkPacer`, audio, clipboard, chat, file transfer, recording container | [ovapp.md](crates/ovapp.md) |
 | `ovhost` | bin | Windows host: DXGI/GDI capture, cursor, input injection, mic / loopback / speaker, desktop effects + crash-safe cleanup, direct networking | [ovhost.md](crates/ovhost.md) |
 | `ovview` | bin | Windows viewer: Direct2D/GDI presentation with area/sharpen scaling, HUD, hotkeys, input forwarding, audio, record/play/export | [ovview.md](crates/ovview.md) |
 | `ovgui` | bin (`OpenView.exe`) | Desktop front end: ID/PIN, partner list, settings, tray, Credential Manager; supervises the other binaries | [ovgui.md](crates/ovgui.md) |
-| `ovcommon` | lib | Shared plumbing of the Windows binaries: data-dir rule (`%LOCALAPPDATA%\OpenView`, portable mode, migrations, `Downloads\OpenView`), JSON-lines status-event schema, `tracing` logging setup (feature `logging`) | [ovcommon.md](crates/ovcommon.md) |
+| `ovcommon` | lib | Shared plumbing of the Windows binaries: data-dir rule (`%LOCALAPPDATA%\OpenView`, portable mode, migrations, `Downloads\OpenView`), relay address syntax (`RelayAddr`: IP, `hostname[:port]`, `ws://` / `wss://`), JSON-lines status-event schema, `tracing` logging setup (feature `logging`) | [ovcommon.md](crates/ovcommon.md) |
 | `ovffi` | staticlib | C ABI for iOS: identity, session create/pump, relay/WS/datagram bridging, screen/video/audio/cursor/clipboard/file sinks, input | [ovffi.md](crates/ovffi.md) |
 
 ## 4. Session lifecycle
@@ -170,9 +170,10 @@ and post events to the UI; Job Object ties children to the GUI's lifetime.
 
 | Item | Value |
 |---|---|
-| Relay | TCP 4569 (the default of the relay and every client; WebSocket on the same port) |
+| Relay | TCP 4569 (the default of the relay and every client; WebSocket on the same port, or `ws://` / `wss://` through a reverse proxy) |
 | Direct path | UDP 4570 (UPnP-mapped when available) |
-| mDNS | 224.0.0.251:5353 |
+| LAN sessions | UDP 4571 (`ovhost --lan-port`), no relay |
+| mDNS | 224.0.0.251:5353, `_openview._udp.local` (unattended hosts) |
 | Received files | `Downloads\OpenView` (desktop host and viewer, never overwriting: `name (2).ext`); app Documents (iOS) |
 | Recordings | `%USERPROFILE%\ovrecord\*.ovrec` |
 | Data (host identity, GUI settings, logs) | `%LOCALAPPDATA%\OpenView` (`<exe dir>\data` with `portable.txt`; `--data-dir` / `OPENVIEW_DATA_DIR`); see [ovcommon.md](crates/ovcommon.md) |
@@ -184,7 +185,7 @@ and post events to the UI; Job Object ties children to the GUI's lifetime.
   Cargo.toml            workspace (10 crates)
   crates/<crate>/       sources, tests/, examples/
   assets/               app icon (ico/svg) + winres.rs (icon, manifest, VERSIONINFO; included by build.rs)
-  scripts/              e2e_relay.sh
+  scripts/              e2e_relay.sh, e2e_lan.sh
   ios/                  build_ios.sh, RemoteView/ (XcodeGen project, Swift, Metal)
   docs/                 this documentation
   CHANGELOG.md README.md LICENSE

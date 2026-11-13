@@ -1,4 +1,4 @@
-//! Session recording container (v0.19) — a self-describing, versioned binary
+//! Session recording container — a self-describing, versioned binary
 //! file the desktop viewer writes while a remote screen session plays, so it
 //! can later be parsed and played back.
 //!
@@ -27,6 +27,8 @@
 //! ```
 
 use std::io::Write;
+
+use crate::error::AppError;
 
 /// Header magic.
 pub const MAGIC: &[u8; 8] = b"OVREC001";
@@ -69,7 +71,7 @@ pub struct RecordedFrame {
     /// Decompressed pixel bytes (row-major, `width * height * 4` for BGRA).
     pub pixels: Vec<u8>,
     /// Frame width in pixels (stored per record, so a recording that spans a
-    /// mid-session capture-target change — v0.18 monitor switch — still
+    /// mid-session capture-target change such as a monitor switch still
     /// dimensions every frame correctly).
     pub width: u32,
     /// Frame height in pixels.
@@ -101,8 +103,9 @@ pub struct RecordWriter {
 
 impl RecordWriter {
     /// Create the file and write the header. The parent directory must exist.
-    pub fn create(path: &std::path::Path, header: &RecordHeader) -> Result<Self, String> {
-        let f = std::fs::File::create(path).map_err(|e| format!("create {:?}: {e}", path))?;
+    pub fn create(path: &std::path::Path, header: &RecordHeader) -> Result<Self, AppError> {
+        let f = std::fs::File::create(path)
+            .map_err(|e| AppError::io(format!("create {:?}: {e}", path)))?;
         let mut file = std::io::BufWriter::new(f);
         let mut buf = Vec::with_capacity(64 + header.app_version.len() + header.host_name.len());
         buf.extend_from_slice(MAGIC);
@@ -116,7 +119,7 @@ impl RecordWriter {
         write_str(&mut buf, &header.host_name)?;
         buf.extend_from_slice(&header.start_unix_ms.to_be_bytes());
         file.write_all(&buf)
-            .map_err(|e| format!("write header: {e}"))?;
+            .map_err(|e| AppError::io(format!("write header: {e}")))?;
         let bytes_written = buf.len() as u64;
         Ok(Self {
             file,
@@ -141,12 +144,12 @@ impl RecordWriter {
         total_len: u32,
         width: u32,
         height: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         if pixels.len() as u64 != total_len as u64 {
-            return Err(format!(
+            return Err(AppError::invalid(format!(
                 "append_frame: pixels.len() {} != total_len {total_len}",
                 pixels.len()
-            ));
+            )));
         }
         let payload = crate::terminal::compress_frame(pixels);
         let mut buf = Vec::with_capacity(28 + payload.len());
@@ -159,7 +162,7 @@ impl RecordWriter {
         buf.extend_from_slice(&payload);
         self.file
             .write_all(&buf)
-            .map_err(|e| format!("write frame: {e}"))?;
+            .map_err(|e| AppError::io(format!("write frame: {e}")))?;
         self.frame_count += 1;
         self.last_ts_ms = ts_ms;
         self.bytes_written += buf.len() as u64;
@@ -167,17 +170,19 @@ impl RecordWriter {
     }
 
     /// Write the trailer, flush, and close the file.
-    pub fn finalize(mut self) -> Result<RecordSummary, String> {
+    pub fn finalize(mut self) -> Result<RecordSummary, AppError> {
         self.file
             .write_all(TRAILER_MAGIC)
-            .map_err(|e| format!("write trailer: {e}"))?;
+            .map_err(|e| AppError::io(format!("write trailer: {e}")))?;
         self.file
             .write_all(&self.frame_count.to_be_bytes())
-            .map_err(|e| format!("write trailer: {e}"))?;
+            .map_err(|e| AppError::io(format!("write trailer: {e}")))?;
         self.file
             .write_all(&self.last_ts_ms.to_be_bytes())
-            .map_err(|e| format!("write trailer: {e}"))?;
-        self.file.flush().map_err(|e| format!("flush: {e}"))?;
+            .map_err(|e| AppError::io(format!("write trailer: {e}")))?;
+        self.file
+            .flush()
+            .map_err(|e| AppError::io(format!("flush: {e}")))?;
         drop(self.file);
         let bytes = std::fs::metadata(&self.path)
             .map(|m| m.len())
@@ -202,10 +207,12 @@ impl RecordWriter {
 }
 
 /// Length-prefixed UTF-8 string into a growable buffer.
-fn write_str(buf: &mut Vec<u8>, s: &str) -> Result<(), String> {
+fn write_str(buf: &mut Vec<u8>, s: &str) -> Result<(), AppError> {
     let len = s.len();
     if len > u16::MAX as usize {
-        return Err(format!("string too long for u16 prefix: {len} bytes"));
+        return Err(AppError::invalid(format!(
+            "string too long for u16 prefix: {len} bytes"
+        )));
     }
     buf.extend_from_slice(&(len as u16).to_be_bytes());
     buf.extend_from_slice(s.as_bytes());
@@ -213,25 +220,25 @@ fn write_str(buf: &mut Vec<u8>, s: &str) -> Result<(), String> {
 }
 
 /// Read a length-prefixed UTF-8 string from a byte cursor.
-fn read_str(cur: &mut &[u8]) -> Result<String, String> {
+fn read_str(cur: &mut &[u8]) -> Result<String, AppError> {
     if cur.len() < 2 {
-        return Err("truncated string length".into());
+        return Err(AppError::malformed("truncated string length"));
     }
     let len = u16::from_be_bytes([cur[0], cur[1]]) as usize;
     let rest = &cur[2..];
     if rest.len() < len {
-        return Err("truncated string bytes".into());
+        return Err(AppError::malformed("truncated string bytes"));
     }
     let s = std::str::from_utf8(&rest[..len])
-        .map_err(|e| format!("string is not UTF-8: {e}"))?
+        .map_err(|e| AppError::malformed(format!("string is not UTF-8: {e}")))?
         .to_owned();
     *cur = &rest[len..];
     Ok(s)
 }
 
-fn take<const N: usize>(cur: &mut &[u8]) -> Result<[u8; N], String> {
+fn take<const N: usize>(cur: &mut &[u8]) -> Result<[u8; N], AppError> {
     if cur.len() < N {
-        return Err("truncated container".into());
+        return Err(AppError::malformed("truncated container"));
     }
     let (head, rest) = cur.split_at(N);
     *cur = rest;
@@ -242,14 +249,16 @@ fn take<const N: usize>(cur: &mut &[u8]) -> Result<[u8; N], String> {
 
 /// Parse and validate the header from the raw file bytes; returns the header
 /// and the byte offset just past it (where the frame records start).
-fn parse_header(buf: &[u8]) -> Result<(RecordHeader, usize), String> {
+fn parse_header(buf: &[u8]) -> Result<(RecordHeader, usize), AppError> {
     let mut cur = buf;
     if take::<8>(&mut cur)? != *MAGIC {
-        return Err("bad magic (not an OVREC001 container)".into());
+        return Err(AppError::malformed("bad magic (not an OVREC001 container)"));
     }
     let version = u32::from_be_bytes(take::<4>(&mut cur)?);
     if version != FORMAT_VERSION {
-        return Err(format!("unsupported format version {version}"));
+        return Err(AppError::malformed(format!(
+            "unsupported format version {version}"
+        )));
     }
     let app_version = read_str(&mut cur)?;
     let pixel_format = take::<1>(&mut cur)?[0];
@@ -275,15 +284,15 @@ fn parse_header(buf: &[u8]) -> Result<(RecordHeader, usize), String> {
 }
 
 /// Read the header of a recording file.
-pub fn read_header(path: &std::path::Path) -> Result<RecordHeader, String> {
-    let buf = std::fs::read(path).map_err(|e| format!("read {:?}: {e}", path))?;
+pub fn read_header(path: &std::path::Path) -> Result<RecordHeader, AppError> {
+    let buf = std::fs::read(path).map_err(|e| AppError::io(format!("read {:?}: {e}", path)))?;
     parse_header(&buf).map(|(h, _)| h)
 }
 
 /// Walk every frame record and decompress it. Validates that the trailer is
 /// present and its frame count matches the records actually read.
-pub fn read_frames(path: &std::path::Path) -> Result<Vec<RecordedFrame>, String> {
-    let buf = std::fs::read(path).map_err(|e| format!("read {:?}: {e}", path))?;
+pub fn read_frames(path: &std::path::Path) -> Result<Vec<RecordedFrame>, AppError> {
+    let buf = std::fs::read(path).map_err(|e| AppError::io(format!("read {:?}: {e}", path)))?;
     let (_, mut off) = parse_header(&buf)?;
     let mut frames = Vec::new();
     loop {
@@ -302,14 +311,15 @@ pub fn read_frames(path: &std::path::Path) -> Result<Vec<RecordedFrame>, String>
         let compressed_len = u32::from_be_bytes(take::<4>(&mut cur)?);
         let clen = compressed_len as usize;
         if cur.len() < clen {
-            return Err(format!(
+            return Err(AppError::malformed(format!(
                 "truncated frame payload at record {} (need {clen}, have {})",
                 frames.len(),
                 cur.len()
-            ));
+            )));
         }
         let payload = &cur[..clen];
-        let pixels = crate::terminal::decompress(payload, total_len as usize)?;
+        let pixels = crate::terminal::decompress(payload, total_len as usize)
+            .map_err(AppError::malformed)?;
         frames.push(RecordedFrame {
             seq,
             ts_ms,
@@ -321,18 +331,20 @@ pub fn read_frames(path: &std::path::Path) -> Result<Vec<RecordedFrame>, String>
     }
     // Trailer.
     if buf.len() < off + 24 {
-        return Err("missing or truncated trailer".into());
+        return Err(AppError::malformed("missing or truncated trailer"));
     }
     if &buf[off..off + 8] != TRAILER_MAGIC {
-        return Err("missing OVRECEOF trailer".into());
+        return Err(AppError::malformed("missing OVRECEOF trailer"));
     }
+    // The length check above guarantees both 8-byte slices exist, so the
+    // `try_into` conversions cannot fail.
     let frame_count = u64::from_be_bytes(buf[off + 8..off + 16].try_into().unwrap());
     let _duration = u64::from_be_bytes(buf[off + 16..off + 24].try_into().unwrap());
     if frame_count != frames.len() as u64 {
-        return Err(format!(
+        return Err(AppError::malformed(format!(
             "trailer frame_count {frame_count} != {0} records read",
             frames.len()
-        ));
+        )));
     }
     Ok(frames)
 }
@@ -340,20 +352,20 @@ pub fn read_frames(path: &std::path::Path) -> Result<Vec<RecordedFrame>, String>
 /// Full parse: header + every record + trailer. Returns the summary, or
 /// `Err` on any corruption (bad magic, truncated record, decompress mismatch,
 /// missing/mismatched trailer).
-pub fn validate(path: &std::path::Path) -> Result<RecordSummary, String> {
-    let buf = std::fs::read(path).map_err(|e| format!("read {:?}: {e}", path))?;
+pub fn validate(path: &std::path::Path) -> Result<RecordSummary, AppError> {
+    let buf = std::fs::read(path).map_err(|e| AppError::io(format!("read {:?}: {e}", path)))?;
     let (header, mut off) = parse_header(&buf)?;
     let mut frame_count = 0u64;
     let mut last_ts_ms = 0u64;
     loop {
         if buf.len() < off + 8 {
-            return Err("missing OVRECEOF trailer".into());
+            return Err(AppError::malformed("missing OVRECEOF trailer"));
         }
         if &buf[off..off + 8] == TRAILER_MAGIC {
             break;
         }
         if buf.len() < off + 28 {
-            return Err("truncated frame record".into());
+            return Err(AppError::malformed("truncated frame record"));
         }
         let mut cur = &buf[off..];
         let _seq = u32::from_be_bytes(take::<4>(&mut cur)?);
@@ -364,27 +376,29 @@ pub fn validate(path: &std::path::Path) -> Result<RecordSummary, String> {
         let compressed_len = u32::from_be_bytes(take::<4>(&mut cur)?);
         let clen = compressed_len as usize;
         if cur.len() < clen {
-            return Err("truncated frame payload".into());
+            return Err(AppError::malformed("truncated frame payload"));
         }
-        crate::terminal::decompress(&cur[..clen], total_len as usize)?;
+        crate::terminal::decompress(&cur[..clen], total_len as usize)
+            .map_err(AppError::malformed)?;
         off += 28 + clen;
         frame_count += 1;
         last_ts_ms = ts_ms;
     }
     if buf.len() < off + 24 {
-        return Err("truncated trailer".into());
+        return Err(AppError::malformed("truncated trailer"));
     }
+    // Length checked above: both 8-byte slices exist.
     let trailer_count = u64::from_be_bytes(buf[off + 8..off + 16].try_into().unwrap());
     let trailer_duration = u64::from_be_bytes(buf[off + 16..off + 24].try_into().unwrap());
     if trailer_count != frame_count {
-        return Err(format!(
+        return Err(AppError::malformed(format!(
             "trailer frame_count {trailer_count} != {frame_count} records read"
-        ));
+        )));
     }
     if trailer_duration != last_ts_ms {
-        return Err(format!(
+        return Err(AppError::malformed(format!(
             "trailer duration {trailer_duration} != last frame ts {last_ts_ms}"
-        ));
+        )));
     }
     Ok(RecordSummary {
         frame_count,

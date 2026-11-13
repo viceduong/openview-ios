@@ -1,12 +1,12 @@
 //! Relay tunnel framing — the tiny wire format every party on a relay
-//! connection speaks (spec v0.4 "relay tunnel"). The relay is a pure byte
+//! connection speaks (`docs/WIRE_PROTOCOL.md`, "Tunnel frames"). The relay is a pure byte
 //! pipe: it forwards frames opaquely; only CONNECT/ATTACH/REJECT control
 //! lines (a separate, frame-less prefix on the TCP stream) are interpreted.
 //!
 //! ```text
 //! frame := kind(1B) len(2B BE) payload(len B)     len <= MAX_FRAME
 //! kind  := 0x00 DATA | 0x01 PING | 0x02 PONG | 0x03 DISCONNECT
-//!       |  0x04 PROBE | 0x05 PUNCH_ACK                      (v0.5)
+//!       |  0x04 PROBE | 0x05 PUNCH_ACK                (hole punching)
 //! ```
 //!
 //! PING/PONG are the tunnel's liveness probe: a carrier that receives a PING
@@ -21,11 +21,11 @@ pub const PING: u8 = 0x01;
 pub const PONG: u8 = 0x02;
 /// DISCONNECT: graceful tunnel teardown (peer closed or relay tore it down).
 pub const DISCONNECT: u8 = 0x03;
-/// PROBE (v0.5 hole punching): payload = 2B u16-BE — the sender's local UDP
+/// PROBE (hole punching): payload = 2B u16-BE — the sender's local UDP
 /// P2P port the peer may punch to. Sent over the relay tunnel; the relay
 /// forwards it opaquely like any other frame.
 pub const PROBE: u8 = 0x04;
-/// PUNCH_ACK (v0.5 hole punching): payload = 2B u16-BE — echoes the peer's
+/// PUNCH_ACK (hole punching): payload = 2B u16-BE — echoes the peer's
 /// local UDP port, acknowledging that a punch datagram arrived on it.
 pub const PUNCH_ACK: u8 = 0x05;
 

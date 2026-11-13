@@ -123,6 +123,8 @@ fn send_ctrl_break(pid: u32) -> bool {
 struct Job(HANDLE);
 // SAFETY: a job handle is a kernel object handle, usable from any thread.
 unsafe impl Send for Job {}
+// SAFETY: as above; the handle is only passed by value to thread-safe Win32
+// job APIs, never mutated through `&Job`.
 unsafe impl Sync for Job {}
 
 fn job() -> Option<&'static Job> {

@@ -1,4 +1,4 @@
-//! The host's screen source (Phase 3): DXGI Desktop Duplication when it is
+//! The host's screen source: DXGI Desktop Duplication when it is
 //! available, GDI `BitBlt` otherwise — switched transparently.
 //!
 //! - DXGI is tried at start and after every retarget (monitor switch).
@@ -10,10 +10,11 @@
 //!   kept *pending*: GDI serves the grabs and every grab polls the
 //!   duplication without blocking; its first frame switches to DXGI.
 //! - `--gdi` / `OV_CAPTURE=gdi` force GDI.
-//! - `--test-pattern video|scroll` (Phase 5) replaces the screen with a
+//! - `--test-pattern video|scroll|photo` replaces the screen with a
 //!   synthetic desktop whose middle moves (a 640x360 video, or a scrolling
 //!   page) for 5 s, then rests for 2 s — exercises the H.264 motion path
-//!   on a static machine.
+//!   on a static machine; `photo` cycles photo-like windows instead
+//!   (lossy tiles, refinement, tile-cache hits).
 //!
 //! Every grab yields the region's pixels (tight BGRA, alpha opaque) plus,
 //! from DXGI, the OS's changed rects as diff hints (`None` from GDI or after
@@ -25,7 +26,7 @@ use ovapp::gdisrc::GdiScreen;
 use ovapp::tiles::TileRect;
 
 /// How long to wait before trying DXGI again after it failed.
-pub const DXGI_RETRY: Duration = Duration::from_secs(2);
+pub(crate) const DXGI_RETRY: Duration = Duration::from_secs(2);
 /// How long a (re)created duplication may wait for its initial image
 /// before the source runs on GDI and keeps the duplication pending: once
 /// per start / retarget / loss, never on the periodic retries.
@@ -33,7 +34,7 @@ const DXGI_INITIAL_WAIT_MS: u32 = 1000;
 
 /// Which backend produced a grab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Backend {
+pub(crate) enum Backend {
     Dxgi,
     Gdi,
     Pattern,
@@ -50,18 +51,18 @@ impl std::fmt::Display for Backend {
 }
 
 /// One captured image (borrowed from the source until the next grab).
-pub struct Grab<'a> {
-    pub px: &'a [u8],
-    pub w: u32,
-    pub h: u32,
-    pub hints: Option<&'a [TileRect]>,
-    /// Wave 1: the OS's move rects (DXGI; copy-rect candidates the encoder
+pub(crate) struct Grab<'a> {
+    pub(crate) px: &'a [u8],
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) hints: Option<&'a [TileRect]>,
+    /// The OS's move rects (DXGI; copy-rect candidates the encoder
     /// verifies). `None` from GDI / the test pattern.
-    pub moves: Option<&'a [ovapp::bands::MoveRect]>,
-    pub backend: Backend,
+    pub(crate) moves: Option<&'a [ovapp::bands::MoveRect]>,
+    pub(crate) backend: Backend,
 }
 
-pub struct ScreenSource {
+pub(crate) struct ScreenSource {
     gdi: GdiScreen,
     #[cfg(windows)]
     dxgi: Option<crate::dxgi::DxgiCapture>,
@@ -75,9 +76,9 @@ pub struct ScreenSource {
     retry_at: Option<Instant>,
     /// Last backend reported (to log switches once).
     last: Option<Backend>,
-    /// Phase 5 `--test-pattern`.
+    /// `--test-pattern`.
     pattern: Option<TestPattern>,
-    /// Wave 1: present-to-grab delay of the last DXGI grab (capture-phase
+    /// Present-to-grab delay of the last DXGI grab (capture-phase
     /// latency probe; `None` from GDI or when nothing new was presented).
     latency: Option<Duration>,
 }
@@ -85,26 +86,23 @@ pub struct ScreenSource {
 /// The QPC clock (what DXGI `LastPresentTime` is in), in ticks and ticks/s.
 #[cfg(windows)]
 fn qpc_now() -> (i64, i64) {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn QueryPerformanceCounter(c: *mut i64) -> i32;
-        fn QueryPerformanceFrequency(f: *mut i64) -> i32;
-    }
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
     let (mut c, mut f) = (0i64, 0i64);
-    // SAFETY: valid out-pointers.
+    // SAFETY: both calls only write through valid, exclusive out-pointers
+    // (and cannot fail on Windows XP or later).
     unsafe {
-        QueryPerformanceCounter(&mut c);
-        QueryPerformanceFrequency(&mut f);
+        let _ = QueryPerformanceCounter(&mut c);
+        let _ = QueryPerformanceFrequency(&mut f);
     }
     (c, f.max(1))
 }
 
 /// Which synthetic motion `--test-pattern` draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatternKind {
+pub(crate) enum PatternKind {
     Video,
     Scroll,
-    /// Wave 2: three "windows" (the desktop, and two photo windows)
+    /// Three "windows" (the desktop, and two photo windows)
     /// switching every [`TestPattern::SWITCH`]: lossy-first photos, their
     /// refinement, and cache hits when a window comes back.
     Photo,
@@ -112,7 +110,7 @@ pub enum PatternKind {
 
 /// A synthetic screen: a static desktop with a moving region that plays
 /// for [`TestPattern::MOVE`] then rests for [`TestPattern::REST`].
-pub struct TestPattern {
+pub(crate) struct TestPattern {
     kind: PatternKind,
     px: Vec<u8>,
     w: u32,
@@ -121,19 +119,19 @@ pub struct TestPattern {
     start: Instant,
     t: u32,
     hint: [TileRect; 1],
-    /// Wave 2 photo pattern: the screens it cycles through, and which one
+    /// Photo pattern: the screens it cycles through, and which one
     /// is shown.
     screens: Vec<Vec<u8>>,
     shown: usize,
 }
 
 impl TestPattern {
-    pub const MOVE: Duration = Duration::from_secs(5);
-    pub const REST: Duration = Duration::from_secs(2);
-    /// Wave 2 photo pattern: one window switch per this.
-    pub const SWITCH: Duration = Duration::from_millis(1500);
+    pub(crate) const MOVE: Duration = Duration::from_secs(5);
+    pub(crate) const REST: Duration = Duration::from_secs(2);
+    /// Photo pattern: one window switch per this.
+    pub(crate) const SWITCH: Duration = Duration::from_millis(1500);
 
-    pub fn new(kind: PatternKind, w: u32, h: u32) -> Self {
+    pub(crate) fn new(kind: PatternKind, w: u32, h: u32) -> Self {
         let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
         ovapp::video::synth_desktop(&mut px, w, h);
         let (rw, rh) = match kind {
@@ -227,7 +225,7 @@ impl TestPattern {
     }
 }
 
-/// Wave 2 photo pattern: a photo-like picture (gradients, a sine, fine
+/// Photo pattern: a photo-like picture (gradients, a sine, fine
 /// noise) in `r` of a `w`-wide BGRA frame.
 fn photo_fill(px: &mut [u8], w: u32, r: TileRect, seed: u64) {
     let mut s: u64 = 0x9e37_79b9_7f4a_7c15 ^ seed;
@@ -255,7 +253,7 @@ fn photo_fill(px: &mut [u8], w: u32, r: TileRect, seed: u64) {
 impl ScreenSource {
     /// Wrap a GDI source (which also defines the region) and try DXGI on
     /// the same region.
-    pub fn new(gdi: GdiScreen, prefer_dxgi: bool) -> Self {
+    pub(crate) fn new(gdi: GdiScreen, prefer_dxgi: bool) -> Self {
         let mut s = Self {
             gdi,
             #[cfg(windows)]
@@ -273,22 +271,22 @@ impl ScreenSource {
         s
     }
 
-    /// Replace the screen with a synthetic test pattern (Phase 5).
-    pub fn set_pattern(&mut self, kind: PatternKind) {
+    /// Replace the screen with a synthetic test pattern.
+    pub(crate) fn set_pattern(&mut self, kind: PatternKind) {
         let (w, h) = self.gdi.size();
         self.pattern = Some(TestPattern::new(kind, w & !1, h & !1));
     }
 
-    pub fn origin(&self) -> (i32, i32) {
+    pub(crate) fn origin(&self) -> (i32, i32) {
         self.gdi.origin()
     }
 
-    pub fn size(&self) -> (u32, u32) {
+    pub(crate) fn size(&self) -> (u32, u32) {
         self.gdi.size()
     }
 
     /// Re-target to a new desktop rect (monitor switch).
-    pub fn retarget(&mut self, x: i32, y: i32, w: u32, h: u32) -> Result<(), String> {
+    pub(crate) fn retarget(&mut self, x: i32, y: i32, w: u32, h: u32) -> Result<(), String> {
         self.gdi.retarget(x, y, w, h)?;
         if let Some(kind) = self.pattern.as_ref().map(|p| p.kind) {
             self.set_pattern(kind);
@@ -304,7 +302,7 @@ impl ScreenSource {
     }
 
     /// The backend currently in use.
-    pub fn backend(&self) -> Backend {
+    pub(crate) fn backend(&self) -> Backend {
         #[cfg(windows)]
         if self.dxgi.is_some() {
             return Backend::Dxgi;
@@ -372,20 +370,20 @@ impl ScreenSource {
         }
     }
 
-    /// Section 5 `--gpu-encode`: the GPU copy of what the next
+    /// GPU encode input: the GPU copy of what the next
     /// [`grab`](Self::grab) returns (DXGI only).
     #[cfg(windows)]
-    pub fn gpu_frame(&self) -> Option<ovapp::mfcodec::GpuFrame> {
+    pub(crate) fn gpu_frame(&self) -> Option<ovapp::mfcodec::GpuFrame> {
         if self.pattern.is_some() {
             return None;
         }
         self.dxgi.as_ref()?.gpu_frame()
     }
 
-    /// Wave 1: whether [`wait_change`](Self::wait_change) can block on the
+    /// Whether [`wait_change`](Self::wait_change) can block on the
     /// OS (an active DXGI duplication; not GDI / a pending duplication /
     /// the test pattern).
-    pub fn can_wait(&self) -> bool {
+    pub(crate) fn can_wait(&self) -> bool {
         #[cfg(windows)]
         {
             self.pattern.is_none() && self.dxgi.is_some()
@@ -396,16 +394,16 @@ impl ScreenSource {
         }
     }
 
-    /// Wave 1: present-to-grab delay of the last grab (see `latency`).
-    pub fn take_latency(&mut self) -> Option<Duration> {
+    /// Present-to-grab delay of the last grab (see `latency`).
+    pub(crate) fn take_latency(&mut self) -> Option<Duration> {
         self.latency.take()
     }
 
-    /// Section 5 (event-driven capture): block up to `timeout` for the
+    /// Event-driven capture: block up to `timeout` for the
     /// screen to change. `None` = this backend cannot wait (GDI / test
     /// pattern: the caller sleeps instead); `Some(true)` = a change is
     /// buffered for the next [`grab`](Self::grab).
-    pub fn wait_change(&mut self, timeout: std::time::Duration) -> Option<bool> {
+    pub(crate) fn wait_change(&mut self, timeout: std::time::Duration) -> Option<bool> {
         if self.pattern.is_some() {
             return None;
         }
@@ -431,7 +429,7 @@ impl ScreenSource {
     }
 
     /// Grab the current image.
-    pub fn grab(&mut self) -> Result<Grab<'_>, String> {
+    pub(crate) fn grab(&mut self) -> Result<Grab<'_>, String> {
         if self.pattern.is_some() {
             self.note(Backend::Pattern);
             return Ok(self.pattern.as_mut().expect("checked above").grab());

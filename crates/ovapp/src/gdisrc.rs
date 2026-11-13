@@ -1,5 +1,5 @@
-//! Real screen capture via Windows GDI (spec v0.6 increment: replace the
-//! synthetic frame source with actual pixels).
+//! Real screen capture via Windows GDI: actual desktop pixels for the
+//! screen stream (the fallback when DXGI desktop duplication is unavailable).
 //!
 //! The capture source is deliberately dependency-free: instead of pulling in
 //! the `windows`/`winapi` crates we declare the handful of Win32 functions we
@@ -19,6 +19,7 @@
 //! On non-Windows targets the same type exists but every constructor fails,
 //! keeping `ovapp` (and the iOS `ovffi` staticlib) compiling unchanged.
 
+use crate::error::AppError;
 #[cfg(test)]
 use crate::screen::PixelFormat;
 
@@ -185,6 +186,7 @@ mod imp {
     //! Windows-side state: the persistent DIB section and its DCs.
 
     use super::ffi;
+    use crate::error::AppError;
     use std::slice;
 
     /// Everything `Drop` needs to release, plus the geometry and pixel pointer.
@@ -199,28 +201,33 @@ mod imp {
         pub old_obj: isize,
         /// Direct pointer to the DIB's pixel bytes (top-down BGRA32).
         pub bits: *mut u8,
-        /// Region geometry: origin on the (virtual) desktop.
+        /// Region origin x on the (virtual) desktop.
         pub x: i32,
+        /// Region origin y on the (virtual) desktop.
         pub y: i32,
+        /// Region width in pixels.
         pub w: u32,
+        /// Region height in pixels.
         pub h: u32,
     }
 
     impl Win {
         /// Build the DIB-backed capture source for `w x h` at `(x, y)`.
-        pub fn new(x: i32, y: i32, w: u32, h: u32) -> Result<Self, String> {
+        pub fn new(x: i32, y: i32, w: u32, h: u32) -> Result<Self, AppError> {
             if w == 0 || h == 0 {
-                return Err("GDI capture region is empty (w/h == 0)".into());
+                return Err(AppError::invalid("GDI capture region is empty (w/h == 0)"));
             }
             // SAFETY: these are plain FFI calls; NULL handles are checked below.
             let hdc_screen = unsafe { ffi::GetDC(0) };
             if hdc_screen == 0 {
-                return Err("GetDC(0) failed".into());
+                return Err(AppError::platform("GetDC(0) failed"));
             }
+            // SAFETY: `hdc_screen` is a live DC (checked non-NULL above).
             let hdc_mem = unsafe { ffi::CreateCompatibleDC(hdc_screen) };
             if hdc_mem == 0 {
+                // SAFETY: releases the DC obtained above, exactly once.
                 unsafe { ffi::ReleaseDC(0, hdc_screen) };
-                return Err("CreateCompatibleDC failed".into());
+                return Err(AppError::platform("CreateCompatibleDC failed"));
             }
 
             // A negative biHeight gives a TOP-DOWN DIB: row 0 is the top row,
@@ -247,17 +254,23 @@ mod imp {
                 ffi::CreateDIBSection(hdc_mem, &bmi, ffi::DIB_RGB_COLORS, &mut bits, 0, 0)
             };
             if hbitmap == 0 || bits.is_null() {
+                // SAFETY: releases the two DCs created above, exactly once.
                 unsafe { ffi::DeleteDC(hdc_mem) };
+                // SAFETY: as above.
                 unsafe { ffi::ReleaseDC(0, hdc_screen) };
-                return Err("CreateDIBSection failed".into());
+                return Err(AppError::platform("CreateDIBSection failed"));
             }
             // SAFETY: both handles are valid GDI objects we just created.
             let old_obj = unsafe { ffi::SelectObject(hdc_mem, hbitmap) };
             if old_obj == 0 {
+                // SAFETY: releases the bitmap (never selected) and the two DCs
+                // created above, each exactly once.
                 unsafe { ffi::DeleteObject(hbitmap) };
+                // SAFETY: as above.
                 unsafe { ffi::DeleteDC(hdc_mem) };
+                // SAFETY: as above.
                 unsafe { ffi::ReleaseDC(0, hdc_screen) };
-                return Err("SelectObject failed".into());
+                return Err(AppError::platform("SelectObject failed"));
             }
 
             Ok(Self {
@@ -284,9 +297,9 @@ mod imp {
         ///    `bits`/`x`/`y`/`w`/`h`.
         ///
         /// Any failure before step 3 leaves the old DIB live and selected.
-        pub fn retarget(&mut self, x: i32, y: i32, w: u32, h: u32) -> Result<(), String> {
+        pub fn retarget(&mut self, x: i32, y: i32, w: u32, h: u32) -> Result<(), AppError> {
             if w == 0 || h == 0 {
-                return Err("GDI capture region is empty (w/h == 0)".into());
+                return Err(AppError::invalid("GDI capture region is empty (w/h == 0)"));
             }
             // Same top-down 32-bpp DIB as `new` (see the comment there).
             let bmi = ffi::BITMAPINFO {
@@ -311,7 +324,9 @@ mod imp {
                 ffi::CreateDIBSection(self.hdc_mem, &bmi, ffi::DIB_RGB_COLORS, &mut bits, 0, 0)
             };
             if new_bitmap == 0 || bits.is_null() {
-                return Err("CreateDIBSection failed during retarget".into());
+                return Err(AppError::platform(
+                    "CreateDIBSection failed during retarget",
+                ));
             }
             // SAFETY: both handles are valid GDI objects; the returned value
             // is the previously selected bitmap (our old one).
@@ -319,11 +334,15 @@ mod imp {
             if old == 0 {
                 // The new bitmap was never selected: release it and keep the
                 // old state fully intact.
+                // SAFETY: the new bitmap was created above and never
+                // selected; it is released exactly once.
                 unsafe { ffi::DeleteObject(new_bitmap) };
-                return Err("SelectObject failed during retarget".into());
+                return Err(AppError::platform("SelectObject failed during retarget"));
             }
             // The swap is committed: release the old bitmap (no longer
             // selected anywhere) and adopt the new geometry.
+            // SAFETY: `self.hbitmap` is our old DIB, deselected just above and
+            // replaced right below, so it is deleted exactly once.
             unsafe { ffi::DeleteObject(self.hbitmap) };
             self.hbitmap = new_bitmap;
             self.bits = bits;
@@ -336,7 +355,7 @@ mod imp {
 
         /// BitBlt the region into the DIB and return the DIB's own pixels
         /// (alpha forced opaque in place) — no per-frame allocation.
-        pub fn capture_ref(&mut self) -> Result<(&[u8], u32, u32), String> {
+        pub fn capture_ref(&mut self) -> Result<(&[u8], u32, u32), AppError> {
             // SAFETY: all handles belong to this struct and are still alive.
             let ok = unsafe {
                 ffi::BitBlt(
@@ -355,16 +374,18 @@ mod imp {
                 tracing::debug!("gdisrc: BitBlt returned 0 (region may be stale)");
             }
             let len = (self.w as usize) * (self.h as usize) * 4;
-            // SAFETY: see `capture`; GDI is done writing once BitBlt returns.
+            // SAFETY: see `capture`; GDI is done writing once BitBlt returns,
+            // and `&mut self` makes this the only live view of the DIB.
             let px = unsafe { slice::from_raw_parts_mut(self.bits, len) };
-            for chunk in px.chunks_exact_mut(4) {
+            let (pixels, _) = px.as_chunks_mut::<4>();
+            for chunk in pixels {
                 chunk[3] = 255;
             }
             Ok((px, self.w, self.h))
         }
 
         /// BitBlt the region into the DIB and copy the pixels out as BGRA32.
-        pub fn capture(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+        pub fn capture(&mut self) -> Result<(Vec<u8>, u32, u32), AppError> {
             // SAFETY: all handles belong to this struct and are still alive.
             let ok = unsafe {
                 ffi::BitBlt(
@@ -396,10 +417,12 @@ mod imp {
             // so force alpha = 255 or the iOS `premultipliedFirst` CGImage
             // (and any future desktop render window) would show a black
             // screen. Enforces the invariant: Bgra frames carry opaque alpha.
-            for chunk in px.chunks_mut(4) {
+            // `len` is a multiple of 4, so there is no remainder.
+            let (pixels, _) = px.as_chunks_mut::<4>();
+            for chunk in pixels {
                 chunk[3] = 255;
             }
-            debug_assert!(px.chunks_exact(4).all(|c| c[3] == 255));
+            debug_assert!(px.as_chunks::<4>().0.iter().all(|c| c[3] == 255));
             Ok((px, self.w, self.h))
         }
     }
@@ -420,7 +443,7 @@ mod imp {
 
 impl GdiScreen {
     /// Capture a screen region: `(x, y)` top-left, `w x h` pixels, 32-bit BGRA.
-    pub fn new(x: i32, y: i32, w: u32, h: u32) -> Result<Self, String> {
+    pub fn new(x: i32, y: i32, w: u32, h: u32) -> Result<Self, AppError> {
         #[cfg(windows)]
         {
             Ok(Self {
@@ -430,12 +453,12 @@ impl GdiScreen {
         #[cfg(not(windows))]
         {
             let _ = (x, y, w, h);
-            Err("GDI screen capture is Windows-only".into())
+            Err(AppError::invalid("GDI screen capture is Windows-only"))
         }
     }
 
     /// Full primary monitor (dimensions from `GetSystemMetrics` on Windows).
-    pub fn full_primary() -> Result<Self, String> {
+    pub fn full_primary() -> Result<Self, AppError> {
         #[cfg(windows)]
         {
             // SAFETY: plain FFI query with no side effects.
@@ -446,41 +469,43 @@ impl GdiScreen {
                 )
             };
             if w <= 0 || h <= 0 {
-                return Err("GetSystemMetrics returned no usable screen size".into());
+                return Err(AppError::platform(
+                    "GetSystemMetrics returned no usable screen size",
+                ));
             }
             Self::new(0, 0, w as u32, h as u32)
         }
         #[cfg(not(windows))]
         {
-            Err("GDI screen capture is Windows-only".into())
+            Err(AppError::invalid("GDI screen capture is Windows-only"))
         }
     }
 
     /// Grab one frame: `BitBlt` into the persistent DIB, then return
     /// `(BGRA32 pixels, width, height)`.
-    pub fn capture(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+    pub fn capture(&mut self) -> Result<(Vec<u8>, u32, u32), AppError> {
         #[cfg(windows)]
         {
             self.inner.capture()
         }
         #[cfg(not(windows))]
         {
-            Err("GDI screen capture is Windows-only".into())
+            Err(AppError::invalid("GDI screen capture is Windows-only"))
         }
     }
 
     /// Like [`capture`](Self::capture) but borrows the persistent DIB's
     /// pixels (tight top-down BGRA32, alpha opaque) instead of copying them
-    /// out: valid until the next call. The Phase 3 capture loop diffs and
+    /// out: valid until the next call. The host capture loop diffs and
     /// encodes straight from it.
-    pub fn capture_ref(&mut self) -> Result<(&[u8], u32, u32), String> {
+    pub fn capture_ref(&mut self) -> Result<(&[u8], u32, u32), AppError> {
         #[cfg(windows)]
         {
             self.inner.capture_ref()
         }
         #[cfg(not(windows))]
         {
-            Err("GDI screen capture is Windows-only".into())
+            Err(AppError::invalid("GDI screen capture is Windows-only"))
         }
     }
 
@@ -509,7 +534,7 @@ impl GdiScreen {
     }
 
     /// Re-target the capture source to a new region `(x, y, w, h)` without
-    /// tearing down the screen DC (v0.18): the persistent DIB is replaced in
+    /// tearing down the screen DC: the persistent DIB is replaced in
     /// place, so a monitor switch costs one `CreateDIBSection` + two
     /// `SelectObject` calls instead of a full rebuild.
     ///
@@ -517,7 +542,7 @@ impl GdiScreen {
     /// existing state is mutated, and the old bitmap is released only after
     /// the new one is live — a failed retarget leaves the running source
     /// untouched. Empty regions are rejected up front.
-    pub fn retarget(&mut self, x: i32, y: i32, w: u32, h: u32) -> Result<(), String> {
+    pub fn retarget(&mut self, x: i32, y: i32, w: u32, h: u32) -> Result<(), AppError> {
         #[cfg(windows)]
         {
             self.inner.retarget(x, y, w, h)
@@ -527,7 +552,7 @@ impl GdiScreen {
             // No live source off-Windows; validating the geometry keeps the
             // API's contract identical across targets.
             if w == 0 || h == 0 {
-                Err("GDI capture region is empty (w/h == 0)".into())
+                Err(AppError::invalid("GDI capture region is empty (w/h == 0)"))
             } else {
                 let _ = (x, y);
                 Ok(())

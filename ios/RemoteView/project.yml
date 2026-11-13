@@ -50,6 +50,9 @@ targets:
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: OpenView connects to peers on your local network or to your relay server.
+        # Bonjour browse for OpenView PCs ("On this network", LanDiscovery).
+        NSBonjourServices:
+          - _openview._udp
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UILaunchScreen: {}
@@ -92,9 +95,9 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
 
   # Pure-logic unit tests (relay address parsing, direct-path candidates,
-  # viewport zoom math). The few source files they cover are compiled into
-  # the test bundle directly, so the tests need neither the app host nor the
-  # Rust library and run in any simulator:
+  # viewport zoom math, LAN TXT records). The few source files they cover
+  # are compiled into the test bundle directly, so the tests need neither
+  # the app host nor the Rust library and run in any simulator:
   #   xcodebuild test -project OpenView.xcodeproj -scheme OpenView \
   #     -destination 'platform=iOS Simulator,name=iPhone 15'
   RemoteViewTests:
@@ -105,6 +108,7 @@ targets:
       - path: RemoteView/Settings/RelayAddress.swift
       - path: RemoteView/Transport/DirectPaths.swift
       - path: RemoteView/Screen/ViewportMath.swift
+      - path: RemoteView/Transport/LanTxtRecord.swift
     configFiles:
       Debug: Config/Base.xcconfig
       Release: Config/Base.xcconfig

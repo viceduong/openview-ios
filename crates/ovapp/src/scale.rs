@@ -1,4 +1,4 @@
-//! Area + sharpen image scaling (Section 4 "rendering look") — the pure
+//! Area + sharpen image scaling (the viewer's "rendering look") — the pure
 //! Rust reference of the viewer's scaler. The iOS Metal shaders mirror it,
 //! and the desktop viewer uses it as the CPU fallback when Direct2D is
 //! unavailable.
@@ -163,6 +163,7 @@ impl Scaler {
         Self::new(sw, sh, dw, dh, Filter::Auto, DEFAULT_SHARPEN)
     }
 
+    /// `(sw, sh, dw, dh)`: the source and destination sizes.
     pub fn dims(&self) -> (u32, u32, u32, u32) {
         (self.sw, self.sh, self.dw, self.dh)
     }
@@ -185,7 +186,8 @@ impl Scaler {
         let tx = &self.tx;
         par_rows(&mut self.tmp, dw * 4, |y, row| {
             let s = &src[y * stride..y * stride + sw * 4];
-            for (x, out) in row.chunks_exact_mut(4).enumerate() {
+            let (pixels, _) = row.as_chunks_mut::<4>();
+            for (x, out) in pixels.iter_mut().enumerate() {
                 let st = tx.start[x] as usize;
                 let ws = &tx.w[x * tx.width..x * tx.width + tx.width];
                 let mut acc = [0i32; 4];
@@ -341,7 +343,10 @@ mod tests {
                     &mut out,
                 );
                 assert!(
-                    out.chunks_exact(4).all(|p| p == [10, 120, 250, 255]),
+                    out.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|p| *p == [10, 120, 250, 255]),
                     "{f:?} {sw}x{sh}->{dw}x{dh}"
                 );
             }
@@ -364,12 +369,19 @@ mod tests {
         let mut out = Vec::new();
         Scaler::new(w, h, 32, 32, Filter::Auto, 0.0).scale(&src, w as usize * 4, &mut out);
         assert!(
-            out.chunks_exact(4).all(|p| (127..=128).contains(&p[0])),
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| (127..=128).contains(&p[0])),
             "flat grey"
         );
         // Non-integer ratio: still within a narrow band around the mean.
         Scaler::new(w, h, 27, 27, Filter::Auto, 0.0).scale(&src, w as usize * 4, &mut out);
-        assert!(out.chunks_exact(4).all(|p| (100..=155).contains(&p[0])));
+        assert!(out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| (100..=155).contains(&p[0])));
     }
 
     #[test]
@@ -413,7 +425,7 @@ mod tests {
         let src: Vec<u8> = [0u8, 255].iter().flat_map(|&v| [v, v, v, 255]).collect();
         let mut out = Vec::new();
         Scaler::new(2, 1, 8, 1, Filter::Bilinear, 0.0).scale(&src, 8, &mut out);
-        let row: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        let row: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
         assert!(
             row.windows(2).all(|w| w[0] <= w[1]),
             "monotone ramp {row:?}"
@@ -421,7 +433,9 @@ mod tests {
         assert_eq!((row[0], row[7]), (0, 255));
     }
 
-    /// Speed (run with `--release -- --ignored --nocapture`).
+    /// Benchmark, not a correctness test (it only prints timings): scaler
+    /// speed for common desktop sizes. Run with
+    /// `cargo test --release -p ovapp -- --ignored --nocapture bench_scale`.
     #[test]
     #[ignore]
     fn bench_scale() {

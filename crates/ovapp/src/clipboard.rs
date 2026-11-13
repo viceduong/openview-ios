@@ -1,4 +1,4 @@
-//! Clipboard sync state (v0.26 "bidirectional clipboard sync").
+//! Clipboard sync state for bidirectional clipboard sync.
 //!
 //! The wire side is the `CLIPBOARD` command (opcode `0x50`, see
 //! [`crate::terminal`]). This module holds the *pure* half of the feature:

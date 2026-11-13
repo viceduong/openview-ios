@@ -41,7 +41,8 @@ pub struct Settings {
     pub direct: bool,
     pub upnp: bool,
     /// Relay for outgoing connections (and for this PC's host when
-    /// `run_relay` is off), `host:port`; empty = not configured yet.
+    /// `run_relay` is off), `host[:port]` or a `ws://` / `wss://` URL
+    /// ([`ovcommon::relay_addr`]); empty = not configured yet.
     pub relay_address: String,
     /// Run the bundled relay on this PC and park this PC's host on it.
     pub run_relay: bool,

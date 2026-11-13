@@ -15,19 +15,27 @@
 //! policy — the same pump code works over a 1 Gbit LAN link and a relayed
 //! cellular path.
 //!
-//! Three carriers implement the trait in v0.3:
+//! The carriers implementing the trait:
 //! - [`UdpP2pCarrier`] — the primary path (direct P2P / LAN).
 //! - [`TcpCarrier`] — fallback for UDP-blocked networks; each logical
 //!   datagram is framed `[2B u16-BE len][body]` so the upper layers see the
 //!   same datagram semantics over a byte stream.
 //! - [`InMemoryCarrier::pair`] — an in-process connected pair for tests.
+//! - [`RelayTunnelCarrier`] — one connection to an `ovrelay` server (raw
+//!   TCP, or WebSocket `ws://` / `wss://` with feature `ws-client`).
+//! - [`DirectCarrier`] — a relayed session upgraded to a direct UDP path
+//!   when one validates ([`direct`]).
 //!
-//! Phase 4: the record layer needs in-order, lossless delivery (one lost
-//! record desyncs the session), so the UDP carrier gained [`rudp`] — a
-//! fragmenting, selectively-acked, retransmitting and paced framing that is
-//! switched on per direction once the peer advertises it (CAPS
-//! `CAP_RUDP`); until then UDP datagrams are exactly the pre-Phase-4 raw
-//! records, so old peers keep working.
+//! The record layer needs in-order, lossless delivery (one lost record
+//! desyncs the session), so the UDP carrier runs [`rudp`] — a fragmenting,
+//! selectively-acked, retransmitting and paced framing that is switched on
+//! per direction once the peer advertises it (CAPS `CAP_RUDP`); until then
+//! UDP datagrams are bare records, so peers without `CAP_RUDP` keep
+//! working.
+
+#![warn(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 mod carrier;
 pub mod cc;
@@ -35,16 +43,19 @@ pub mod direct;
 mod inmem;
 pub mod media;
 mod punch;
-pub use punch::{HolePunch, DEFAULT_PUNCH_COUNT, DEFAULT_PUNCH_INTERVAL, DEMOTE_AFTER, PUNCH_BYTE};
 mod relay;
 pub mod rudp;
 mod tcp;
 mod tunnel;
 mod udp;
+pub mod ws;
 
 pub use carrier::{Carrier, CarrierStats, RawSock, TransportError};
 pub use direct::{DirectCarrier, DirectSockets, DirectState};
 pub use inmem::InMemoryCarrier;
+pub use punch::{HolePunch, DEFAULT_PUNCH_COUNT, DEFAULT_PUNCH_INTERVAL, DEMOTE_AFTER, PUNCH_BYTE};
+#[cfg(feature = "ws-client")]
+pub use relay::WsEndpoint;
 pub use relay::{BridgeWriter, ReadWake, RelayTunnelCarrier, TunnelRole};
 pub use tcp::TcpCarrier;
 pub use tunnel::{

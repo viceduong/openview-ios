@@ -1,4 +1,4 @@
-//! Pure frame→image helpers (v0.20) — no platform calls, fully unit-tested.
+//! Pure frame→image helpers — no platform calls, fully unit-tested.
 //!
 //! Two concerns live here:
 //!
@@ -11,6 +11,7 @@
 //!   recording's original variable-rate timing (the stream is change-detected,
 //!   so inter-frame gaps vary).
 
+use crate::error::AppError;
 use crate::record::RecordedFrame;
 use std::time::Duration;
 
@@ -19,19 +20,21 @@ use std::time::Duration;
 /// `bgra` must be exactly `width * height * 4` bytes (row-major, no padding).
 /// On any other length this returns `Err` — it never panics. The alpha byte
 /// is dropped (PPM has no alpha channel).
-pub fn bgra_to_ppm(width: u32, height: u32, bgra: &[u8]) -> Result<Vec<u8>, String> {
+pub fn bgra_to_ppm(width: u32, height: u32, bgra: &[u8]) -> Result<Vec<u8>, AppError> {
     let expected = (width as u64) * (height as u64) * 4;
     if bgra.len() as u64 != expected {
-        return Err(format!(
+        return Err(AppError::invalid(format!(
             "bgra_to_ppm: pixel buffer is {} bytes, expected {expected} \
              (width {width} x height {height} x 4)",
             bgra.len()
-        ));
+        )));
     }
     let (w, h) = (width as usize, height as usize);
     let mut out = Vec::with_capacity(16 + bgra.len());
     out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
-    for px in bgra.chunks_exact(4) {
+    // The length check above leaves no remainder.
+    let (pixels, _) = bgra.as_chunks::<4>();
+    for px in pixels {
         // BGRA quad: [0]=B, [1]=G, [2]=R, [3]=A -> emit R,G,B.
         out.extend_from_slice(&[px[2], px[1], px[0]]);
     }

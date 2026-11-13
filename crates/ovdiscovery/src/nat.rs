@@ -1,4 +1,4 @@
-//! NAT-type inference (spec v0.5 "NAT type handling").
+//! NAT-type inference.
 //!
 //! The relay passively observes each endpoint's socket address
 //! (`getpeername` — see `ovrelay::attach_line`). A second probe from a

@@ -1,6 +1,5 @@
 //! Integration test: the full ovcore handshake + AEAD record exchange over
-//! two real UDP carriers on 127.0.0.1 — the spec's `handshake_over_udp`
-//! milestone (implementation status v0.3). Proves the Carrier trait is
+//! two real UDP carriers on 127.0.0.1. Proves the Carrier trait is
 //! path-agnostic: the same pump that drove ovcore's in-memory pipe tests
 //! drives a real kernel UDP socket pair here.
 
@@ -66,9 +65,9 @@ fn handshake_over_udp_then_records_both_ways() {
     );
     server.expect_device(dev_c);
 
-    // The client's HELLO is emitted at construction; keep a copy. v0.3 has no
-    // ARQ, so if a datagram is lost the test re-sends the HELLO until the
-    // server reacts (a test-level stand-in for the v0.4 ReliableCarrier).
+    // The client's HELLO is emitted at construction; keep a copy. The raw
+    // UDP carrier has no ARQ, so if a datagram is lost the test re-sends the
+    // HELLO until the server reacts (a test-level stand-in for reliability).
     let initial_hello = match client.take_events().into_iter().next() {
         Some(HandshakeEvent::Sent(d)) => d,
         _ => unreachable!("client emits HELLO at construction"),

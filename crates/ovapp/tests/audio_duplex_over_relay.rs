@@ -1,5 +1,5 @@
-//! Integration test: **bidirectional** (full-duplex) audio over a live relay
-//! (v0.23). The AUDIO (0x40) opcode is direction-agnostic — the sender of a
+//! Integration test: **bidirectional** (full-duplex) audio over a live relay.
+//! The AUDIO (0x40) opcode is direction-agnostic — the sender of a
 //! record is always "my mic", the receiver plays it as "the remote mic". Two
 //! endpoints each stream a *distinct* synthetic tone as 0x40 ticks
 //! concurrently; each side must receive the OTHER's audio, decodable and

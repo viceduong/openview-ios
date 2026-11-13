@@ -1,150 +1,123 @@
-//! OS clipboard I/O (v0.26 "bidirectional clipboard sync").
+//! OS clipboard I/O for bidirectional clipboard sync.
 //!
 //! Structure mirrors `ovhost::cursor` / `ovhost::mic`: the decision logic
 //! (the echo-loop guard) is the pure [`ovapp::clipboard::ClipboardSync`];
-//! this module is only the Win32 FFI that reads and writes the local
-//! clipboard, behind `#[cfg(windows)]` so the crate still builds on other
-//! hosts (where the clipboard feature is simply absent).
-//!
-//! Raw Win32 imports (user32 + kernel32), no `windows`/`winapi` crates —
-//! linked implicitly by MSVC, same as the rest of the host crates.
+//! this module is only the Win32 calls (through the `windows` crate) that
+//! read and write the local clipboard, behind `#[cfg(windows)]` so the crate
+//! still builds on other hosts (where the clipboard feature is simply
+//! absent).
 //!
 //! Polling strategy: [`clip_sequence`] (`GetClipboardSequenceNumber`) is a
 //! cheap, lock-free call the serve loop can make every iteration; only when
 //! it changes do we take the clipboard lock for [`clip_read_text`].
 
-/// The Win32 `CF_UNICODETEXT` clipboard format.
 #[cfg(windows)]
-const CF_UNICODETEXT: u32 = 13;
+pub(crate) use windows_impl::{clip_read_text, clip_sequence, clip_write_text};
 
-/// The current clipboard sequence number — bumped on every clipboard
-/// content change. Cheap enough to poll every loop iteration.
-#[cfg(windows)]
-pub fn clip_sequence() -> u32 {
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetClipboardSequenceNumber() -> u32;
-    }
-    unsafe { GetClipboardSequenceNumber() }
-}
+#[cfg(not(windows))]
+pub(crate) use non_windows::{clip_read_text, clip_sequence, clip_write_text};
 
-/// Read the clipboard as UTF-8 text, if it currently holds text.
-///
-/// `None` when the clipboard has no text format or cannot be opened (another
-/// process holding it open is a normal, transient condition — callers just
-/// retry on the next poll).
 #[cfg(windows)]
-pub fn clip_read_text() -> Option<String> {
-    #[link(name = "user32")]
-    extern "system" {
-        fn OpenClipboard(owner: isize) -> i32;
-        fn IsClipboardFormatAvailable(format: u32) -> i32;
-        fn GetClipboardData(format: u32) -> isize;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GlobalLock(h: isize) -> *mut u8;
-        fn GlobalUnlock(h: isize) -> i32;
-        fn GlobalSize(h: isize) -> usize;
+mod windows_impl {
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+        IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    };
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    /// `CF_UNICODETEXT` as the `u32` the clipboard calls take.
+    const UNICODE_TEXT: u32 = CF_UNICODETEXT.0 as u32;
+
+    /// The current clipboard sequence number — bumped on every clipboard
+    /// content change. Cheap enough to poll every loop iteration.
+    pub(crate) fn clip_sequence() -> u32 {
+        // SAFETY: no preconditions; a plain counter read.
+        unsafe { GetClipboardSequenceNumber() }
     }
 
-    unsafe {
-        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
-            return None;
-        }
-        if OpenClipboard(0) == 0 {
-            return None;
-        }
-        // Always close, even on the early-outs below (the guard owns
-        // CloseClipboard).
+    /// Read the clipboard as UTF-8 text, if it currently holds text.
+    ///
+    /// `None` when the clipboard has no text format or cannot be opened
+    /// (another process holding it open is a normal, transient condition —
+    /// callers just retry on the next poll).
+    pub(crate) fn clip_read_text() -> Option<String> {
+        // SAFETY: no preconditions.
+        unsafe { IsClipboardFormatAvailable(UNICODE_TEXT) }.ok()?;
+        // SAFETY: no owner window; balanced by the guard below.
+        unsafe { OpenClipboard(None) }.ok()?;
+        // Always close, even on the early-outs below.
         let _guard = CloseOnDrop;
-        let h = GetClipboardData(CF_UNICODETEXT);
-        if h == 0 {
-            return None;
-        }
-        let ptr = GlobalLock(h);
+        // SAFETY: the clipboard is open (guarded above).
+        let h = HGLOBAL(unsafe { GetClipboardData(UNICODE_TEXT) }.ok()?.0);
+        // SAFETY: `h` is the clipboard's live CF_UNICODETEXT memory object,
+        // valid while the clipboard stays open.
+        let ptr = unsafe { GlobalLock(h) } as *const u16;
         if ptr.is_null() {
             return None;
         }
-        // The object is NUL-terminated UTF-16; GlobalSize may over-report
-        // (it returns in bytes, rounded up), so scan to the NUL.
-        let size = GlobalSize(h);
-        let mut units = size / 2;
-        while units > 0 && *ptr.add((units - 1) * 2) == 0 && *ptr.add((units - 1) * 2 + 1) == 0 {
-            units -= 1;
-        }
-        // Trim the terminating NUL itself (keep interior NULs out too: text
-        // ends at the first NUL by Win32 convention).
-        let mut end = 0usize;
-        while end < units && !(*ptr.add(end * 2) == 0 && *ptr.add(end * 2 + 1) == 0) {
-            end += 1;
-        }
-        let slice = std::slice::from_raw_parts(ptr as *const u16, end);
-        let out = String::from_utf16_lossy(slice);
-        GlobalUnlock(h);
+        // SAFETY: a locked global object spans `GlobalSize` bytes (possibly
+        // over-reported, rounded up, never under) and is suitably aligned
+        // for u16; it stays locked until `GlobalUnlock` below.
+        let units = unsafe { std::slice::from_raw_parts(ptr, GlobalSize(h) / 2) };
+        // NUL-terminated UTF-16: text ends at the first NUL by Win32
+        // convention (GlobalSize may over-report, so scan for it).
+        let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        let out = String::from_utf16_lossy(&units[..end]);
+        // SAFETY: balances the GlobalLock above; `units` is not used after.
+        let _ = unsafe { GlobalUnlock(h) };
         Some(out)
     }
-}
 
-/// Write UTF-8 `text` to the clipboard (empty text clears it). Returns
-/// whether the clipboard was updated.
-#[cfg(windows)]
-pub fn clip_write_text(text: &str) -> bool {
-    #[link(name = "user32")]
-    extern "system" {
-        fn OpenClipboard(owner: isize) -> i32;
-        fn EmptyClipboard() -> i32;
-        fn SetClipboardData(format: u32, h: isize) -> isize;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
-        fn GlobalLock(h: isize) -> *mut u8;
-        fn GlobalUnlock(h: isize) -> i32;
-    }
+    /// Write UTF-8 `text` to the clipboard (empty text clears it). Returns
+    /// whether the clipboard was updated.
+    pub(crate) fn clip_write_text(text: &str) -> bool {
+        // UTF-16 with a NUL terminator.
+        let mut units: Vec<u16> = text.encode_utf16().collect();
+        units.push(0);
 
-    const GMEM_MOVEABLE: u32 = 0x0002;
-
-    // UTF-16 with a NUL terminator.
-    let mut units: Vec<u16> = text.encode_utf16().collect();
-    units.push(0);
-
-    unsafe {
-        if OpenClipboard(0) == 0 {
+        // SAFETY: no owner window; balanced by the guard below.
+        if unsafe { OpenClipboard(None) }.is_err() {
             return false;
         }
         let _guard = CloseOnDrop;
-        if EmptyClipboard() == 0 {
+        // SAFETY: the clipboard is open (guarded above).
+        if unsafe { EmptyClipboard() }.is_err() {
             return false;
         }
-        let h = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2);
-        if h == 0 {
+        // SAFETY: a plain movable allocation of the buffer's byte size.
+        let Ok(h) = (unsafe { GlobalAlloc(GMEM_MOVEABLE, units.len() * 2) }) else {
             return false;
-        }
-        let ptr = GlobalLock(h);
+        };
+        // SAFETY: `h` is the live allocation just made.
+        let ptr = unsafe { GlobalLock(h) } as *mut u16;
         if ptr.is_null() {
             return false;
         }
-        std::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, ptr, units.len() * 2);
-        GlobalUnlock(h);
-        // On success the system owns `h`; do not free it.
-        SetClipboardData(CF_UNICODETEXT, h) != 0
-    }
-}
-
-/// `CloseClipboard` on scope exit so an early return can never leave the
-/// clipboard locked (the lock is system-global).
-#[cfg(windows)]
-struct CloseOnDrop;
-#[cfg(windows)]
-impl Drop for CloseOnDrop {
-    fn drop(&mut self) {
-        #[link(name = "user32")]
-        extern "system" {
-            fn CloseClipboard() -> i32;
-        }
+        // SAFETY: the locked object holds `units.len() * 2` bytes and does
+        // not overlap `units`; the unlock balances the lock.
         unsafe {
-            CloseClipboard();
+            std::ptr::copy_nonoverlapping(units.as_ptr(), ptr, units.len());
+            let _ = GlobalUnlock(h);
+        }
+        // SAFETY: the clipboard is open and emptied; `h` is an unlocked
+        // movable global holding NUL-terminated UTF-16. On success the
+        // system owns `h`; do not free it.
+        unsafe { SetClipboardData(UNICODE_TEXT, Some(HANDLE(h.0))) }.is_ok()
+    }
+
+    /// `CloseClipboard` on scope exit so an early return can never leave the
+    /// clipboard locked (the lock is system-global).
+    struct CloseOnDrop;
+
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: only constructed right after a successful
+            // OpenClipboard on this thread.
+            let _ = unsafe { CloseClipboard() };
         }
     }
 }
@@ -154,18 +127,15 @@ mod non_windows {
     //! Non-Windows stubs so the crate builds (and tests) on other hosts;
     //! the clipboard feature is simply unavailable there.
 
-    pub fn clip_sequence() -> u32 {
+    pub(crate) fn clip_sequence() -> u32 {
         0
     }
 
-    pub fn clip_read_text() -> Option<String> {
+    pub(crate) fn clip_read_text() -> Option<String> {
         None
     }
 
-    pub fn clip_write_text(_text: &str) -> bool {
+    pub(crate) fn clip_write_text(_text: &str) -> bool {
         false
     }
 }
-
-#[cfg(not(windows))]
-pub use non_windows::{clip_read_text, clip_sequence, clip_write_text};

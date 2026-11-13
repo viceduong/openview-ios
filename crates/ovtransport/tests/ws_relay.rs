@@ -199,10 +199,13 @@ fn recv_bridge_once(
     carrier.poll_recv(&mut |_| {})
 }
 
-/// Live sessions over the Cloudflare WebSocket died 18-30 s in: show that
-/// the relay itself keeps a paired WebSocket session up well past that, with
-/// its keepalive PINGs well formed (answered like URLSession does) and data
-/// flowing both ways throughout. Slow (40 s): `cargo test -- --ignored`.
+/// Soak test: the relay keeps a paired WebSocket session up for 40 s (past
+/// the 18-30 s window in which sessions through a Cloudflare WebSocket were
+/// seen to die), with its keepalive PINGs well formed (answered like
+/// URLSession does) and data flowing both ways throughout.
+///
+/// A correctness test, but slow (40 s), so it is `#[ignore]`d. Run it with
+/// `cargo test -p ovtransport --test ws_relay -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn websocket_session_outlives_30_seconds_with_relay_pings() {

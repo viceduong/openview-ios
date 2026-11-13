@@ -1,207 +1,560 @@
-//! LAN discovery over mDNS/DNS-SD (spec v0.5 "LAN discovery").
+//! LAN discovery over mDNS / DNS-SD (RFC 6762 / RFC 6763), keyed by
+//! OpenView **device id**.
 //!
-//! **Implementation note — why a hand-rolled responder instead of `mdns-sd`:**
-//! the spec names `mdns-sd` as the library; the crate works on Windows, but
-//! its API joins OS-wide multicast groups on real interfaces and spawns its
-//! own blocking threads, which makes loopback-only deterministic tests
-//! (the milestone requirement) impossible: two in-process instances would
-//! see each other only through the host's real network stack, with
-//! multicast routing and firewall policies in between. OpenView therefore
-//! ships a minimal DNS-SD responder/browser over raw UDP multicast
-//! (224.0.0.251:5353) — ~200 lines, std only, and *bindable to 127.0.0.1*
-//! so tests run entirely on loopback. The wire format, service names and
-//! TXT records are exactly what the spec defines, so a production build can
-//! swap in `mdns-sd` (or an OS resolver) behind the same [`Advertiser`] /
-//! [`browse`] surface without touching callers.
+//! # Design note
 //!
-//! Services (spec):
-//! - `_openview._udp.local` — TXT `id=<32 hex chars>` (fingerprint),
-//!   SRV port = the local UDP P2P port.
-//! - `ov-<6-digit pairing code>._openview._tcp.local` — same TXT `id`,
-//!   so an initiator can join on LAN by pairing code alone.
+//! **What is published.** An unattended host (`ovhost`, which accepts
+//! sessions from its own network on its LAN port without the relay) runs one
+//! [`Advertiser`] for its process lifetime. It owns the DNS-SD service instance
+//! `<device-id>._openview._udp.local` (the decimal device id is the instance
+//! label, so it is unique per machine and needs no conflict probing) and
+//! answers for:
 //!
-//! Browsing returns deduplicated [`DiscoveredPeer`]s: a peer advertising
-//! both services (same `id`) collapses into one entry carrying both ports.
+//! | Record | Owner | Data | TTL |
+//! |---|---|---|---|
+//! | PTR | `_openview._udp.local` | the instance | 4500 s (shared) |
+//! | PTR | `_services._dns-sd._udp.local` | `_openview._udp.local` | 4500 s (shared) |
+//! | SRV | instance | port = the host's LAN session port (UDP, default 4571), target `openview-<id>.local` | 120 s, cache-flush |
+//! | TXT | instance | `id=<device id>`, `v=<handshake version, 2>`, `name=<display name>` | 4500 s, cache-flush |
+//! | A / AAAA | `openview-<id>.local` | every real LAN address of the host | 120 s, cache-flush |
+//!
+//! Addresses come from [`crate::netif`] (`GetAdaptersAddresses` on Windows:
+//! up, multicast-capable, non-loopback, non-tunnel adapters; no `169.254/16`;
+//! IPv6 only on request). The host name is `openview-<id>.local`, not the
+//! computer name, so the Windows built-in responder (which owns
+//! `<COMPUTERNAME>.local`) is never contradicted.
+//!
+//! **Responder behaviour (RFC 6762 basics).** One UDP socket on
+//! `0.0.0.0:5353` with `SO_REUSEADDR` (shared with the OS responder and any
+//! other mDNS stack), joined to `224.0.0.251` on every LAN interface address;
+//! the interface list is re-read every 30 s and new interfaces are joined
+//! and re-announced. On start the full record set is announced twice, 1 s
+//! apart; on [`Advertiser::stop`] / drop a goodbye (same records, TTL 0) is
+//! multicast. Queries are answered as follows:
+//! - source port ≠ 5353 → *legacy unicast* (§6.7): unicast reply echoing the
+//!   query id and questions, TTL ≤ 10 s, no cache-flush bits;
+//! - QU bit set → unicast reply to the querier;
+//! - otherwise → multicast reply on the interface(s) whose subnet contains
+//!   the querier (all interfaces when none matches), at most one identical
+//!   multicast reply per second.
+//!
+//! Known-answer suppression is honoured for answers the querier already
+//! holds with at least half their TTL left. Probing, conflict resolution
+//! and IPv6 multicast (`ff02::fb`) are not implemented: the instance name is
+//! unique by construction and IPv4 multicast reaches every Bonjour/Avahi
+//! browser.
+//!
+//! **Browser.** [`Browser`] queries `PTR _openview._udp.local` from an
+//! ephemeral port on every interface (so every responder replies by
+//! unicast, which arrives even when another process owns 5353) with backoff
+//! 0, 1, 2, 4, 8, then every 15 s, and also listens on the shared 5353
+//! socket for announcements and goodbyes. Records are cached per instance;
+//! a host is reported once its SRV and at least one address are known.
+//! Addresses are ordered: the responder's packet source address first (it
+//! is on a link the browser can reach), then IPv4, then IPv6; when no A/AAAA
+//! arrived the source address is used. Entries live for `max(TTL, 30 s)`
+//! after the last refresh; a goodbye removes them at once. Malformed packets
+//! are logged at debug level and skipped — they never end a browse.
+//!
+//! # Callers
+//!
+//! - **ovhost** (`start_lan` in `main.rs`): advertise on start, stop (the
+//!   goodbye) from the exit cleanup:
+//!   ```no_run
+//!   use ovdiscovery::mdns::{AdvertiseConfig, Advertiser, DEFAULT_LAN_PORT};
+//!   # let device_id = 123_456_789_u64;
+//!   let mut cfg = AdvertiseConfig::new(device_id, DEFAULT_LAN_PORT);
+//!   cfg.version = 2; // ovcore::handshake::PROTOCOL_VERSION
+//!   let adv = Advertiser::start(cfg)?; // keep alive; drop = goodbye
+//!   # Ok::<(), ovdiscovery::DiscoveryError>(())
+//!   ```
+//! - **ovview `--id`**: `resolve(device_id, 3 s)` → `Option<DiscoveredHost>`;
+//!   it dials `host.addrs` in order with the PIN handshake.
+//! - **ovgui "Computers on this network"**: a [`Browser`] alive while the
+//!   window is visible, [`Browser::hosts`] (a cheap snapshot) polled every
+//!   second. One-shot alternative: [`browse`].
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::dns_wire::{decode_name, encode_name, encode_response, Record};
-use crate::error::DiscoveryError;
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-/// mDNS multicast group (spec / RFC 6762): the browser sends queries here
-/// and the responder answers on it. On loopback tests this is bound to
-/// 127.0.0.1 so packets never leave the process.
+use crate::dns_wire::{
+    txt_pairs, Message, Question, RData, ResourceRecord, FLAG_AUTHORITATIVE, FLAG_RESPONSE, TYPE_A,
+    TYPE_AAAA, TYPE_ANY, TYPE_PTR, TYPE_SRV, TYPE_TXT,
+};
+use crate::error::DiscoveryError;
+use crate::netif::{self, LocalInterface};
+
+/// mDNS IPv4 multicast group (RFC 6762).
 pub const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 /// mDNS port.
 pub const MDNS_PORT: u16 = 5353;
+/// DNS-SD service type of an OpenView host (Bonjour: `_openview._udp`).
+pub const SERVICE_TYPE: &str = "_openview._udp.local";
+/// The host's default LAN session port (UDP; `ovhost --lan-port`), the
+/// usual SRV port. Not the direct-path port 4570.
+pub const DEFAULT_LAN_PORT: u16 = 4571;
+/// Handshake protocol version advertised in TXT `v=` by default (matches
+/// `ovcore::handshake::PROTOCOL_VERSION`; this crate does not depend on
+/// `ovcore`, so callers should set [`AdvertiseConfig::version`] from it).
+pub const TXT_PROTOCOL_VERSION: u8 = 2;
 
-/// Service type for the UDP P2P path.
-pub const SERVICE_UDP: &str = "_openview._udp.local";
-/// Service type for pairing-code join (TCP carrier path).
-pub const SERVICE_TCP: &str = "_openview._tcp.local";
+/// DNS-SD service-type enumeration name (RFC 6763 §9).
+const META_SERVICES: &str = "_services._dns-sd._udp.local";
+/// TTL of host-bound records (SRV, A, AAAA).
+const TTL_HOST: u32 = 120;
+/// TTL of the other records (PTR, TXT).
+const TTL_OTHER: u32 = 4500;
+/// Legacy-unicast replies carry at most this TTL (RFC 6762 §6.7).
+const TTL_LEGACY_MAX: u32 = 10;
+/// Socket receive tick (stop-flag latency).
+const RECV_TICK: Duration = Duration::from_millis(200);
+/// Browser receive tick per socket.
+const BROWSE_TICK: Duration = Duration::from_millis(50);
+/// How often the advertiser re-reads the interface list.
+const IFACE_REFRESH: Duration = Duration::from_secs(30);
+/// Gap between the two start-up announcements.
+const ANNOUNCE_GAP: Duration = Duration::from_secs(1);
+/// Minimum time a browsed record is kept after it was last heard.
+const MIN_HOLD: Duration = Duration::from_secs(30);
+/// Browser query backoff (seconds after the previous query); the last
+/// value repeats.
+const QUERY_GAPS: [u64; 6] = [1, 2, 4, 8, 15, 15];
+/// Cap on cached instances / host names (a hostile LAN cannot grow it).
+const MAX_CACHE: usize = 256;
+/// Largest mDNS packet we accept (RFC 6762 §17: 9000 bytes).
+const MAX_PACKET: usize = 9000;
 
-/// A peer found by browsing. `fingerprint` is the 16-byte identity
-/// fingerprint (TXT `id`), `udp_port` the P2P UDP listener, and `tcp_port`
-/// is present only if the peer also advertises the pairing-code TCP service.
+/// A host found on the LAN.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveredPeer {
-    /// 16-byte identity fingerprint (from TXT `id`).
-    pub fingerprint: [u8; 16],
-    /// The peer's local UDP P2P port (SRV of `_openview._udp`).
-    pub udp_port: u16,
-    /// The peer's TCP carrier port, if it advertises the TCP service.
-    pub tcp_port: Option<u16>,
+pub struct DiscoveredHost {
+    /// OpenView device id (TXT `id=`, else the instance label).
+    pub device_id: u64,
+    /// Display name (TXT `name=`, else the instance label).
+    pub name: String,
+    /// Direct UDP addresses to try, best first.
+    pub addrs: Vec<SocketAddr>,
+    /// Handshake protocol version (TXT `v=`), if advertised.
+    pub version: Option<u8>,
+    /// When a record of this host was last received.
+    pub last_seen: Instant,
 }
 
-/// TXT `id` entry for a fingerprint.
-fn txt_id(fingerprint: &[u8; 16]) -> String {
-    let mut s = String::with_capacity(3 + 32);
-    s.push_str("id=");
-    for b in fingerprint {
-        s.push_str(&format!("{b:02x}"));
+impl DiscoveredHost {
+    /// The advertised protocol version is ours (or not advertised).
+    pub fn is_compatible(&self) -> bool {
+        self.version.is_none_or(|v| v == TXT_PROTOCOL_VERSION)
     }
-    s
 }
 
-/// Parse a TXT `id=...` entry back into a fingerprint.
-fn parse_id(entry: &str) -> Option<[u8; 16]> {
-    let hex = entry.strip_prefix("id=")?;
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut fp = [0u8; 16];
-    for (i, b) in fp.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(fp)
+/// The DNS-SD instance name of a device id.
+pub fn instance_name(device_id: u64) -> String {
+    format!("{device_id}.{SERVICE_TYPE}")
 }
 
-/// An advertiser: spawns one thread that answers mDNS queries for our two
-/// service instances on the given bind address. Drop it (or call
-/// [`stop`](Self::stop)) to silence the responses.
+/// The mDNS host name the SRV record points at.
+fn host_name(device_id: u64) -> String {
+    format!("openview-{device_id}.local")
+}
+
+/// The computer name (`COMPUTERNAME` / `HOSTNAME`), or "OpenView host".
+pub fn default_display_name() -> String {
+    let raw = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_default();
+    let name = raw.trim();
+    if name.is_empty() {
+        "OpenView host".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Truncate to at most `max` bytes on a char boundary.
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// ---------------------------------------------------------------------------
+// Advertiser
+// ---------------------------------------------------------------------------
+
+/// What an [`Advertiser`] publishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvertiseConfig {
+    /// OpenView device id (instance label and TXT `id=`).
+    pub device_id: u64,
+    /// The host's LAN session port (SRV port).
+    pub port: u16,
+    /// Display name (TXT `name=`, truncated to fit one TXT string).
+    pub name: String,
+    /// Handshake protocol version (TXT `v=`).
+    pub version: u8,
+    /// Addresses to publish; empty = the LAN interface addresses, re-read
+    /// every 30 s.
+    pub addrs: Vec<IpAddr>,
+    /// When enumerating, also publish global / unique-local IPv6 (AAAA).
+    /// Leave off unless the direct socket accepts IPv6.
+    pub include_ipv6: bool,
+}
+
+impl AdvertiseConfig {
+    /// Defaults: the computer name, [`TXT_PROTOCOL_VERSION`], enumerated
+    /// IPv4 addresses.
+    pub fn new(device_id: u64, port: u16) -> Self {
+        Self {
+            device_id,
+            port,
+            name: default_display_name(),
+            version: TXT_PROTOCOL_VERSION,
+            addrs: Vec::new(),
+            include_ipv6: false,
+        }
+    }
+
+    fn txt_entries(&self) -> Vec<Vec<u8>> {
+        let name = truncate_utf8(self.name.trim(), 255 - "name=".len());
+        vec![
+            format!("id={}", self.device_id).into_bytes(),
+            format!("v={}", self.version).into_bytes(),
+            format!("name={name}").into_bytes(),
+        ]
+    }
+
+    /// The addresses to publish given the current interfaces.
+    fn publish_addrs(&self, ifaces: &[LocalInterface]) -> Vec<IpAddr> {
+        let mut out: Vec<IpAddr> = if self.addrs.is_empty() {
+            let v4 = ifaces
+                .iter()
+                .flat_map(|i| i.v4.iter().map(|&(ip, _)| IpAddr::V4(ip)));
+            let v6 = ifaces
+                .iter()
+                .filter(|_| self.include_ipv6)
+                .flat_map(|i| i.v6.iter().map(|&ip| IpAddr::V6(ip)));
+            v4.chain(v6).collect()
+        } else {
+            self.addrs.clone()
+        };
+        let mut seen = Vec::with_capacity(out.len());
+        out.retain(|ip| {
+            let fresh = !seen.contains(ip);
+            seen.push(*ip);
+            fresh
+        });
+        out
+    }
+}
+
+/// The record set of one advertised instance.
+#[derive(Debug, Clone)]
+struct ServiceRecords {
+    instance: String,
+    host: String,
+    ptr: ResourceRecord,
+    meta: ResourceRecord,
+    srv: ResourceRecord,
+    txt: ResourceRecord,
+    addrs: Vec<ResourceRecord>,
+}
+
+impl ServiceRecords {
+    fn new(cfg: &AdvertiseConfig, addrs: &[IpAddr]) -> Self {
+        let instance = instance_name(cfg.device_id);
+        let host = host_name(cfg.device_id);
+        let addrs = addrs
+            .iter()
+            .map(|ip| {
+                let data = match ip {
+                    IpAddr::V4(v4) => RData::A(*v4),
+                    IpAddr::V6(v6) => RData::Aaaa(*v6),
+                };
+                ResourceRecord::new(host.clone(), TTL_HOST, true, data)
+            })
+            .collect();
+        Self {
+            ptr: ResourceRecord::new(SERVICE_TYPE, TTL_OTHER, false, RData::Ptr(instance.clone())),
+            meta: ResourceRecord::new(
+                META_SERVICES,
+                TTL_OTHER,
+                false,
+                RData::Ptr(SERVICE_TYPE.to_string()),
+            ),
+            srv: ResourceRecord::new(
+                instance.clone(),
+                TTL_HOST,
+                true,
+                RData::Srv {
+                    priority: 0,
+                    weight: 0,
+                    port: cfg.port,
+                    target: host.clone(),
+                },
+            ),
+            txt: ResourceRecord::new(
+                instance.clone(),
+                TTL_OTHER,
+                true,
+                RData::Txt(cfg.txt_entries()),
+            ),
+            addrs,
+            instance,
+            host,
+        }
+    }
+
+    /// Unsolicited announcement (or goodbye with `ttl_zero`).
+    fn announcement(&self, ttl_zero: bool) -> Message {
+        let mut answers = vec![self.ptr.clone(), self.srv.clone(), self.txt.clone()];
+        answers.extend(self.addrs.iter().cloned());
+        if ttl_zero {
+            for r in &mut answers {
+                r.ttl = 0;
+            }
+        }
+        Message {
+            flags: FLAG_RESPONSE | FLAG_AUTHORITATIVE,
+            answers,
+            ..Message::default()
+        }
+    }
+
+    /// The response to `query`, if any of its questions is ours. `legacy`
+    /// formats a legacy-unicast reply (RFC 6762 §6.7).
+    fn respond(&self, query: &Message, legacy: bool) -> Option<Message> {
+        if query.is_response() {
+            return None;
+        }
+        let mut answers: Vec<ResourceRecord> = Vec::new();
+        let mut extra: Vec<ResourceRecord> = Vec::new();
+        for q in &query.questions {
+            let any = q.qtype == TYPE_ANY;
+            if q.name.eq_ignore_ascii_case(SERVICE_TYPE) && (any || q.qtype == TYPE_PTR) {
+                answers.push(self.ptr.clone());
+                extra.push(self.srv.clone());
+                extra.push(self.txt.clone());
+                extra.extend(self.addrs.iter().cloned());
+            } else if q.name.eq_ignore_ascii_case(META_SERVICES) && (any || q.qtype == TYPE_PTR) {
+                answers.push(self.meta.clone());
+            } else if q.name.eq_ignore_ascii_case(&self.instance) {
+                if any || q.qtype == TYPE_SRV {
+                    answers.push(self.srv.clone());
+                }
+                if any || q.qtype == TYPE_TXT {
+                    answers.push(self.txt.clone());
+                }
+                extra.push(self.srv.clone());
+                extra.push(self.txt.clone());
+                extra.extend(self.addrs.iter().cloned());
+            } else if q.name.eq_ignore_ascii_case(&self.host) {
+                let want = |r: &&ResourceRecord| {
+                    any || (q.qtype == TYPE_A && r.rtype == TYPE_A)
+                        || (q.qtype == TYPE_AAAA && r.rtype == TYPE_AAAA)
+                };
+                answers.extend(self.addrs.iter().filter(want).cloned());
+                extra.extend(self.addrs.iter().cloned());
+            }
+        }
+        // Known-answer suppression (§7.1).
+        answers.retain(|a| {
+            !query
+                .answers
+                .iter()
+                .any(|k| k.same_record(a) && k.ttl >= a.ttl / 2)
+        });
+        dedupe(&mut answers);
+        extra.retain(|e| !answers.iter().any(|a| a.same_record(e)));
+        dedupe(&mut extra);
+        if answers.is_empty() {
+            return None;
+        }
+        let mut msg = Message {
+            flags: FLAG_RESPONSE | FLAG_AUTHORITATIVE,
+            answers,
+            additionals: extra,
+            ..Message::default()
+        };
+        if legacy {
+            msg.id = query.id;
+            msg.questions = query.questions.clone();
+            for r in msg.answers.iter_mut().chain(msg.additionals.iter_mut()) {
+                r.ttl = r.ttl.min(TTL_LEGACY_MAX);
+                r.cache_flush = false;
+            }
+        }
+        Some(msg)
+    }
+}
+
+/// Drop repeated records, keeping the first.
+fn dedupe(v: &mut Vec<ResourceRecord>) {
+    let mut kept: Vec<ResourceRecord> = Vec::with_capacity(v.len());
+    for r in v.drain(..) {
+        if !kept.iter().any(|k| k.same_record(&r)) {
+            kept.push(r);
+        }
+    }
+    *v = kept;
+}
+
+/// Bind the shared mDNS port (`0.0.0.0:5353`, address reuse on).
+fn bind_mdns_socket() -> io::Result<UdpSocket> {
+    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    s.set_reuse_address(true)?;
+    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+    s.set_reuse_port(true)?;
+    s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())?;
+    s.set_multicast_loop_v4(true)?;
+    s.set_multicast_ttl_v4(255)?;
+    Ok(s.into())
+}
+
+/// Join the mDNS group on every interface address; returns the joined
+/// addresses. Falls back to the default interface when none joins.
+fn join_all(sock: &UdpSocket, ifaces: &[LocalInterface], already: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let mut joined = Vec::new();
+    for ip in ifaces.iter().flat_map(|i| i.v4.iter().map(|&(ip, _)| ip)) {
+        if joined.contains(&ip) {
+            continue;
+        }
+        if already.contains(&ip) {
+            joined.push(ip);
+            continue;
+        }
+        match sock.join_multicast_v4(&MDNS_GROUP, &ip) {
+            Ok(()) => joined.push(ip),
+            Err(e) => tracing::debug!("mdns: join on {ip} failed: {e}"),
+        }
+    }
+    if joined.is_empty() && already.is_empty() {
+        if let Err(e) = sock.join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::UNSPECIFIED) {
+            tracing::debug!("mdns: default-interface join failed: {e}");
+        }
+    }
+    joined
+}
+
+/// Send `packet` to the mDNS group out of interface `via` (default route
+/// when `None`).
+fn send_multicast(sock: &UdpSocket, packet: &[u8], via: Option<Ipv4Addr>) {
+    if let Some(ip) = via {
+        if let Err(e) = SockRef::from(sock).set_multicast_if_v4(&ip) {
+            tracing::debug!("mdns: select interface {ip} failed: {e}");
+            return;
+        }
+    }
+    if let Err(e) = sock.send_to(packet, SocketAddr::from((MDNS_GROUP, MDNS_PORT))) {
+        tracing::debug!("mdns: multicast send via {via:?} failed: {e}");
+    }
+}
+
+/// Is this receive error just the read timeout?
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// Where the responder lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Net {
+    /// Real mDNS: shared port 5353, multicast joins and announcements.
+    Multicast,
+    /// Tests: a private loopback socket answering unicast queries only.
+    Loopback,
+}
+
+/// Publishes one OpenView host on the LAN until stopped or dropped (a drop
+/// sends the goodbye packet).
 pub struct Advertiser {
     stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-    /// The socket the responder answers from (kept for tests / stats).
-    socket: UdpSocket,
+    thread: Option<JoinHandle<()>>,
+    instance: String,
+    local: SocketAddr,
 }
 
 impl Advertiser {
-    /// Advertise this peer on mDNS. `bind` should be a loopback address in
-    /// tests (`127.0.0.1:0`) and `MDNS_GROUP`-routable on a real interface
-    /// in production. `pairing_code` is the 6-digit code used for the TCP
-    /// instance name `ov-<code>`.
-    pub fn start(
-        bind: SocketAddr,
-        fingerprint: [u8; 16],
-        udp_port: u16,
-        tcp_port: Option<u16>,
-        pairing_code: &str,
-    ) -> Result<Self, DiscoveryError> {
-        let socket = UdpSocket::bind(bind)?;
-        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-        if bind.ip().is_loopback() {
-            // Loopback tests: no multicast join needed — queries are unicast
-            // to our socket, replies go back to the querier's source address.
+    /// Start advertising on every LAN interface (shared UDP 5353).
+    ///
+    /// Fails only when the mDNS port cannot be bound (another process holds
+    /// it exclusively).
+    pub fn start(cfg: AdvertiseConfig) -> Result<Self, DiscoveryError> {
+        let sock = bind_mdns_socket()
+            .map_err(|e| DiscoveryError::Advertise(format!("cannot bind UDP {MDNS_PORT}: {e}")))?;
+        Self::spawn(cfg, sock, Net::Multicast)
+    }
+
+    /// Test helper: answer unicast queries on a private `127.0.0.1` port
+    /// (see [`local_addr`](Self::local_addr)); no multicast, no
+    /// announcements. Pair with [`Browser::start_unicast`].
+    pub fn start_loopback(cfg: AdvertiseConfig) -> Result<Self, DiscoveryError> {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        Self::spawn(cfg, sock, Net::Loopback)
+    }
+
+    fn spawn(cfg: AdvertiseConfig, sock: UdpSocket, net: Net) -> Result<Self, DiscoveryError> {
+        sock.set_read_timeout(Some(RECV_TICK))?;
+        let local = sock.local_addr()?;
+        let ifaces = if net == Net::Multicast {
+            netif::lan_interfaces()
         } else {
-            // Best-effort multicast join on the default interface; a failure
-            // here means no LAN visibility but the advertiser still runs.
-            let _ = socket.join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::UNSPECIFIED);
-        }
-
-        let id = txt_id(&fingerprint);
-        // Instance names must be unique per responder (DNS-SD requirement):
-        // two peers on one LAN share the service type, so the UDP instance
-        // carries a fingerprint suffix. Two peers with the same 6-digit
-        // pairing code would otherwise collide in browse-side dedupe.
-        let fp_tag: String = fingerprint
-            .iter()
-            .take(4)
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let udp_instance = format!("openview-{fp_tag}.{SERVICE_UDP}");
-        let tcp_instance = format!("ov-{pairing_code}.{SERVICE_TCP}");
-        let host = "openview.local";
-
+            Vec::new()
+        };
+        let joined = if net == Net::Multicast {
+            join_all(&sock, &ifaces, &[])
+        } else {
+            Vec::new()
+        };
+        let records = ServiceRecords::new(&cfg, &cfg.publish_addrs(&ifaces));
+        let instance = records.instance.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = stop.clone();
-        let answer_socket = socket.try_clone()?;
-        let thread = thread::spawn(move || {
-            let mut buf = [0u8; 1500];
-            while !stop2.load(Ordering::Relaxed) {
-                let (n, src) = match answer_socket.recv_from(&mut buf) {
-                    Ok(x) => x,
-                    Err(_) => continue, // timeout tick: re-check the stop flag
-                };
-                if !query_matches(&buf[..n], SERVICE_UDP) && !query_matches(&buf[..n], SERVICE_TCP)
-                {
-                    continue;
-                }
-                // Answer with our records for the queried service (both
-                // instances when both services match — cheap and simple).
-                let mut records = vec![
-                    Record::Ptr {
-                        name: SERVICE_UDP,
-                        target: &udp_instance,
-                    },
-                    Record::Srv {
-                        name: &udp_instance,
-                        host,
-                        port: udp_port,
-                    },
-                    Record::Txt {
-                        name: &udp_instance,
-                        entries: std::slice::from_ref(&id),
-                    },
-                    Record::A {
-                        name: host,
-                        ip: [127, 0, 0, 1],
-                    },
-                ];
-                if let Some(tp) = tcp_port {
-                    records.push(Record::Ptr {
-                        name: SERVICE_TCP,
-                        target: &tcp_instance,
-                    });
-                    records.push(Record::Srv {
-                        name: &tcp_instance,
-                        host,
-                        port: tp,
-                    });
-                    records.push(Record::Txt {
-                        name: &tcp_instance,
-                        entries: std::slice::from_ref(&id),
-                    });
-                }
-                if let Ok(packet) = encode_response(&records) {
-                    // Reply unicast to the querier (RFC 6762 §18.12 allows
-                    // unicast responses to questions with the QU bit; loopback
-                    // tests rely on it).
-                    let _ = answer_socket.send_to(&packet, src);
-                }
-            }
-        });
-
+        let responder = Responder {
+            cfg,
+            sock,
+            net,
+            ifaces,
+            joined,
+            records,
+            last_multicast: None,
+        };
+        let flag = stop.clone();
+        let thread = thread::Builder::new()
+            .name("ov-mdns-advertise".into())
+            .spawn(move || responder.run(&flag))
+            .map_err(DiscoveryError::Io)?;
         Ok(Self {
             stop,
             thread: Some(thread),
-            socket,
+            instance,
+            local,
         })
     }
 
-    /// The bound address of the responder socket.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.socket
-            .local_addr()
-            .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static fallback"))
+    /// The advertised instance name (`<device-id>._openview._udp.local`).
+    pub fn instance_name(&self) -> &str {
+        &self.instance
     }
 
-    /// Stop the responder thread.
+    /// The responder socket's local address (`0.0.0.0:5353` normally).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// Send the goodbye and stop answering (also done on drop). Returns
+    /// within ~200 ms.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
@@ -216,322 +569,652 @@ impl Drop for Advertiser {
     }
 }
 
-/// Does this mDNS packet contain a question for `service`?
-fn query_matches(packet: &[u8], service: &str) -> bool {
-    // Header: ID(2) flags(2) QDCOUNT(2)...
-    if packet.len() < 12 {
-        return false;
-    }
-    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
-    if qdcount == 0 {
-        return false;
-    }
-    // Question name is the first name in the question section.
-    match decode_name(packet, 12) {
-        Ok((name, _)) => name.eq_ignore_ascii_case(service),
-        Err(_) => false,
-    }
+/// The advertiser thread's state.
+struct Responder {
+    cfg: AdvertiseConfig,
+    sock: UdpSocket,
+    net: Net,
+    ifaces: Vec<LocalInterface>,
+    joined: Vec<Ipv4Addr>,
+    records: ServiceRecords,
+    /// The last multicast reply (rate limit: one identical reply per second).
+    last_multicast: Option<(Instant, Vec<u8>)>,
 }
 
-/// Build a one-question mDNS query packet for `service`.
-fn build_query(service: &str) -> Result<Vec<u8>, DiscoveryError> {
-    let mut packet = Vec::with_capacity(64);
-    packet.extend_from_slice(&0u16.to_be_bytes()); // ID 0
-    packet.extend_from_slice(&0x0000u16.to_be_bytes()); // standard query
-    packet.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-    packet.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
-    packet.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-    packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-    packet.extend_from_slice(&encode_name(service)?);
-    packet.extend_from_slice(&12u16.to_be_bytes()); // QTYPE = PTR
-    packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
-    Ok(packet)
-}
-
-/// One parsed answer record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Answer {
-    rtype: u16,
-    name: String,
-    /// SRV port, A address, or TXT entries depending on `rtype`.
-    data: RecordData,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RecordData {
-    Ptr(String),
-    Srv { port: u16, host: String },
-    Txt(Vec<String>),
-    A([u8; 4]),
-}
-
-/// Parse every answer record of an mDNS response packet.
-fn parse_answers(packet: &[u8]) -> Result<Vec<Answer>, DiscoveryError> {
-    if packet.len() < 12 {
-        return Err(DiscoveryError::Truncated);
-    }
-    let ancount = u16::from_be_bytes([packet[6], packet[7]]);
-    let mut i = 12usize;
-    // Skip the question section (QDCOUNT is 0 in our own queries, but be
-    // tolerant of other queriers).
-    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
-    for _ in 0..qdcount {
-        let (_, used) = decode_name(packet, i)?;
-        i += used + 4; // name + QTYPE + QCLASS
-    }
-    let mut answers = Vec::with_capacity(ancount as usize);
-    for _ in 0..ancount {
-        let (name, used) = decode_name(packet, i)?;
-        i += used;
-        if i + 10 > packet.len() {
-            return Err(DiscoveryError::Truncated);
+impl Responder {
+    fn run(mut self, stop: &AtomicBool) {
+        let mut announce_left = 2u8;
+        let mut next_announce = Instant::now();
+        let mut next_refresh = Instant::now() + IFACE_REFRESH;
+        let mut buf = vec![0u8; MAX_PACKET];
+        while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if announce_left > 0 && now >= next_announce {
+                self.announce(false);
+                announce_left -= 1;
+                next_announce = now + ANNOUNCE_GAP;
+            }
+            if self.net == Net::Multicast && now >= next_refresh {
+                next_refresh = now + IFACE_REFRESH;
+                if self.refresh_interfaces() {
+                    announce_left = 2;
+                    next_announce = now;
+                }
+            }
+            match self.sock.recv_from(&mut buf) {
+                Ok((n, src)) => self.handle(&buf[..n], src),
+                Err(e) if is_timeout(&e) => {}
+                // e.g. WSAECONNRESET after an ICMP port-unreachable on
+                // Windows: harmless, but don't spin on a persistent error.
+                Err(e) => {
+                    tracing::debug!("mdns: advertiser recv error: {e}");
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
         }
-        let rtype = u16::from_be_bytes([packet[i], packet[i + 1]]);
-        i += 8; // type + class + ttl
-        let rdlen = u16::from_be_bytes([packet[i], packet[i + 1]]) as usize;
-        i += 2;
-        let rdata = packet.get(i..i + rdlen).ok_or(DiscoveryError::Truncated)?;
-        let rdata_start = i;
-        i += rdlen;
-        let data = match rtype {
-            12 => {
-                let (target, _) = decode_name(packet, rdata_start)?;
-                RecordData::Ptr(target)
+        self.announce(true);
+    }
+
+    /// Multicast the record set (or its goodbye) on every interface.
+    fn announce(&self, goodbye: bool) {
+        if self.net != Net::Multicast {
+            return;
+        }
+        match self.records.announcement(goodbye).encode() {
+            Ok(packet) => self.multicast_on(&packet, &self.ifaces.iter().collect::<Vec<_>>()),
+            Err(e) => tracing::debug!("mdns: cannot encode announcement: {e}"),
+        }
+    }
+
+    /// Send on each of `ifaces` (all joined addresses' interfaces), or the
+    /// default interface when there are none.
+    fn multicast_on(&self, packet: &[u8], ifaces: &[&LocalInterface]) {
+        let mut sent = false;
+        for iface in ifaces {
+            if let Some(&(ip, _)) = iface.v4.iter().find(|(ip, _)| self.joined.contains(ip)) {
+                send_multicast(&self.sock, packet, Some(ip));
+                sent = true;
             }
-            33 => {
-                if rdata.len() < 8 {
-                    return Err(DiscoveryError::Truncated);
-                }
-                let port = u16::from_be_bytes([rdata[4], rdata[5]]);
-                let (host, _) = decode_name(packet, rdata_start + 6)?;
-                RecordData::Srv { port, host }
+        }
+        if !sent {
+            send_multicast(&self.sock, packet, None);
+        }
+    }
+
+    /// Re-read the interfaces; join new ones, rebuild the records, send
+    /// goodbyes for vanished addresses. True when the records changed.
+    fn refresh_interfaces(&mut self) -> bool {
+        let ifaces = netif::lan_interfaces();
+        if ifaces == self.ifaces {
+            return false;
+        }
+        let joined = join_all(&self.sock, &ifaces, &self.joined);
+        for gone in self.joined.iter().filter(|ip| !joined.contains(ip)) {
+            let _ = self.sock.leave_multicast_v4(&MDNS_GROUP, gone);
+        }
+        let records = ServiceRecords::new(&self.cfg, &self.cfg.publish_addrs(&ifaces));
+        let vanished: Vec<ResourceRecord> = self
+            .records
+            .addrs
+            .iter()
+            .filter(|old| !records.addrs.iter().any(|new| new.same_record(old)))
+            .map(|r| ResourceRecord {
+                ttl: 0,
+                ..r.clone()
+            })
+            .collect();
+        if !vanished.is_empty() {
+            let bye = Message {
+                flags: FLAG_RESPONSE | FLAG_AUTHORITATIVE,
+                answers: vanished,
+                ..Message::default()
+            };
+            if let Ok(packet) = bye.encode() {
+                self.multicast_on(&packet, &self.ifaces.iter().collect::<Vec<_>>());
             }
-            16 => {
-                let mut entries = Vec::new();
-                let mut j = 0;
-                while j < rdata.len() {
-                    let l = rdata[j] as usize;
-                    j += 1;
-                    let end = (j + l).min(rdata.len());
-                    entries.push(String::from_utf8_lossy(&rdata[j..end]).into_owned());
-                    j = end;
-                }
-                RecordData::Txt(entries)
+        }
+        let changed = records.addrs != self.records.addrs;
+        tracing::debug!("mdns: interfaces changed; joined {joined:?}");
+        self.ifaces = ifaces;
+        self.joined = joined;
+        self.records = records;
+        changed
+    }
+
+    fn handle(&mut self, packet: &[u8], src: SocketAddr) {
+        let query = match Message::parse(packet) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("mdns: ignoring malformed packet from {src}: {e}");
+                return;
             }
-            1 => {
-                if rdata.len() != 4 {
-                    return Err(DiscoveryError::Truncated);
-                }
-                RecordData::A([rdata[0], rdata[1], rdata[2], rdata[3]])
-            }
-            _ => RecordData::Ptr(String::new()), // ignore unknown types
         };
-        answers.push(Answer { rtype, name, data });
-    }
-    Ok(answers)
-}
-
-/// Collapse parsed answers into discovered peers: an SRV under
-/// `SERVICE_UDP` (with its TXT `id`) is a peer; an SRV under `SERVICE_TCP`
-/// enriches the matching peer with a TCP port. Dedupe by fingerprint.
-fn collapse(answers: &[Answer]) -> Vec<DiscoveredPeer> {
-    // fingerprint -> (udp_port, tcp_port). Insertion order preserved via a
-    // Vec of keys so the result is deterministic.
-    let mut order: Vec<[u8; 16]> = Vec::new();
-    let mut peers: HashMap<[u8; 16], (Option<u16>, Option<u16>)> = HashMap::new();
-
-    // Instance name -> TXT id, resolved in a first pass.
-    let mut instance_id: HashMap<&str, [u8; 16]> = HashMap::new();
-    for a in answers {
-        if let RecordData::Txt(entries) = &a.data {
-            for e in entries {
-                if let Some(fp) = parse_id(e) {
-                    instance_id.insert(a.name.as_str(), fp);
-                }
+        let legacy = src.port() != MDNS_PORT;
+        let Some(reply) = self.records.respond(&query, legacy) else {
+            return;
+        };
+        let packet = match reply.encode() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("mdns: cannot encode reply: {e}");
+                return;
+            }
+        };
+        let unicast = legacy
+            || self.net == Net::Loopback
+            || query.questions.iter().any(|q| q.unicast_response);
+        if unicast {
+            if let Err(e) = self.sock.send_to(&packet, src) {
+                tracing::debug!("mdns: unicast reply to {src} failed: {e}");
+            }
+            return;
+        }
+        // Multicast: at most one identical reply per second (§6).
+        let now = Instant::now();
+        if let Some((at, last)) = &self.last_multicast {
+            if *last == packet && now.duration_since(*at) < Duration::from_secs(1) {
+                return;
             }
         }
+        let on_link: Vec<&LocalInterface> = match src.ip() {
+            IpAddr::V4(v4) => self.ifaces.iter().filter(|i| i.contains(v4)).collect(),
+            IpAddr::V6(_) => Vec::new(),
+        };
+        if on_link.is_empty() {
+            self.multicast_on(&packet, &self.ifaces.iter().collect::<Vec<_>>());
+        } else {
+            self.multicast_on(&packet, &on_link);
+        }
+        self.last_multicast = Some((now, packet));
     }
-    for a in answers {
-        if let RecordData::Srv { port, .. } = &a.data {
-            let Some(fp) = instance_id.get(a.name.as_str()).copied() else {
+}
+
+// ---------------------------------------------------------------------------
+// Browser
+// ---------------------------------------------------------------------------
+
+/// Parsed TXT of an instance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TxtInfo {
+    id: Option<u64>,
+    version: Option<u8>,
+    name: Option<String>,
+}
+
+impl TxtInfo {
+    fn parse(entries: &[Vec<u8>]) -> Self {
+        let mut info = Self::default();
+        for (k, v) in txt_pairs(entries) {
+            let Some(v) = v else { continue };
+            match k.as_str() {
+                "id" => info.id = v.trim().parse().ok(),
+                "v" => info.version = v.trim().parse().ok(),
+                "name" => {
+                    let n = v.trim();
+                    if !n.is_empty() {
+                        info.name = Some(n.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        info
+    }
+}
+
+/// One cached service instance.
+#[derive(Debug, Clone)]
+struct CachedInstance {
+    /// The instance label (`<device-id>`), case preserved.
+    label: String,
+    /// Lowercased SRV target and port.
+    srv: Option<(String, u16)>,
+    txt: TxtInfo,
+    /// Source address of the last packet that carried this instance.
+    src: Option<IpAddr>,
+    last_seen: Instant,
+    expires: Instant,
+}
+
+/// The browser's record cache (pure; driven by [`Cache::ingest`]).
+#[derive(Debug, Default)]
+struct Cache {
+    /// Lowercased instance name -> instance.
+    instances: HashMap<String, CachedInstance>,
+    /// Lowercased host name -> addresses with expiry.
+    hosts: HashMap<String, Vec<(IpAddr, Instant)>>,
+}
+
+/// Lowercased instance name if `name` is `<label>._openview._udp.local`.
+fn instance_key(name: &str) -> Option<(String, String)> {
+    let lower = name.to_ascii_lowercase();
+    let label = lower.strip_suffix(SERVICE_TYPE)?.strip_suffix('.')?;
+    if label.is_empty() {
+        return None;
+    }
+    let label_len = label.len();
+    Some((lower.clone(), name[..label_len].to_string()))
+}
+
+fn hold(now: Instant, ttl: u32) -> Instant {
+    now + Duration::from_secs(u64::from(ttl)).max(MIN_HOLD)
+}
+
+impl Cache {
+    /// Fold one received message in (queries are ignored).
+    fn ingest(&mut self, msg: &Message, src: IpAddr, now: Instant) {
+        if !msg.is_response() {
+            return;
+        }
+        // Pass 1: PTR / SRV / TXT of our service type.
+        for r in msg.records() {
+            let key_name = match (&r.data, r.rtype) {
+                (RData::Ptr(target), TYPE_PTR) if r.name.eq_ignore_ascii_case(SERVICE_TYPE) => {
+                    target.as_str()
+                }
+                (RData::Srv { .. }, TYPE_SRV) | (RData::Txt(_), TYPE_TXT) => r.name.as_str(),
+                _ => continue,
+            };
+            let Some((key, label)) = instance_key(key_name) else {
                 continue;
             };
-            let entry = peers.entry(fp).or_insert_with(|| {
-                order.push(fp);
-                (None, None)
+            if r.ttl == 0 {
+                // Goodbye: a PTR or SRV withdrawal removes the instance.
+                if r.rtype != TYPE_TXT {
+                    self.instances.remove(&key);
+                }
+                continue;
+            }
+            if !self.instances.contains_key(&key) && self.instances.len() >= MAX_CACHE {
+                continue;
+            }
+            let inst = self.instances.entry(key).or_insert_with(|| CachedInstance {
+                label,
+                srv: None,
+                txt: TxtInfo::default(),
+                src: None,
+                last_seen: now,
+                expires: now,
             });
-            let is_udp = a.name.ends_with(SERVICE_UDP);
-            if is_udp {
-                entry.0 = Some(*port);
-            } else if a.name.ends_with(SERVICE_TCP) {
-                entry.1 = Some(*port);
+            match &r.data {
+                RData::Srv { port, target, .. } => {
+                    inst.srv = Some((target.to_ascii_lowercase(), *port));
+                }
+                RData::Txt(entries) => inst.txt = TxtInfo::parse(entries),
+                _ => {}
+            }
+            inst.src = Some(src);
+            inst.last_seen = now;
+            inst.expires = inst.expires.max(hold(now, r.ttl));
+        }
+        // Pass 2: addresses of host names an instance points at.
+        for r in msg.records() {
+            let ip = match r.data {
+                RData::A(v4) => IpAddr::V4(v4),
+                RData::Aaaa(v6) => IpAddr::V6(v6),
+                _ => continue,
+            };
+            let host = r.name.to_ascii_lowercase();
+            let referenced = self
+                .instances
+                .values()
+                .any(|i| i.srv.as_ref().is_some_and(|(t, _)| *t == host));
+            if !referenced {
+                continue;
+            }
+            if r.ttl == 0 {
+                if let Some(list) = self.hosts.get_mut(&host) {
+                    list.retain(|(a, _)| *a != ip);
+                }
+                continue;
+            }
+            if !self.hosts.contains_key(&host) && self.hosts.len() >= MAX_CACHE {
+                continue;
+            }
+            let list = self.hosts.entry(host.clone()).or_default();
+            let until = hold(now, r.ttl);
+            if let Some(entry) = list.iter_mut().find(|(a, _)| *a == ip) {
+                entry.1 = entry.1.max(until);
+            } else if list.len() < 16 {
+                list.push((ip, until));
+            }
+            for inst in self.instances.values_mut() {
+                if inst.srv.as_ref().is_some_and(|(t, _)| *t == host) {
+                    inst.last_seen = now;
+                    inst.src = Some(src);
+                }
             }
         }
     }
-    order
-        .into_iter()
-        .filter_map(|fp| {
-            peers.get(&fp).and_then(|(udp, tcp)| {
-                udp.map(|udp_port| DiscoveredPeer {
-                    fingerprint: fp,
-                    udp_port,
-                    tcp_port: *tcp,
-                })
-            })
+
+    /// Drop expired instances and addresses.
+    fn expire(&mut self, now: Instant) {
+        self.instances.retain(|_, i| i.expires > now);
+        for list in self.hosts.values_mut() {
+            list.retain(|(_, until)| *until > now);
+        }
+        self.hosts.retain(|_, list| !list.is_empty());
+    }
+
+    /// Resolved hosts, deduplicated by device id, sorted by name.
+    fn hosts(&self) -> Vec<DiscoveredHost> {
+        let mut out: Vec<DiscoveredHost> = Vec::new();
+        for inst in self.instances.values() {
+            let Some((target, port)) = &inst.srv else {
+                continue;
+            };
+            let Some(device_id) = inst.txt.id.or_else(|| inst.label.parse().ok()) else {
+                continue;
+            };
+            let known: Vec<IpAddr> = self
+                .hosts
+                .get(target)
+                .map(|l| l.iter().map(|(ip, _)| *ip).collect())
+                .unwrap_or_default();
+            let mut ips: Vec<IpAddr> = Vec::with_capacity(known.len() + 1);
+            if let Some(src) = inst.src {
+                if known.contains(&src) || known.is_empty() {
+                    ips.push(src);
+                }
+            }
+            ips.extend(known.iter().filter(|ip| ip.is_ipv4()));
+            ips.extend(known.iter().filter(|ip| ip.is_ipv6()));
+            let mut addrs: Vec<SocketAddr> = Vec::with_capacity(ips.len());
+            for ip in ips {
+                let a = SocketAddr::new(ip, *port);
+                if !addrs.contains(&a) {
+                    addrs.push(a);
+                }
+            }
+            if addrs.is_empty() {
+                continue;
+            }
+            let host = DiscoveredHost {
+                device_id,
+                name: inst.txt.name.clone().unwrap_or_else(|| inst.label.clone()),
+                addrs,
+                version: inst.txt.version,
+                last_seen: inst.last_seen,
+            };
+            match out.iter_mut().find(|h| h.device_id == device_id) {
+                Some(existing) if existing.last_seen < host.last_seen => *existing = host,
+                Some(_) => {}
+                None => out.push(host),
+            }
+        }
+        out.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then(a.device_id.cmp(&b.device_id))
+        });
+        out
+    }
+}
+
+/// Where the browser sends its queries.
+#[derive(Debug, Clone)]
+enum QueryTargets {
+    /// The mDNS group, out of every LAN interface.
+    Multicast(Vec<Ipv4Addr>),
+    /// Fixed unicast responders (tests).
+    Unicast(Vec<SocketAddr>),
+}
+
+/// State shared between a [`Browser`] handle and its thread.
+#[derive(Debug, Default)]
+struct BrowserShared {
+    stop: AtomicBool,
+    hosts: Mutex<Vec<DiscoveredHost>>,
+}
+
+/// A continuous browse for OpenView hosts. Results accumulate in the
+/// background; [`hosts`](Self::hosts) returns the current snapshot. Stop it
+/// (or drop it) when the list is no longer shown.
+pub struct Browser {
+    shared: Arc<BrowserShared>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Browser {
+    /// Start browsing the LAN.
+    ///
+    /// Fails only when no UDP socket can be bound at all; a busy 5353 just
+    /// means announcements are not overheard (query replies still arrive).
+    pub fn start() -> Result<Self, DiscoveryError> {
+        let ifaces = netif::lan_interfaces();
+        let query = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        query.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
+        query.set_multicast_loop_v4(true)?;
+        query.set_multicast_ttl_v4(255)?;
+        let query: UdpSocket = query.into();
+        let listen = match bind_mdns_socket() {
+            Ok(s) => {
+                join_all(&s, &ifaces, &[]);
+                Some(s)
+            }
+            Err(e) => {
+                tracing::debug!("mdns: browser cannot share UDP {MDNS_PORT}: {e}");
+                None
+            }
+        };
+        let via = ifaces
+            .iter()
+            .filter_map(|i| i.v4.first().map(|&(ip, _)| ip))
+            .collect();
+        Self::spawn(query, listen, QueryTargets::Multicast(via))
+    }
+
+    /// Test helper: query fixed responders by unicast (e.g. an
+    /// [`Advertiser::start_loopback`]); nothing is multicast.
+    pub fn start_unicast(responders: &[SocketAddr]) -> Result<Self, DiscoveryError> {
+        let query = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        Self::spawn(query, None, QueryTargets::Unicast(responders.to_vec()))
+    }
+
+    fn spawn(
+        query: UdpSocket,
+        listen: Option<UdpSocket>,
+        targets: QueryTargets,
+    ) -> Result<Self, DiscoveryError> {
+        query.set_read_timeout(Some(BROWSE_TICK))?;
+        if let Some(l) = &listen {
+            l.set_read_timeout(Some(BROWSE_TICK))?;
+        }
+        let shared = Arc::new(BrowserShared::default());
+        let worker = Querier {
+            query,
+            listen,
+            targets,
+            cache: Cache::default(),
+            shared: shared.clone(),
+        };
+        let thread = thread::Builder::new()
+            .name("ov-mdns-browse".into())
+            .spawn(move || worker.run())
+            .map_err(DiscoveryError::Io)?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
         })
-        .collect()
+    }
+
+    /// The hosts currently known (resolved, not expired), sorted by name.
+    pub fn hosts(&self) -> Vec<DiscoveredHost> {
+        self.shared
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The host with this device id, if currently known.
+    pub fn find(&self, device_id: u64) -> Option<DiscoveredHost> {
+        self.shared
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|h| h.device_id == device_id)
+            .cloned()
+    }
+
+    /// Stop the background thread (also done on drop).
+    pub fn stop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
-/// Browse for OpenView peers until `deadline`. Queries both services,
-/// collects answers, and returns deduplicated peers. `bind` should be
-/// loopback in tests; on a real interface the OS routes the multicast group.
-pub fn browse(bind: SocketAddr, deadline: Instant) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
-    let socket = UdpSocket::bind(bind)?;
-    socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-    if bind.ip().is_loopback() {
-        // Loopback: send queries unicast to each responder we know about is
-        // impossible before discovery, so the test helper
-        // [`browse_loopback`] takes explicit responder addresses instead.
-        return Ok(Vec::new());
+impl Drop for Browser {
+    fn drop(&mut self) {
+        self.stop();
     }
-    let _ = socket.join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::UNSPECIFIED);
-    let group = SocketAddr::from((MDNS_GROUP, MDNS_PORT));
-    let query_udp = build_query(SERVICE_UDP)?;
-    let query_tcp = build_query(SERVICE_TCP)?;
-    let mut answers = Vec::new();
-    while Instant::now() < deadline {
-        socket.send_to(&query_udp, group)?;
-        socket.send_to(&query_tcp, group)?;
-        let until = Instant::now() + Duration::from_millis(200);
-        let mut buf = [0u8; 1500];
-        while Instant::now() < until && Instant::now() < deadline {
-            match socket.recv_from(&mut buf) {
-                Ok((n, _)) => answers.extend(parse_answers(&buf[..n])?),
-                Err(_) => break, // timeout tick: re-query
-            }
-        }
-        let peers = collapse(&answers);
-        if !peers.is_empty() {
-            return Ok(peers);
-        }
-    }
-    Ok(collapse(&answers))
 }
 
-/// Browse specific responder sockets directly (loopback tests): sends a
-/// unicast query to each responder address and parses the replies. Polls
-/// with a deadline instead of sleeping indefinitely.
-pub fn browse_loopback(
-    bind: SocketAddr,
-    responders: &[SocketAddr],
-    deadline: Instant,
-) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
-    let socket = UdpSocket::bind(bind)?;
-    socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-    let query_udp = build_query(SERVICE_UDP)?;
-    let query_tcp = build_query(SERVICE_TCP)?;
-    let mut answers = Vec::new();
-    while Instant::now() < deadline {
-        for r in responders {
-            socket.send_to(&query_udp, r)?;
-            socket.send_to(&query_tcp, r)?;
-        }
-        let mut buf = [0u8; 1500];
-        let until = Instant::now() + Duration::from_millis(50);
-        let before = answers.len();
-        while Instant::now() < until {
-            match socket.recv_from(&mut buf) {
-                Ok((n, _)) => answers.extend(parse_answers(&buf[..n])?),
-                Err(_) => break,
+/// The browser thread.
+struct Querier {
+    query: UdpSocket,
+    listen: Option<UdpSocket>,
+    targets: QueryTargets,
+    cache: Cache,
+    shared: Arc<BrowserShared>,
+}
+
+impl Querier {
+    fn run(mut self) {
+        let packet = match build_ptr_query() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("mdns: cannot build query: {e}");
+                return;
+            }
+        };
+        let mut next_query = Instant::now();
+        let mut gap_idx = 0usize;
+        let mut buf = vec![0u8; MAX_PACKET];
+        while !self.shared.stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if now >= next_query {
+                self.send_query(&packet);
+                next_query = now + Duration::from_secs(QUERY_GAPS[gap_idx]);
+                gap_idx = (gap_idx + 1).min(QUERY_GAPS.len() - 1);
+            }
+            let mut changed = Self::drain(&self.query, &mut self.cache, &mut buf);
+            if let Some(l) = &self.listen {
+                changed |= Self::drain(l, &mut self.cache, &mut buf);
+            }
+            let before = self.cache.instances.len();
+            self.cache.expire(Instant::now());
+            if changed || before != self.cache.instances.len() {
+                let snapshot = self.cache.hosts();
+                *self
+                    .shared
+                    .hosts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = snapshot;
             }
         }
-        let peers = collapse(&answers);
-        // Keep going until either every responder answered (quiescent round:
-        // no new answers this round) or the deadline expires, so multi-
-        // responder setups are not cut short by the fastest reply.
-        if !peers.is_empty() && answers.len() == before {
-            return Ok(peers);
+    }
+
+    fn send_query(&self, packet: &[u8]) {
+        match &self.targets {
+            QueryTargets::Multicast(via) if via.is_empty() => {
+                send_multicast(&self.query, packet, None);
+            }
+            QueryTargets::Multicast(via) => {
+                for ip in via {
+                    send_multicast(&self.query, packet, Some(*ip));
+                }
+            }
+            QueryTargets::Unicast(list) => {
+                for to in list {
+                    if let Err(e) = self.query.send_to(packet, to) {
+                        tracing::debug!("mdns: query to {to} failed: {e}");
+                    }
+                }
+            }
         }
     }
-    Ok(collapse(&answers))
+
+    /// Receive until the socket times out; true when anything was cached.
+    fn drain(sock: &UdpSocket, cache: &mut Cache, buf: &mut [u8]) -> bool {
+        let mut got = false;
+        loop {
+            match sock.recv_from(buf) {
+                Ok((n, src)) => match Message::parse(&buf[..n]) {
+                    Ok(msg) => {
+                        if msg.is_response() {
+                            cache.ingest(&msg, src.ip(), Instant::now());
+                            got = true;
+                        }
+                    }
+                    Err(e) => tracing::debug!("mdns: ignoring malformed packet from {src}: {e}"),
+                },
+                Err(e) if is_timeout(&e) => return got,
+                Err(e) => {
+                    // Windows reports an earlier ICMP unreachable here;
+                    // keep browsing.
+                    tracing::debug!("mdns: browse recv error: {e}");
+                    return got;
+                }
+            }
+            // Bounded: after a busy burst, give the query timer a turn.
+            if got && cache.instances.len() >= MAX_CACHE {
+                return got;
+            }
+        }
+    }
+}
+
+/// `PTR _openview._udp.local` (QM; sent from an ephemeral port, so every
+/// responder replies by unicast).
+fn build_ptr_query() -> Result<Vec<u8>, DiscoveryError> {
+    Message {
+        questions: vec![Question {
+            name: SERVICE_TYPE.to_string(),
+            qtype: TYPE_PTR,
+            unicast_response: false,
+        }],
+        ..Message::default()
+    }
+    .encode()
+}
+
+/// Browse for `timeout` and return every host found.
+pub fn browse(timeout: Duration) -> Result<Vec<DiscoveredHost>, DiscoveryError> {
+    let mut b = Browser::start()?;
+    thread::sleep(timeout);
+    let hosts = b.hosts();
+    b.stop();
+    Ok(hosts)
+}
+
+/// Find the host with `device_id`, returning as soon as it resolves, or
+/// `None` after `timeout`.
+pub fn resolve(
+    device_id: u64,
+    timeout: Duration,
+) -> Result<Option<DiscoveredHost>, DiscoveryError> {
+    let b = Browser::start()?;
+    Ok(wait_for(&b, device_id, timeout))
+}
+
+/// Poll `b` for `device_id` until `timeout`.
+fn wait_for(b: &Browser, device_id: u64, timeout: Duration) -> Option<DiscoveredHost> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(h) = b.find(device_id) {
+            return Some(h);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn txt_id_roundtrip() {
-        let fp = [0x0Fu8; 16];
-        let s = txt_id(&fp);
-        assert_eq!(s, "id=0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f");
-        assert_eq!(parse_id(&s), Some(fp));
-        assert_eq!(parse_id("id=xyz"), None);
-        assert_eq!(parse_id("port=4242"), None);
-    }
-
-    #[test]
-    fn query_matches_service_names() {
-        let q = build_query(SERVICE_UDP).unwrap();
-        assert!(query_matches(&q, SERVICE_UDP));
-        assert!(!query_matches(&q, SERVICE_TCP));
-        assert!(!query_matches(&[0u8; 4], SERVICE_UDP));
-    }
-
-    #[test]
-    fn collapse_dedupes_and_merges_services() {
-        let fp = [7u8; 16];
-        let id = txt_id(&fp);
-        let answers = vec![
-            Answer {
-                rtype: 12,
-                name: SERVICE_UDP.into(),
-                data: RecordData::Ptr(format!("openview.{SERVICE_UDP}")),
-            },
-            Answer {
-                rtype: 33,
-                name: format!("openview.{SERVICE_UDP}"),
-                data: RecordData::Srv {
-                    port: 5000,
-                    host: "openview.local".into(),
-                },
-            },
-            Answer {
-                rtype: 16,
-                name: format!("openview.{SERVICE_UDP}"),
-                data: RecordData::Txt(vec![id.clone()]),
-            },
-            Answer {
-                rtype: 33,
-                name: format!("ov-654321.{SERVICE_TCP}"),
-                data: RecordData::Srv {
-                    port: 5001,
-                    host: "openview.local".into(),
-                },
-            },
-            Answer {
-                rtype: 16,
-                name: format!("ov-654321.{SERVICE_TCP}"),
-                data: RecordData::Txt(vec![id]),
-            },
-        ];
-        let peers = collapse(&answers);
-        assert_eq!(peers.len(), 1, "same id across both services must dedupe");
-        assert_eq!(peers[0].fingerprint, fp);
-        assert_eq!(peers[0].udp_port, 5000);
-        assert_eq!(peers[0].tcp_port, Some(5001));
-    }
-
-    #[test]
-    fn collapse_ignores_srv_without_id() {
-        let answers = vec![Answer {
-            rtype: 33,
-            name: format!("openview.{SERVICE_UDP}"),
-            data: RecordData::Srv {
-                port: 5000,
-                host: "openview.local".into(),
-            },
-        }];
-        assert!(collapse(&answers).is_empty());
-    }
-}
+mod tests;

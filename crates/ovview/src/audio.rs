@@ -1,25 +1,24 @@
-//! Speaker playback (v0.21; Phase 4 rework).
+//! Speaker playback.
 //!
 //! The host's `AUDIO` commands (raw PCM, or Opus once our CAPS advertised
 //! `CAP_OPUS`) are decoded by the command hook into a shared [`AudioBus`];
 //! a dedicated playback thread drains it into the default output device.
 //!
-//! Phase 4: the bus is a [`ovapp::audio::JitterBuffer`] (60 ms prefill
-//! target, oldest audio dropped past 120 ms, re-prefill after an underrun)
-//! instead of a 400 ms drop-oldest ring, and the device is
-//! [`ovapp::winaudio::WinmmSpeaker`]: three rotating 20 ms `waveOut`
-//! headers refilled on the driver's completion event, replacing one header
-//! re-written after a `sleep(2)` poll (which left the device idle between
-//! buffers). Shared with `ovhost::speaker`.
+//! The bus is a [`ovapp::audio::JitterBuffer`] (prefill target and ceiling
+//! set by the session; oldest audio dropped past the ceiling, re-prefill
+//! after an underrun), and the device is [`ovapp::winaudio::WinmmSpeaker`]:
+//! three rotating 20 ms `waveOut` headers refilled on the driver's
+//! completion event, so the device never idles between buffers. Shared with
+//! `ovhost::speaker`.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-pub use ovapp::audio::AudioBus;
+use ovapp::audio::AudioBus;
 
 /// Spawn the playback thread for `bus`; it runs until `stop` is set (join
 /// the handle to release the device). `None` off Windows.
-pub fn spawn(bus: AudioBus, stop: Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
+pub(crate) fn spawn(bus: AudioBus, stop: Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
     #[cfg(windows)]
     {
         ovapp::winaudio::spawn_playback(bus, stop, "ovview-audio")

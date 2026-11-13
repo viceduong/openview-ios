@@ -8,13 +8,33 @@ liveness, file transfer) lives in Rust. Swift only moves bytes and renders.
 
 | | |
 |---|---|
-| Source | `crates/ovffi/src/lib.rs` |
+| Source | `crates/ovffi/src/` (module map below; `lib.rs` holds the crate doc and the module list) |
 | C header | `ios/OvFFI/include/shim.h` (+ `module.modulemap`, module `OvFFI`, shipped inside the XCFramework; Swift uses `import OvFFI`) |
 | Swift wrapper | `ios/RemoteView/RemoteView/Transport/OvFFI.swift` (`OvSessionBox`, `OvScreenBox`) |
-| Tests | `src/tests.rs`, `src/relay_tests.rs`, `src/direct_tests.rs`, `src/pin_tests.rs`, `src/header_tests.rs` |
-| Dependencies | `ovcore`, `ovtransport`, `ovapp`; dev-dep `ovrelay` (`Cargo.toml`) |
+| Tests | `src/tests/` (`ffi.rs`, `relay.rs`, `direct.rs`, `pin.rs`, `header.rs`) |
+| Dependencies | `ovcore`, `ovtransport` (without the `ws-client` feature: the app owns its WebSocket and uses the byte-stream bridge), `ovapp`; dev-dep `ovrelay` (`Cargo.toml`) |
 
-The header and `lib.rs` export the same 53 `ov_*` symbols; `header_tests`
+Module map (`crates/ovffi/src/`):
+
+| File | Contents |
+|---|---|
+| `lib.rs` | Crate doc (design notes, error codes), module list |
+| `error.rs` | `OV_ERR_*` codes, error mapping, the `ffi_guard!` panic guard |
+| `cabi.rs` | Pointer and buffer helpers shared by the entry points |
+| `callbacks.rs` | Session callback types and `Sink` |
+| `identity.rs` | `ov_identity_*` |
+| `session.rs` | `ov_session_*`: lifecycle, sinks, handshake, records; `device_id_from_fp` |
+| `pump.rs` | Handshake progress, record decryption, sending on the current path |
+| `transport.rs` | The session transport: host-owned datagram path or relay tunnel |
+| `relay.rs` | Rust-owned TCP relay, the host-owned byte-stream bridge, the wake sink, the relay pump, `relay_session_id` |
+| `direct.rs` | The direct UDP engine over shell-owned per-candidate paths |
+| `media.rs` | Media-channel negotiation and delivery as channel-0 commands |
+| `file_transfer.rs` | `ov_file_send` |
+| `screen/mod.rs` | `ov_screen_*`: the channel-0 screen assembler |
+| `screen/feed.rs`, `screen/framebuffer.rs`, `screen/liveness.rs`, `screen/sinks.rs`, `screen/video.rs` | Command decode and routing; zero-copy framebuffer access; keepalive and watchdog; screen sink types and setters; H.264 pass-through |
+| `tests/mod.rs` | Tests through the C entry points |
+
+The header and the crate export the same 53 `ov_*` symbols; `src/tests/header.rs`
 fails `cargo test -p ovffi` when they drift apart (it also checks the
 `ov_video_packet` field order and the shared constants). Swift calls all of
 them except `ov_identity_fingerprint` and `ov_identity_free`.
@@ -49,7 +69,7 @@ to `ov_session_send_record(channel 0)`.
 
 ### Error codes
 
-These come from the module doc in `lib.rs` (and the top of `shim.h`):
+These come from the module doc in `lib.rs` and `error.rs` (and the top of `shim.h`):
 
 | Code | Meaning | Swift `OvSessionBox.FfiError` |
 |---|---|---|
@@ -201,7 +221,7 @@ int32_t ov_session_begin_pin(OvSession *s, const uint8_t *pin, size_t pin_len);
 - A wrong PIN fails the pump with `-3` on both sides; a host that is
   throttling PIN attempts answers `-7`, and `ov_session_retry_after_secs`
   (below) tells the client how long to wait. Tested end to end through the
-  C API in `src/pin_tests.rs`.
+  C API in `src/tests/pin.rs`.
 
 ```c
 int64_t ov_session_retry_after_secs(OvSession *s); /* -1 = not rate limited */
@@ -494,11 +514,11 @@ LOCAL_CAPS | CAP_LZ4 | VIEWER_W2_CAPS        (always)
 ```
 
 Here `LOCAL_CAPS = TILES|ZSTD|KEYFRAME|RUDP|INPUT2|LZ4|BANDS|MOVE` and
-`VIEWER_W2_CAPS = LOSSY|CACHE` (`ovapp/src/terminal.rs`). **Install the
+`VIEWER_W2_CAPS = LOSSY|CACHE` (`ovapp/src/terminal/caps.rs`). **Install the
 Opus and video sinks and set the direct-capable flag before the first
 feed.** CAPS go out only once per screen.
 
-Bit values (`ovapp/src/terminal.rs`):
+Bit values (`ovapp/src/terminal/caps.rs`):
 
 | Bit | Cap |
 |---|---|
@@ -688,7 +708,7 @@ the session drops the Rust-owned TCP relay socket.
 Run with `cargo test -p ovffi`. The tests call the `extern "C"` functions
 directly.
 
-**`src/tests.rs`**
+**`src/tests/ffi.rs`**
 
 | Test | Covers |
 |---|---|
@@ -707,7 +727,7 @@ directly.
 | `screen_passes_h264_through_and_advertises_cap_h264` | H.264 pass-through, CAP_H264, IDR requests |
 | `screen_decodes_lz4_frames` | LZ4 frames |
 
-**`src/relay_tests.rs`** — uses a real in-process `ovrelay::Relay`. Each
+**`src/tests/relay.rs`** — uses a real in-process `ovrelay::Relay`. Each
 session has its own `Collector`, so there is no global state.
 
 | Test | Covers |
@@ -718,7 +738,7 @@ session has its own `Collector`, so there is no global state.
 | `relay_wake_sink_delivers_without_waiting_for_the_tick` | Wake sink compared with the 50 ms tick (`measure_relay_latency`) |
 | `relay_wake_sink_is_inert_without_a_tcp_relay` | Returns `0` |
 
-**`src/direct_tests.rs`** — an iOS-style client (relay plus shell-owned
+**`src/tests/direct.rs`** — an iOS-style client (relay plus shell-owned
 direct paths through the C sinks) against a desktop host (`TerminalSession`
 + `DirectCarrier`).
 
@@ -734,15 +754,9 @@ direct paths through the C sinks) against a desktop host (`TerminalSession`
 
 These are observed in the code; nothing was changed.
 
-- **`ov_session_pump` collapses errors to `-3`.** This includes `-2` (no
-  transport) and `-4` (send failure). `pump_relay` does the same for
-  `pump_inner` errors. A pre-handshake transport hiccup can therefore look
-  like a crypto failure to the shell.
-- **Stale monitors doc.** The `MonitorsSink` doc comment says 13-byte
-  records; the wire and the Swift side use 17 bytes.
 - **`OpusSink` gap signal is ignored on iOS.** The NULL-packet "audio lost"
   call is dropped by the Swift trampoline's `guard let packet` (also noted
-  in the `lib.rs` comment).
+  in the `OpusSink` doc comment, `screen/sinks.rs`).
 - **Unused identity calls.** `ov_identity_fingerprint` and
   `ov_identity_free` are exported but not called from Swift.
 - **`ov_session_set_wake_sink` nullability.** It takes `Option<WakeSink>`

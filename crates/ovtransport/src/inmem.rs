@@ -1,6 +1,6 @@
 //! In-memory carrier pair — an in-process datagram pipe for tests and for
 //! embedding OpenView inside a single process (e.g. the desktop app talking
-//! to a local test host). Spec §5 / implementation status v0.3.
+//! to a local test host).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

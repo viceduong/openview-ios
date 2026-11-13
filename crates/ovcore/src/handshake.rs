@@ -198,12 +198,16 @@ fn finished_mac(key: &[u8; 32], tag: &[u8], th: &[u8; 32]) -> HmacSha256 {
 
 // ---------------- public API ----------------
 
+/// Which side of the handshake this endpoint plays.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
+    /// The dialing side (sends the first HELLO).
     Client,
+    /// The answering side (validates the client's HELLO, verifies PINs).
     Server,
 }
 
+/// Authentication mode advertised in HELLO (wire byte).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum AuthMode {
@@ -295,16 +299,21 @@ impl Auth {
 /// What a peer told us in its HELLO (validated before this is stored).
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
+    /// The peer's device id.
     pub device_id: u64,
     /// 16-byte fingerprint of the peer's Ed25519 key.
     pub fingerprint: [u8; 16],
+    /// The authentication mode the peer advertised.
     pub auth_mode: AuthMode,
     /// Peer's wall-clock offset estimate in ms (0 in practice).
     pub clock_offset_ms: i64,
+    /// The peer's static X25519 public key.
     pub x25519_static_pk: X25519PublicKey,
+    /// The peer's ephemeral X25519 public key for this handshake.
     pub x25519_eph_pk: X25519PublicKey,
 }
 
+/// Output of the handshake state machine.
 #[derive(Clone, Debug)]
 pub enum HandshakeEvent {
     /// Bytes to send over the wire (one datagram).
@@ -463,6 +472,7 @@ impl Handshake {
         self.throttle = Some(throttle);
     }
 
+    /// Whether the handshake completed and a session is available.
     pub fn is_established(&self) -> bool {
         matches!(self.state, State::Established)
     }
@@ -501,6 +511,7 @@ impl Handshake {
         self.session.take()
     }
 
+    /// What the peer announced in its HELLO, once validated.
     pub fn peer(&self) -> Option<&PeerInfo> {
         self.peer.as_ref()
     }

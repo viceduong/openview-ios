@@ -3,7 +3,6 @@
 //!
 //! Wire format: `header (12 B) || ciphertext (N B) || tag (16 B)` where
 //! header = [sender_id u64 LE][seq u32 LE] and the AAD binds header + channel.
-#![allow(dead_code)]
 
 pub use crate::framing::{
     header_bytes, parse_header, seq_matches, Recorder, HEADER_LEN, MIN_RECORD_LEN, TAG_LEN,

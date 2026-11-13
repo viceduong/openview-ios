@@ -69,8 +69,8 @@ and 20 s in total to send its HTTP upgrade and CONNECT line.
 ### `ovhost`
 
 ```text
-ovhost [--relay HOST:PORT]                              # attended: one session, pairing code
-ovhost --screen [WxH] [--fps N] [--relay HOST:PORT]
+ovhost [--relay ADDR]                                   # attended: one session, pairing code
+ovhost --screen [WxH] [--fps N] [--relay ADDR]
 set OPENVIEW_PIN=<pin> & ovhost --service --screen      # unattended, serve forever
 ```
 
@@ -79,7 +79,7 @@ set OPENVIEW_PIN=<pin> & ovhost --service --screen      # unattended, serve fore
 | Flag | Default | Meaning |
 |---|---|---|
 | `--service` | off (one session, then exit) | Serve sessions forever, with an error backoff of 1 s doubling to 30 s. It is a loop, not a Windows SCM service. |
-| `--relay HOST:PORT` | `127.0.0.1:4569` | Relay to park on. Must be an IP:port. The host connects **out** to it over TCP. |
+| `--relay ADDR` | `127.0.0.1:4569` | Relay to park on: an IP or host name with an optional port (default 4569), or a `ws://` / `wss://` URL. The host connects **out** to it (TCP, or WebSocket over TCP/TLS). |
 | `--unattended` | off | Unattended access: stable device ID and PIN authentication. Needs a PIN (`--unattended needs a PIN (OPENVIEW_PIN or --pin)`). |
 | `--pin <pw>` / env `OPENVIEW_PIN` | — | The access PIN. Implies `--unattended`. Prefer the environment variable: a command line is visible to other processes. |
 | `--data-dir <dir>` | `%LOCALAPPDATA%\OpenView` (`<exe dir>\data` when `portable.txt` sits next to the exe) | Where the unattended identity `ovhost-unattended.id` (= the device ID) and the desktop-effects crash marker live. An identity left next to the exe by an older release is copied here once. |
@@ -113,6 +113,9 @@ set OPENVIEW_PIN=<pin> & ovhost --service --screen      # unattended, serve fore
 |---|---|---|
 | `--direct-port N` | `4570` | UDP port of the direct path, bound on `0.0.0.0` (and `[::]`). The only **inbound** port the host needs; allow it in the firewall. |
 | `--no-direct` | direct on | Relay only, with no direct-path upgrade |
+| `--lan-port N` | `4571` | UDP port for **LAN sessions without the relay**: a viewer on the same network sends its handshake here (`0` = any free port; unattended hosts announce the bound port by mDNS). Allow it in the firewall. |
+| `--no-lan` | LAN on | Do not accept LAN sessions (implies `--no-mdns`) |
+| `--no-mdns` | mDNS on | Unattended mode: do not announce the host on the local network (mDNS / Bonjour `_openview._udp`, UDP 5353). LAN viewers then need its address (`ovview --lan-addr`). |
 | `--no-upnp` | UPnP on | Do not map the direct port on the router (UPnP IGD) |
 | `--stun H:P` | `stun.cloudflare.com:3478` | STUN server used to learn the public address |
 | `--no-stun` | STUN on | Skip the STUN query |
@@ -147,9 +150,9 @@ former `OV_*` / `OVHOST_*` environment variables, which are no longer read)
 ### `ovview`
 
 ```text
-ovview --code <6-digit> [--relay HOST:PORT]
-ovview --id <fingerprint-hex>
-ovview --connect <device_id> [--relay HOST:PORT]      # PIN from OPENVIEW_PIN (or --pin)
+ovview --code <6-digit> [--relay ADDR]
+ovview --id <device_id> [--lan-addr IP:PORT] [--relay-fallback --relay ADDR]   # LAN, PIN as below
+ovview --connect <device_id> [--relay ADDR]           # PIN from OPENVIEW_PIN (or --pin)
 ovview --info <file.ovrec>
 ovview --export <file.ovrec> --out <dir> [--frame N]
 ovview --play <file.ovrec> [--loop]
@@ -161,14 +164,16 @@ ovview --play <file.ovrec> [--loop]
 | Flag | Meaning |
 |---|---|
 | `--code <code>` | Join a host by pairing code through the relay |
-| `--id <hex>` | Join a LAN host by fingerprint: mDNS discovery, then direct UDP. 32 hex characters; non-hex characters are ignored. See the limitations in `crates/ovview.md` §1. |
+| `--id <device_id>` | LAN access without the relay: look the unattended host up on the local network by mDNS (up to 3 s), then run the PIN handshake and the session over direct UDP to its LAN port. Spaces and dashes in the ID are ignored. Needs the PIN like `--connect`. |
+| `--lan-addr IP:PORT[,IP:PORT]` | With `--id`: dial these host addresses (its LAN port, default 4571) instead of the mDNS lookup |
+| `--relay-fallback` | With `--id`: when nobody answers on the LAN, dial the host through `--relay` like `--connect` (a wrong PIN is not retried) |
 | `--connect <device_id>` | Unattended access: dial by the host's numeric device ID and authenticate with its PIN (`OPENVIEW_PIN`, or `--pin <pw>`, which other processes can see) |
 
 **Options**
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--relay HOST:PORT` | `127.0.0.1:4569` | Relay address (IP:port) |
+| `--relay ADDR` | `127.0.0.1:4569` | Relay address: IP or host name with an optional port (default 4569), or a `ws://` / `wss://` URL |
 | `--no-window` | off | Run headless: no window is created (stdin lines are still sent as text) |
 | `--no-h264` | H.264 on | Never accept H.264, so the host sends lossless tiles only. Without Media Foundation (Windows N/KN lacking the Media Feature Pack) H.264 is off automatically. |
 | `--no-direct` | direct on | Stay on the relay |
@@ -252,14 +257,45 @@ clipboard, and audio playback with `--audio`, but no screen. The pairing code
 changes every time `ovhost` starts, and with `--service` it also changes for
 every session.
 
-### 2.2 LAN direct connection
+### 2.2 LAN connection (no relay needed)
 
-The session always starts through the relay. The host then offers direct UDP
-candidates (its LAN IPv4 addresses, loopback, the STUN and UPnP public
-addresses, a global IPv6 address) on **UDP 4570**, and the viewer switches to
-the best working path. Look for `direct: ...` log lines (or `direct_path` status
-events on stdout). With `--rtt-log`, each RTT sample shows `via direct <addr>` or
-`via relay`.
+An **unattended** host (`--unattended`, which the Windows app runs) accepts
+sessions from its own network on its **LAN port** (UDP 4571, `--lan-port`)
+and announces itself by mDNS / Bonjour as `<device-id>._openview._udp.local`
+(TXT `id`, `v`, `name`). A viewer on the same network finds it by device ID
+and dials it directly; no relay is involved:
+
+```powershell
+$env:OPENVIEW_PIN = "<host PIN>"
+ovhost --unattended --screen                       # LAN sessions on UDP 4571 + mDNS
+ovview --id 123456789012                            # mDNS lookup, then direct UDP
+ovview --id 123456789012 --lan-addr 192.168.1.20:4571   # no mDNS (e.g. multicast filtered)
+```
+
+* The handshake is the normal PIN handshake (SPAKE2); `ovview` pins the
+  device ID, so another machine answering the mDNS query fails the
+  handshake. A wrong PIN counts against the host's attempt limit, per source
+  address.
+* The Windows app lists the hosts it finds under **Computers on this
+  network**; connecting to one (or to its ID from the Connect card) uses the
+  LAN path, with the relay as the fallback.
+* The iPhone / iPad app lists them under **On this network** (Bonjour).
+* The host keeps serving the LAN when its relay is unreachable (it reports
+  `session_failed` and retries the relay in the background).
+* An attended host (`ovhost` without a PIN) also listens on the LAN port; it
+  is not announced (its identity changes every run), so dial its address
+  with the pairing code (the iOS app's "Pair with code → LAN").
+* Allow UDP 4571 (and the shared mDNS port UDP 5353) inbound for
+  `ovhost.exe`; `firewall.cmd add` allows all UDP for the program.
+* Turn it off with `--no-lan` (or only the announcement with `--no-mdns`).
+
+**Direct upgrade of a relayed session.** A session that starts on the relay
+(or on the LAN path) is upgraded to a direct UDP path when one works: the
+host offers candidates (its LAN IPv4 addresses, loopback, the STUN and UPnP
+public addresses, a global IPv6 address) on **UDP 4570**, and the viewer
+switches to the best working path. Look for `direct: ...` log lines (or
+`direct_path` status events on stdout). With `--rtt-log`, each RTT sample
+shows `via direct <addr>` or `via relay`.
 
 ```powershell
 ovrelay --bind 0.0.0.0:4569
@@ -270,17 +306,14 @@ ovview  --code NNNNNN --relay 192.168.1.10:4569 --rtt-log
 * Allow UDP 4570 inbound on the host's firewall, or choose another port with
   `--direct-port`.
 * Force relay-only with `--no-direct` on either side.
-* `ovview --id <fingerprint>` (mDNS) exists, but `ovhost` does not advertise
-  mDNS, and the LAN path dials `127.0.0.1` (see `crates/ovview.md` §1).
-  Prefer the relay + direct-upgrade recipe above.
 
 ### 2.3 Through the internet via a relay
 
 Run `ovrelay` on a publicly reachable machine (TCP port open) and point both
-sides at it with `--relay PUBLIC_IP:PORT`. The direct upgrade is still
+sides at it with `--relay <address>`: an IP or host name with an optional
+port (default 4569), e.g. `--relay relay.example.com`. Host names are
+resolved and every returned address is tried. The direct upgrade is still
 attempted through UPnP and STUN. If it fails, the session stays on the relay.
-Both `--relay` values must be numeric IP:port; hostnames are not resolved
-(the value is parsed as a `SocketAddr`).
 
 ### 2.4 WebSocket relay (e.g. behind a Cloudflare tunnel)
 
@@ -294,11 +327,16 @@ This lets an HTTP-only front such as a Cloudflare tunnel expose the relay as
 ovrelay --bind 127.0.0.1:4569      # put the HTTPS/WSS front (tunnel) in front of this port
 ```
 
-* Only the **iOS app** dials over WebSocket (`RelayWebSocket.swift`, using
+* `ovhost` and `ovview` dial it with `--relay wss://<host>/relay` (TLS by
+  the Windows TLS stack, SChannel; `ws://` for a plain-HTTP front). The
+  WebSocket runs on a helper thread inside the process; everything else
+  behaves as with a TCP relay.
+* The **iOS app** dials over WebSocket too (`RelayWebSocket.swift`, using
   `RelayTunnelCarrier::connect_bridge`).
-* `ovhost` and `ovview` only dial raw TCP. Run them against the relay's TCP
-  address (for example `127.0.0.1:4569` on the relay machine, or a LAN or
-  public IP).
+* A host on the relay machine can keep using the raw TCP address
+  (`127.0.0.1:4569`); WebSocket and TCP clients pair with each other.
+* A peer that arrives over WebSocket has no relay-observed address, so the
+  direct UDP upgrade relies on the other candidates (local, UPnP, STUN).
 * The relay sends WebSocket PINGs to keep proxies and tunnels open.
 
 ### 2.5 Unattended PIN host (always reachable)
@@ -307,11 +345,11 @@ ovrelay --bind 127.0.0.1:4569      # put the HTTPS/WSS front (tunnel) in front o
 ovrelay --bind 0.0.0.0:4569
 $env:OPENVIEW_PIN = "my-secret"
 ovhost --service --relay 127.0.0.1:4569 --fps 30 --screen
-# logs: device id 309731599215 (unattended); stdout: {"event":"device_id","id":"309731599215"}
+# logs: device id 123456789012 (unattended); stdout: {"event":"device_id","id":"123456789012"}
 
 # From another computer:
 $env:OPENVIEW_PIN = "my-secret"
-ovview --connect 309731599215 --relay <relay-ip>:4569
+ovview --connect 123456789012 --relay <relay-ip>:4569
 ```
 
 * A PIN implies `--unattended`. `--pin "my-secret"` also works, but the
@@ -332,11 +370,11 @@ ovview --connect 309731599215 --relay <relay-ip>:4569
 ### 2.6 Recording and playback
 
 ```powershell
-ovview --code NNNNNN --relay 1.2.3.4:4569 --record-dir D:\rec   # press F6 to start/stop
-ovview --info   D:\rec\ovview-20261112-101500-123.ovrec
-ovview --export D:\rec\ovview-....ovrec --out D:\frames               # all frames
-ovview --export D:\rec\ovview-....ovrec --out D:\frames --frame 42    # one frame
-ovview --play   D:\rec\ovview-....ovrec --loop
+ovview --code NNNNNN --relay 1.2.3.4:4569 --record-dir C:\rec   # press F6 to start/stop
+ovview --info   C:\rec\ovview-20261112-101500-123.ovrec
+ovview --export C:\rec\ovview-....ovrec --out C:\frames               # all frames
+ovview --export C:\rec\ovview-....ovrec --out C:\frames --frame 42    # one frame
+ovview --play   C:\rec\ovview-....ovrec --loop
 ```
 
 * Recordings hold video frames only: BGRA, DEFLATE, with timestamps.
@@ -387,8 +425,8 @@ cargo run -p ovview --example input_smoke -- 127.0.0.1:4569 NNNNNN
 
 The `input_smoke` example sends a scripted input-v2 sequence. Run the host
 with `--dry-input -vv` (per-input-event lines are trace level) to watch it without anything being injected. For
-an end-to-end test across three processes, see `scripts/e2e_relay.sh` (in the
-README).
+an end-to-end test across three processes, see `scripts/e2e_relay.sh`
+([BUILDING.md](BUILDING.md#tests)).
 
 ---
 
@@ -400,7 +438,9 @@ README).
    same folder as OpenView.exe").
 2. Enter the relay in **Settings → Relay** (the first card). **Relay
    address** is empty by default and must be entered before connecting to
-   another computer; a notice shows while it is missing, and the Remote page
+   another computer: an IP or host name with an optional port (default
+   4569), or a `ws://` / `wss://` URL (the field is validated with the same
+   parser `ovhost` / `ovview` use); a notice shows while it is missing, and the Remote page
    links to Settings. **Run a relay on this PC** (default on) runs the
    bundled `ovrelay --bind 0.0.0.0:4569` (or uses an existing relay on that
    port) and parks this PC's host on `127.0.0.1:4569`; when off, the host
@@ -441,9 +481,10 @@ port). Everything then runs on loopback with simulated input and separate
 data (`%LOCALAPPDATA%\OpenView-dev`), and processes started outside this
 instance are never adopted or stopped, so the real install is not touched.
 
-**Firewall.** The host connects **out** to the relay over TCP and needs one
-inbound port: **UDP 4570** for the direct path (`--direct-port`; UPnP maps
-it unless `--no-upnp`). The bundled relay listens on **TCP 4569** on all
+**Firewall.** The host connects **out** to the relay over TCP. Inbound it
+uses **UDP 4570** for the direct path (`--direct-port`; UPnP maps it unless
+`--no-upnp`), **UDP 4571** for LAN sessions (`--lan-port`) and the shared
+mDNS port **UDP 5353** on the local network. The bundled relay listens on **TCP 4569** on all
 interfaces (`127.0.0.1:<port>` in test mode); allow it inbound when other
 devices use this PC's relay.
 
@@ -472,66 +513,11 @@ Things to note:
   with the GUI's own host (the GUI does not read its PIN).
 * To stop, end `ovhost.exe` and `ovrelay.exe`, or use the GUI's take-over.
   Ending the host with Ctrl-Break or a console close restores desktop
-  effects. A hard kill is repaired at the next start (§5).
+  effects. A hard kill is repaired at the next start (see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 
 ---
 
 ## 5. Troubleshooting
 
-Each entry gives the message as printed by the code, followed by its cause or
-fix.
-
-**Connecting**
-
-| Message | Cause / fix |
-|---|---|
-| `ovview: host did not attach within 35s` / `host not reachable (relay park timed out with no host)` | No host is parked under that code or ID on this relay. Check that both sides use the **same relay address**, that the host shows `waiting on relay ...`, and the code or device ID. Remember that a relay started with an explicit `--bind` must use the port the clients dial (default 4569). |
-| `relay connect failed: ...` (either side), or in the GUI "Can't reach the relay at ... (connection refused)" | The relay is not running or the TCP port is blocked |
-| `bad relay `x`: ...` | `--relay` must be a numeric `IP:PORT` |
-| `handshake failed: ...`, or in the GUI "handshake failed (wrong PIN?)" | Wrong PIN or code, or a device-ID mismatch |
-| `handshake timed out` | The peer attached but the handshake did not finish in time (about 2 s on the viewer, 10 s on the host). |
-| `--unattended needs a PIN (OPENVIEW_PIN or --pin)` / `--connect needs the host's PIN (OPENVIEW_PIN or --pin)` | Set `OPENVIEW_PIN` (or pass `--pin`) |
-| `pass exactly one of --connect, --code or --id` (or a clap usage error) | Viewer target flags are missing or combined |
-| The GUI host shows "Not ready" right after a restart | The relay still held the old park slot ("session already has a responder"). The GUI restarts its own relay for this reason; otherwise wait about 30 s. |
-
-**Screen and input**
-
-| Message | Cause / fix |
-|---|---|
-| `DXGI capture unavailable (...); using GDI` | RDP session, rotated output, secure desktop, or the region is not inside one output. GDI works but is slower; DXGI is retried every 2 s. |
-| `DXGI delivers no desktop image (no active monitor / display off?); using GDI until it does` | The display is off or the output is headless. Capture switches back to DXGI on the first presented frame. |
-| `input injection refused (blocked desktop / UIPI?)` | `SendInput` was refused. The code suggests a blocked desktop or UIPI: input to an elevated window from a non-elevated host, or to the secure desktop. |
-| `Ctrl+Alt+Del: SendSAS unavailable (...)` | See §2.5 (session 0 + `SoftwareSASGeneration`) |
-| `released N stuck key(s)/button(s) after 30s without input` | Keys or buttons held by a viewer that vanished were released. This is expected. |
-| `H.264 encoder failed (...); staying on lossless tiles` / `ovview: no H.264 decoder (...)` | The Media Foundation H.264 encoder or decoder could not be opened. The session continues on tiles. Use `--h264 sw` (or the hidden `--no-gpu-encode`) to try other encoder paths. |
-| `Media Foundation is not installed (Windows N/KN without the Media Feature Pack); H.264 off, streaming lossless tiles` | Expected on Windows N/KN; install the Media Feature Pack to get H.264. Both binaries still start (`mfplat.dll` is delay-loaded). |
-| `link-limited: ~N fps (a frame drains in N ms)` | Bandwidth sets the frame rate. Lower the resolution (`--screen WxH`) or use F1 to choose a fixed rate. |
-| `MMCSS registration failed` | The capture thread keeps normal priority. Harmless. |
-
-**Audio**
-
-| Message | Cause / fix |
-|---|---|
-| `mic unavailable, audio disabled: ...` / `system audio unavailable, ...` | The audio device could not be opened (for example, there is none). The session continues without audio. |
-| No sound in the viewer | Playback starts off: press **F2** or pass `--audio`. Check that **M** (mute) was not toggled by typing. |
-
-**Direct path**
-
-| Message | Cause / fix |
-|---|---|
-| `direct path disabled (UDP 4570: ...)` | The port is in use (another host instance?). Use `--direct-port`. |
-| `direct: STUN via ... failed` / `direct: UPnP mapping unavailable` | No public candidate. The direct path may still work on a LAN; otherwise the session stays on the relay. |
-
-**Desktop effects and the GUI**
-
-| Message | Cause / fix |
-|---|---|
-| Wallpaper stays hidden after a crash | Start `ovhost` once. It logs `restored desktop effects left over by a previous run`, using the marker `ovhost-desktopfx.state`. Effects are never written to the profile, so signing out also restores them. |
-| GUI: "ovhost.exe is missing. It must be in the same folder as OpenView.exe ..." | Reinstall, or put the binaries next to `OpenView.exe` (`OPENVIEW_BIN_DIR` for development) |
-| GUI: "No relay configured ..." | Enter **Settings → Relay → Relay address**, or turn on **Run a relay on this PC** |
-| GUI: "Can't stop the other host (it may run as administrator)" | End `ovhost.exe` in Task Manager, then use **Stop it and take over** again |
-
-**Liveness**: the viewer logs `peer disconnected (no inbound for 15s)` when
-the peer goes quiet, and ends the session after 30 s of silence. The host
-pauses capture after 15 s and ends the session after 30 s (`peer silent for
-30s; ending session`).
+Error messages, their causes and fixes, and where the logs are:
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).

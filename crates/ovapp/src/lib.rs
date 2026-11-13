@@ -1,16 +1,25 @@
-//! `ovapp` — the OpenView application shell (spec v0.6 "application shells").
+//! `ovapp` — the OpenView application layer.
 //!
 //! Everything here sits on top of an established [`ovcore::session::Session`]
-//! (post-handshake AEAD record channel) and moves **command-channel** traffic:
-//! one record = one command. Two building blocks:
+//! (the post-handshake AEAD record channel) and moves **command-channel**
+//! traffic: one record = one command. The main building blocks:
 //!
 //! - [`terminal::TerminalSession`] — the command channel itself (echo, remote
-//!   keystrokes, file transfer, **screen-frame streaming**, ping/pong) plus the
+//!   keystrokes, file transfer, screen-frame streaming, ping/pong) plus the
 //!   carrier pump that keeps a session and its transport in lock-step.
 //! - [`screen`] — the remote-display payload: pixel frames (`Frame`,
 //!   `PixelFormat`) streamed over the command channel and reassembled
 //!   byte-exactly.
+//! - [`sendq`], [`tiles`], [`bands`], [`lossy`], [`video`] — the host-side
+//!   screen encoders and their viewer-side decoders.
+//! - [`audio`] — audio framing, jitter buffering and (optionally) Opus.
 //! - [`chat::ChatSession`] — a thin line-based chat wrapper over TYPE commands.
+//!
+//! Fallible APIs return [`AppError`].
+
+#![warn(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod adapt;
 pub mod audio;
@@ -18,6 +27,7 @@ pub mod bands;
 pub mod chat;
 pub mod clipboard;
 pub mod codec;
+pub mod error;
 pub mod file_transfer;
 pub mod gdisrc;
 pub mod image;
@@ -52,6 +62,7 @@ pub use audio::{
 };
 pub use chat::{ChatSession, LineHook};
 pub use clipboard::ClipboardSync;
+pub use error::AppError;
 pub use gdisrc::GdiScreen;
 pub use image::{bgra_to_ppm, frame_pacing};
 pub use liveness::{Keepalive, LinkStats, Liveness, DEAD_AFTER, KEEPALIVE_INTERVAL, RTT_SMOOTHING};

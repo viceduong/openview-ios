@@ -24,7 +24,10 @@ struct ConnectionTransport: Codable, Equatable {
     var lanHost: String
     var lanPort: UInt16
 
-    static let defaultLanPort: UInt16 = 4570
+    /// The host's LAN session port (`ovhost --lan-port`, unattended
+    /// mode). Not the direct-path port 4570, which only serves relayed
+    /// sessions' direct upgrade. Hosts found by Bonjour report their port.
+    static let defaultLanPort: UInt16 = 4571
     static let defaultRelayPort: UInt16 = RelayAddress.defaultTCPPort
 
     static func relay(_ url: String) -> ConnectionTransport {

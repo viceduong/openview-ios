@@ -10,6 +10,8 @@
 //! its listen address and one line per paired / closed session; per-direction
 //! byte statistics and WebSocket close diagnostics are `debug`.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;

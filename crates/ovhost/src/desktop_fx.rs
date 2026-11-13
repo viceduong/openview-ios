@@ -1,4 +1,4 @@
-//! Session desktop effects (Section 4): while a viewer is
+//! Session desktop effects: while a viewer is
 //! connected, hide the host's wallpaper (optionally showing a flat colour)
 //! and turn off UI animations — less to encode, crisper text, snappier
 //! feel. Everything is restored when the session ends, on Ctrl-C / console
@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 /// The OS surface desktop effects touch.
-pub trait FxBackend: Send {
+pub(crate) trait FxBackend: Send {
     /// Current wallpaper path (`""` = none).
     fn wallpaper(&mut self) -> Result<String, String>;
     /// Set the wallpaper for this session only (`""` = none).
@@ -35,16 +35,16 @@ pub trait FxBackend: Send {
 
 /// The values we changed, saved before the first change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Original {
-    pub wallpaper: Option<String>,
-    pub desktop_color: Option<u32>,
-    pub client_animation: Option<bool>,
-    pub window_animation: Option<bool>,
+pub(crate) struct Original {
+    pub(crate) wallpaper: Option<String>,
+    pub(crate) desktop_color: Option<u32>,
+    pub(crate) client_animation: Option<bool>,
+    pub(crate) window_animation: Option<bool>,
 }
 
 impl Original {
     /// Marker file text (`key=value` lines; the wallpaper path last, raw).
-    pub fn to_text(&self) -> String {
+    pub(crate) fn to_text(&self) -> String {
         let mut s = String::from("openview-desktopfx 1\n");
         if let Some(c) = self.desktop_color {
             s.push_str(&format!("color={c}\n"));
@@ -61,7 +61,7 @@ impl Original {
         s
     }
 
-    pub fn from_text(t: &str) -> Option<Self> {
+    pub(crate) fn from_text(t: &str) -> Option<Self> {
         let mut lines = t.lines();
         if lines.next()? != "openview-desktopfx 1" {
             return None;
@@ -88,7 +88,7 @@ impl Original {
 }
 
 /// The session's effects state (see module docs).
-pub struct DesktopFx {
+pub(crate) struct DesktopFx {
     backend: Box<dyn FxBackend>,
     marker: PathBuf,
     orig: Original,
@@ -101,7 +101,11 @@ impl DesktopFx {
     /// `marker`: where originals are kept while effects are active.
     /// `flat_color`: COLORREF shown instead of the wallpaper (`None` =
     /// leave the desktop colour alone).
-    pub fn new(backend: Box<dyn FxBackend>, marker: PathBuf, flat_color: Option<u32>) -> Self {
+    pub(crate) fn new(
+        backend: Box<dyn FxBackend>,
+        marker: PathBuf,
+        flat_color: Option<u32>,
+    ) -> Self {
         Self {
             backend,
             marker,
@@ -114,7 +118,7 @@ impl DesktopFx {
 
     /// Restore a previous run's leftovers (hard crash with effects on).
     /// Returns whether a marker was found.
-    pub fn recover_stale(backend: &mut dyn FxBackend, marker: &Path) -> bool {
+    pub(crate) fn recover_stale(backend: &mut dyn FxBackend, marker: &Path) -> bool {
         let Ok(text) = std::fs::read_to_string(marker) else {
             return false;
         };
@@ -125,11 +129,11 @@ impl DesktopFx {
         true
     }
 
-    pub fn wallpaper_hidden(&self) -> bool {
+    pub(crate) fn wallpaper_hidden(&self) -> bool {
         self.wallpaper_hidden
     }
 
-    pub fn animations_off(&self) -> bool {
+    pub(crate) fn animations_off(&self) -> bool {
         self.animations_off
     }
 
@@ -141,7 +145,7 @@ impl DesktopFx {
     }
 
     /// Hide (`true`) or restore (`false`) the wallpaper.
-    pub fn set_wallpaper_hidden(&mut self, hide: bool) -> Result<(), String> {
+    pub(crate) fn set_wallpaper_hidden(&mut self, hide: bool) -> Result<(), String> {
         if hide == self.wallpaper_hidden {
             return Ok(());
         }
@@ -172,7 +176,7 @@ impl DesktopFx {
     }
 
     /// Disable (`true`) or restore (`false`) UI animations.
-    pub fn set_animations_off(&mut self, off: bool) -> Result<(), String> {
+    pub(crate) fn set_animations_off(&mut self, off: bool) -> Result<(), String> {
         if off == self.animations_off {
             return Ok(());
         }
@@ -208,7 +212,7 @@ impl DesktopFx {
     }
 
     /// Undo everything (idempotent).
-    pub fn restore_all(&mut self) {
+    pub(crate) fn restore_all(&mut self) {
         let _ = self.set_wallpaper_hidden(false);
         let _ = self.set_animations_off(false);
         // Anything left (a failed setter above): best-effort raw restore.
@@ -244,7 +248,7 @@ fn restore_values(b: &mut dyn FxBackend, o: &Original) {
 }
 
 /// Parse `RRGGBB` into a COLORREF (0x00BBGGRR).
-pub fn parse_rgb(s: &str) -> Option<u32> {
+pub(crate) fn parse_rgb(s: &str) -> Option<u32> {
     let s = s.trim_start_matches('#');
     if s.len() != 6 {
         return None;
@@ -257,13 +261,13 @@ pub fn parse_rgb(s: &str) -> Option<u32> {
 /// A backend that changes nothing: it logs each call and keeps the state
 /// in memory (tests, `--fx-dry-run`).
 #[derive(Debug, Clone)]
-pub struct DryRunFx {
-    pub wallpaper: String,
-    pub color: u32,
-    pub client_anim: bool,
-    pub window_anim: bool,
-    pub log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    pub verbose: bool,
+pub(crate) struct DryRunFx {
+    pub(crate) wallpaper: String,
+    pub(crate) color: u32,
+    pub(crate) client_anim: bool,
+    pub(crate) window_anim: bool,
+    pub(crate) log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pub(crate) verbose: bool,
 }
 
 impl Default for DryRunFx {
@@ -327,172 +331,164 @@ impl FxBackend for DryRunFx {
 
 /// The real Win32 backend (`SystemParametersInfoW`, `SetSysColors`).
 #[cfg(windows)]
-pub struct Win32Fx;
+pub(crate) struct Win32Fx;
 
 #[cfg(windows)]
 mod win {
-    #[repr(C)]
-    pub struct AnimationInfo {
-        pub cb_size: u32,
-        pub i_min_animate: i32,
+    //! `SystemParametersInfoW` / `SetSysColors` wrappers with `io::Error`
+    //! failures.
+
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{GetSysColor, SetSysColors, COLOR_DESKTOP};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPIF_SENDCHANGE, SYSTEM_PARAMETERS_INFO_ACTION,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    pub(super) use windows::Win32::UI::WindowsAndMessaging::{
+        ANIMATIONINFO, SPI_GETANIMATION, SPI_GETCLIENTAREAANIMATION, SPI_GETDESKWALLPAPER,
+        SPI_SETANIMATION, SPI_SETCLIENTAREAANIMATION, SPI_SETDESKWALLPAPER,
+    };
+
+    /// The Win32 error behind a `windows` error, as `GetLastError` would
+    /// have reported it.
+    fn os_error(e: &windows::core::Error) -> std::io::Error {
+        let hr = e.code().0 as u32;
+        let code = if hr & 0xFFFF_0000 == 0x8007_0000 {
+            hr & 0xFFFF
+        } else {
+            hr
+        };
+        std::io::Error::from_raw_os_error(code as i32)
     }
-    #[link(name = "user32")]
-    extern "system" {
-        pub fn SystemParametersInfoW(
-            action: u32,
-            uiparam: u32,
-            pvparam: *mut core::ffi::c_void,
-            winini: u32,
-        ) -> i32;
-        pub fn GetSysColor(index: i32) -> u32;
-        pub fn SetSysColors(n: i32, elements: *const i32, values: *const u32) -> i32;
+
+    /// `SystemParametersInfoW(action, ui_param, pv_param, flags)`; `notify`
+    /// broadcasts WM_SETTINGCHANGE (`SPIF_SENDCHANGE`) — never
+    /// `SPIF_UPDATEINIFILE`, so nothing is persisted to the user profile.
+    ///
+    /// # Safety
+    ///
+    /// `pv_param` must be what `action` expects: a valid pointer to a
+    /// buffer / struct of the size `ui_param` describes, or (for actions
+    /// that take a value in `pv_param`) that value.
+    pub(super) unsafe fn spi(
+        action: SYSTEM_PARAMETERS_INFO_ACTION,
+        ui_param: u32,
+        pv_param: *mut core::ffi::c_void,
+        notify: bool,
+    ) -> Result<(), std::io::Error> {
+        let flags = if notify {
+            SPIF_SENDCHANGE
+        } else {
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)
+        };
+        // SAFETY: the caller guarantees `pv_param` matches `action`.
+        unsafe { SystemParametersInfoW(action, ui_param, Some(pv_param), flags) }
+            .map_err(|e| os_error(&e))
     }
-    pub const SPI_GETDESKWALLPAPER: u32 = 0x0073;
-    pub const SPI_SETDESKWALLPAPER: u32 = 0x0014;
-    pub const SPI_GETANIMATION: u32 = 0x0048;
-    pub const SPI_SETANIMATION: u32 = 0x0049;
-    pub const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
-    pub const SPI_SETCLIENTAREAANIMATION: u32 = 0x1043;
-    /// Broadcast WM_SETTINGCHANGE only — never `SPIF_UPDATEINIFILE` (1).
-    pub const SPIF_SENDCHANGE: u32 = 0x02;
-    pub const COLOR_DESKTOP: i32 = 1;
+
+    /// The desktop background colour (`COLORREF`).
+    pub(super) fn desktop_color() -> u32 {
+        // SAFETY: a plain query without pointers.
+        unsafe { GetSysColor(COLOR_DESKTOP) }
+    }
+
+    /// Set the desktop background colour for this session only.
+    pub(super) fn set_desktop_color(c: u32) -> Result<(), std::io::Error> {
+        let el = [COLOR_DESKTOP.0];
+        let v = [COLORREF(c)];
+        // SAFETY: one element / value pair, both arrays live for the call.
+        unsafe { SetSysColors(1, el.as_ptr(), v.as_ptr()) }.map_err(|e| os_error(&e))
+    }
 }
 
 #[cfg(windows)]
 impl FxBackend for Win32Fx {
     fn wallpaper(&mut self) -> Result<String, String> {
         let mut buf = [0u16; 1024];
-        // SAFETY: buffer of the advertised length (in characters).
-        let ok = unsafe {
-            win::SystemParametersInfoW(
+        // SAFETY: a writable buffer of the advertised length (in characters).
+        unsafe {
+            win::spi(
                 win::SPI_GETDESKWALLPAPER,
                 buf.len() as u32,
                 buf.as_mut_ptr().cast(),
-                0,
+                false,
             )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "SPI_GETDESKWALLPAPER: {}",
-                std::io::Error::last_os_error()
-            ));
         }
+        .map_err(|e| format!("SPI_GETDESKWALLPAPER: {e}"))?;
         let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         Ok(String::from_utf16_lossy(&buf[..n]))
     }
     fn set_wallpaper(&mut self, path: &str) -> Result<(), String> {
         let mut w: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: NUL-terminated wide string that outlives the call.
-        let ok = unsafe {
-            win::SystemParametersInfoW(
-                win::SPI_SETDESKWALLPAPER,
-                0,
-                w.as_mut_ptr().cast(),
-                win::SPIF_SENDCHANGE,
-            )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "SPI_SETDESKWALLPAPER: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
+        // SAFETY: a NUL-terminated wide string that outlives the call.
+        unsafe { win::spi(win::SPI_SETDESKWALLPAPER, 0, w.as_mut_ptr().cast(), true) }
+            .map_err(|e| format!("SPI_SETDESKWALLPAPER: {e}"))
     }
     fn desktop_color(&mut self) -> Result<u32, String> {
-        // SAFETY: plain query.
-        Ok(unsafe { win::GetSysColor(win::COLOR_DESKTOP) })
+        Ok(win::desktop_color())
     }
     fn set_desktop_color(&mut self, c: u32) -> Result<(), String> {
-        let el = [win::COLOR_DESKTOP];
-        let v = [c];
-        // SAFETY: one element / value pair. SetSysColors is session-only.
-        if unsafe { win::SetSysColors(1, el.as_ptr(), v.as_ptr()) } == 0 {
-            return Err(format!("SetSysColors: {}", std::io::Error::last_os_error()));
-        }
-        Ok(())
+        win::set_desktop_color(c).map_err(|e| format!("SetSysColors: {e}"))
     }
     fn client_animation(&mut self) -> Result<bool, String> {
         let mut v: i32 = 0;
-        // SAFETY: pvParam points to a BOOL.
-        let ok = unsafe {
-            win::SystemParametersInfoW(
+        // SAFETY: for this action pvParam points to a BOOL.
+        unsafe {
+            win::spi(
                 win::SPI_GETCLIENTAREAANIMATION,
                 0,
                 (&mut v as *mut i32).cast(),
-                0,
+                false,
             )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "SPI_GETCLIENTAREAANIMATION: {}",
-                std::io::Error::last_os_error()
-            ));
         }
+        .map_err(|e| format!("SPI_GETCLIENTAREAANIMATION: {e}"))?;
         Ok(v != 0)
     }
     fn set_client_animation(&mut self, on: bool) -> Result<(), String> {
         // SPI_SETCLIENTAREAANIMATION takes the BOOL in pvParam itself.
         // SAFETY: no pointer is dereferenced for this action.
-        let ok = unsafe {
-            win::SystemParametersInfoW(
+        unsafe {
+            win::spi(
                 win::SPI_SETCLIENTAREAANIMATION,
                 0,
                 on as usize as *mut core::ffi::c_void,
-                win::SPIF_SENDCHANGE,
+                true,
             )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "SPI_SETCLIENTAREAANIMATION: {}",
-                std::io::Error::last_os_error()
-            ));
         }
-        Ok(())
+        .map_err(|e| format!("SPI_SETCLIENTAREAANIMATION: {e}"))
     }
     fn window_animation(&mut self) -> Result<bool, String> {
-        let mut ai = win::AnimationInfo {
-            cb_size: std::mem::size_of::<win::AnimationInfo>() as u32,
-            i_min_animate: 0,
+        let mut ai = win::ANIMATIONINFO {
+            cbSize: std::mem::size_of::<win::ANIMATIONINFO>() as u32,
+            iMinAnimate: 0,
         };
-        // SAFETY: ANIMATIONINFO with cbSize set, as the API requires.
-        let ok = unsafe {
-            win::SystemParametersInfoW(
+        // SAFETY: an ANIMATIONINFO with cbSize set, as the API requires.
+        unsafe {
+            win::spi(
                 win::SPI_GETANIMATION,
-                ai.cb_size,
-                (&mut ai as *mut win::AnimationInfo).cast(),
-                0,
+                ai.cbSize,
+                (&mut ai as *mut win::ANIMATIONINFO).cast(),
+                false,
             )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "SPI_GETANIMATION: {}",
-                std::io::Error::last_os_error()
-            ));
         }
-        Ok(ai.i_min_animate != 0)
+        .map_err(|e| format!("SPI_GETANIMATION: {e}"))?;
+        Ok(ai.iMinAnimate != 0)
     }
     fn set_window_animation(&mut self, on: bool) -> Result<(), String> {
-        let mut ai = win::AnimationInfo {
-            cb_size: std::mem::size_of::<win::AnimationInfo>() as u32,
-            i_min_animate: on as i32,
+        let mut ai = win::ANIMATIONINFO {
+            cbSize: std::mem::size_of::<win::ANIMATIONINFO>() as u32,
+            iMinAnimate: on as i32,
         };
-        // SAFETY: as above.
-        let ok = unsafe {
-            win::SystemParametersInfoW(
+        // SAFETY: an ANIMATIONINFO with cbSize set, as the API requires.
+        unsafe {
+            win::spi(
                 win::SPI_SETANIMATION,
-                ai.cb_size,
-                (&mut ai as *mut win::AnimationInfo).cast(),
-                win::SPIF_SENDCHANGE,
+                ai.cbSize,
+                (&mut ai as *mut win::ANIMATIONINFO).cast(),
+                true,
             )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "SPI_SETANIMATION: {}",
-                std::io::Error::last_os_error()
-            ));
         }
-        Ok(())
+        .map_err(|e| format!("SPI_SETANIMATION: {e}"))
     }
 }
 
@@ -504,13 +500,13 @@ static MARKER_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Keep the marker in the host's data dir (next to the unattended
 /// identity). Call once at startup, before [`default_marker`].
-pub fn set_marker_dir(dir: &std::path::Path) {
+pub(crate) fn set_marker_dir(dir: &std::path::Path) {
     let _ = MARKER_DIR.set(dir.to_path_buf());
 }
 
 /// The marker location: `<data dir>\ovhost-desktopfx.state` (falls back
 /// to the working directory when no data dir was set, e.g. in tests).
-pub fn default_marker() -> PathBuf {
+pub(crate) fn default_marker() -> PathBuf {
     MARKER_DIR
         .get()
         .map_or_else(|| PathBuf::from(MARKER_FILE), |d| d.join(MARKER_FILE))
@@ -518,109 +514,11 @@ pub fn default_marker() -> PathBuf {
 
 /// Where releases before 0.2 kept the marker: next to the executable. A
 /// crash under such a release leaves it there; startup recovers it too.
-pub fn legacy_marker() -> Option<PathBuf> {
+pub(crate) fn legacy_marker() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .map(|p| p.with_file_name(MARKER_FILE))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ovfx-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_file(&d);
-        d
-    }
-
-    #[test]
-    fn hide_and_restore_roundtrip() {
-        let marker = tmp("roundtrip");
-        let be = DryRunFx::default();
-        let log = be.log.clone();
-        let mut fx = DesktopFx::new(Box::new(be), marker.clone(), Some(0));
-        fx.set_wallpaper_hidden(true).unwrap();
-        fx.set_animations_off(true).unwrap();
-        // Originals are on disk while effects are active.
-        let saved = Original::from_text(&std::fs::read_to_string(&marker).unwrap()).unwrap();
-        assert_eq!(
-            saved.wallpaper.as_deref(),
-            Some(r"C:\Users\me\Pictures\wall.jpg")
-        );
-        assert_eq!(saved.desktop_color, Some(0x0080_4000));
-        assert_eq!(saved.client_animation, Some(true));
-        assert_eq!(saved.window_animation, Some(true));
-        drop(fx);
-        assert!(!marker.exists(), "marker removed after restore");
-        let log = log.lock().unwrap().clone();
-        assert_eq!(
-            log,
-            vec![
-                "set desktop color 0x000000".to_string(),
-                "set wallpaper ``".into(),
-                "set client-area animation false".into(),
-                "set window animation false".into(),
-                r"set wallpaper `C:\Users\me\Pictures\wall.jpg`".into(),
-                "set desktop color 0x804000".into(),
-                "set client-area animation true".into(),
-                "set window animation true".into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn toggles_are_idempotent_and_partial() {
-        let marker = tmp("partial");
-        let be = DryRunFx {
-            client_anim: false,
-            ..Default::default()
-        };
-        let log = be.log.clone();
-        let mut fx = DesktopFx::new(Box::new(be), marker.clone(), None);
-        fx.set_animations_off(true).unwrap();
-        fx.set_animations_off(true).unwrap();
-        fx.set_animations_off(false).unwrap();
-        assert!(!marker.exists());
-        fx.set_wallpaper_hidden(true).unwrap();
-        fx.set_wallpaper_hidden(false).unwrap();
-        // The client animation was already off: it is restored to off.
-        let log = log.lock().unwrap().clone();
-        assert!(log.contains(&"set client-area animation false".to_string()));
-        assert!(!log.contains(&"set client-area animation true".to_string()));
-        assert!(
-            !log.iter().any(|l| l.contains("desktop color")),
-            "no flat colour requested"
-        );
-    }
-
-    #[test]
-    fn stale_marker_is_restored_on_next_start() {
-        let marker = tmp("stale");
-        let orig = Original {
-            wallpaper: Some(r"D:\w p\a=b.png".into()),
-            desktop_color: None,
-            client_animation: Some(true),
-            window_animation: Some(false),
-        };
-        std::fs::write(&marker, orig.to_text()).unwrap();
-        let mut be = DryRunFx {
-            wallpaper: String::new(),
-            client_anim: false,
-            ..Default::default()
-        };
-        assert!(DesktopFx::recover_stale(&mut be, &marker));
-        assert_eq!(be.wallpaper, r"D:\w p\a=b.png");
-        assert!(be.client_anim);
-        assert!(!be.window_anim);
-        assert!(!marker.exists());
-        assert!(!DesktopFx::recover_stale(&mut be, &marker));
-    }
-
-    #[test]
-    fn rgb_parse() {
-        assert_eq!(parse_rgb("102030"), Some(0x0030_2010));
-        assert_eq!(parse_rgb("#000000"), Some(0));
-        assert_eq!(parse_rgb("xyz"), None);
-    }
-}
+mod tests;

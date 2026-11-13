@@ -1,7 +1,7 @@
 # `ovrelay` — the relay server
 
 > Source: `crates/ovrelay/` (`src/lib.rs`, `src/ws.rs`, `src/main.rs`)
-> Dependencies: `ovtransport` (frame constants and `encode_frame` only), `thiserror`. Dev-dependency: `ovcore`.
+> Dependencies: `ovtransport` (frame constants, `encode_frame`, and the `ovtransport::ws` WebSocket codec), `ovcommon` (feature `logging`), `thiserror`, `tracing`, `clap`. Dev-dependency: `ovcore`. Feature `fuzzing` exposes `ovrelay::fuzzing` for the cargo-fuzz targets.
 > There are no crypto dependencies. The relay cannot decrypt anything.
 
 ## 1. Overview
@@ -10,7 +10,7 @@
 
 - **Opaque pipe.** Tunnel frames (DATA, PING, PONG, PROBE, PUNCH_ACK) are forwarded untouched. The relay only reads the 3-byte frame headers, to catch DISCONNECT and framing violations. Handshake datagrams and AEAD records ride inside DATA frames, end to end.
 - **Thread per client, std only.** There is no async runtime.
-- **Two client types on one port.** The same port accepts raw TCP clients and **WebSocket** clients (`GET` + `Upgrade: websocket`). Over WebSocket, the identical byte stream travels inside binary messages; the iOS app reaches the relay through a Cloudflare tunnel at `wss://host/relay`. WebSocket and TCP clients pair with each other transparently.
+- **Two client types on one port.** The same port accepts raw TCP clients and **WebSocket** clients (`GET` + `Upgrade: websocket`). Over WebSocket, the identical byte stream travels inside binary messages; the iOS app (and `ovhost` / `ovview` with `--relay wss://…`) can reach the relay through an HTTP(S)-only front such as a Cloudflare tunnel at `wss://host/relay`. WebSocket and TCP clients pair with each other transparently.
 - **Address reporting.** On pairing, each side learns the other side's relay-observed IPv4 address and port, in the `A` line. That address is informational only: the relay never routes on it.
 
 The client side is `ovtransport::RelayTunnelCarrier` ([ovtransport.md §6](ovtransport.md)).
@@ -20,7 +20,7 @@ The client side is `ovtransport::RelayTunnelCarrier` ([ovtransport.md §6](ovtra
 | File | Contents |
 |---|---|
 | `src/lib.rs` | `Relay` (bind, serve, timeout), `RelayError`, `Slot` (per-client state), `Shared` (session table and pairing logic), `handle_client` state machine, control-line encoders, `FrameCursor` (frame-boundary tracker), pipe threads, WebSocket keepalive pinger, session-end log |
-| `src/ws.rs` | Minimal RFC 6455 server: HTTP head parsing, `Sec-WebSocket-Accept` (hand-written SHA-1 and base64), frame encoder, `WsReader` (deframer: unmasking, PING→PONG, CLOSE→EOF), health-check responses |
+| `src/ws.rs` | RFC 6455 server side: HTTP head parsing and the upgrade (`handshake`), health-check responses, unmasked outbound framing, `WsReader` (deframer: unmasking, PING→PONG, CLOSE→EOF). The codec primitives (`accept_key` with its SHA-1 and base64, `unmask`, opcodes) come from `ovtransport::ws` ([ovtransport.md §6.5](ovtransport.md)) |
 | `src/main.rs` | CLI binary |
 
 ## 3. Key types and API
@@ -50,7 +50,7 @@ pub enum RelayError { Bind(io::Error), Io(io::Error), Protocol(String) }
 `handle_client` peeks the first byte, with a pre-session read timeout of `HANDSHAKE_TIMEOUT` = 15 s.
 
 - **`'G'`** → HTTP. `ws::handshake` reads the head one byte at a time, at most `MAX_HEAD` = 16 KiB.
-  - If it has `Upgrade: websocket` **and** a `Sec-WebSocket-Key`: reply `101 Switching Protocols` with `Sec-WebSocket-Accept = base64(SHA1(key ‖ 258EAFA5-E914-47DA-95CA-C5AB0DC85B11))`. The request path is **not** checked; any path with the upgrade headers works.
+  - If it has `Upgrade: websocket` **and** a `Sec-WebSocket-Key`: reply `101 Switching Protocols` with `Sec-WebSocket-Accept = base64(SHA1(key ‖ 258EAFA5-E914-47DA-95CA-C5AB0DC85B11))` (`ovtransport::ws::accept_key`). The request path is **not** checked; any path with the upgrade headers works.
   - Otherwise, `GET / ` or `GET /health ` gets `200 OK` with body `ovrelay\n`, and anything else gets `426 Upgrade Required`. The connection then closes. This is the health check.
 - **Anything else** → a raw relay client. Its first bytes must be a CONNECT line.
 
@@ -80,7 +80,7 @@ Because pairing removes the entry, the same ID is immediately free again. An act
 
 **Where session IDs come from.** The relay never derives them; that is client-side.
 
-- **Attended:** the first 4 ASCII bytes of the host's 6-digit pairing code, as u32 BE (`crates/ovffi/src/lib.rs` `relay_session_id`; `ovview/examples/input_smoke.rs`; the tests).
+- **Attended:** the first 4 ASCII bytes of the host's 6-digit pairing code, as u32 BE (`crates/ovffi/src/relay.rs` `relay_session_id`; `ovview/examples/input_smoke.rs`; the tests).
 - **Unattended:** the low 32 bits of the host's device ID (`crates/ovapp/tests/unattended_over_relay.rs` `session_id_of`).
 
 The relay has **no authentication**. Anyone who knows or guesses a session ID can park on it. The end-to-end handshake ([ovcore.md](ovcore.md)) is what authenticates the peers.
@@ -119,7 +119,7 @@ Closing a slot means: a WebSocket CLOSE (status 1000) if it is a WebSocket clien
 - Size limits: data frames at most `MAX_FRAME` = 128 KiB, control frames at most 125 bytes. An oversized frame is an `InvalidData` error and the connection is dropped without reading the payload.
 - An unknown opcode is an error.
 
-**Outbound frames:** unmasked, FIN set, with 7-bit, 16-bit, or 64-bit length encoding (`encode_into`, which reuses a scratch buffer).
+**Outbound frames:** unmasked, FIN set, with 7-bit, 16-bit, or 64-bit length encoding (`encode_into`, which reuses a scratch buffer and wraps `ovtransport::ws::encode_into` without a mask).
 
 ## 5. CLI (`src/main.rs`, clap)
 
@@ -149,7 +149,7 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 | `PIPE_BUF` | 64 KiB | `lib.rs` |
 | `WS_PING_EVERY` | 15 s | `lib.rs` |
 | park poll interval | 10 ms | `lib.rs` (`wait_until_claimed`) |
-| `ws::MAX_HEAD` / `ws::MAX_FRAME` / `MAX_CONTROL` / `READ_BUF` | 16 KiB / 128 KiB / 125 B / 64 KiB | `ws.rs` |
+| `ws::MAX_HEAD` / `ws::MAX_FRAME` / `MAX_CONTROL` / `READ_BUF` | 16 KiB / 128 KiB / 125 B (`ovtransport::ws::MAX_CONTROL`) / 64 KiB | `ws.rs` |
 
 ## 7. Deployment notes
 
@@ -172,16 +172,17 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 | File | Tests and coverage |
 |---|---|
 | `src/lib.rs` (unit) | `connect_line_roundtrip`; `reject_line_layout`; `frame_cursor_*` (every split point; DISCONNECT and bad frames); `connection_caps_total_and_per_ip_with_loopback_exempt`; `deadline_reader_stops_dribbling_clients`; `parser_entry_points_survive_noise` (3000 random inputs through the WebSocket deframer, frame cursor and CONNECT parser) |
-| `src/ws.rs` (unit) | RFC 6455 accept-key example; SHA-1 known vectors; length encodings; unmask at any offset and split; deframing of masked messages incl. PING and CLOSE; unmasked / oversized / unknown frames rejected; the HTTP head deadline |
+| `src/ws.rs` (unit) | deframing of masked messages incl. PING and CLOSE; unmasked / oversized frames rejected; the HTTP head deadline. The codec's own tests (accept key, SHA-1, length encodings, unmasking) live in `crates/ovtransport/src/ws.rs` |
 | `src/main.rs` (unit) | clap defaults and flags; `Command::debug_assert` |
 | `tests/relay_handshake.rs` | full `ovcore` pairing-code handshake plus AEAD records both ways through a live relay; an unmatched CONNECT times out; PING/PONG round trip |
 | `tests/relay_robustness.rs` | DISCONNECT relaying, abrupt close, re-park during an active session, park timeout never kills an active session, unmatched park gets `XT`, oversized WebSocket frame |
 | `crates/ovtransport/tests/ws_relay.rs` | WebSocket viewer ↔ TCP host pairing and data both ways, health check, raw TCP pairing with address learning, `#[ignore]` keepalive soak |
-| `fuzz/fuzz_targets/ws_frames.rs` | cargo-fuzz target over `ovrelay::fuzzing` (feature `fuzzing`) |
+| `crates/ovtransport/tests/ws_client_relay.rs` | feature `ws-client`: host and viewer both through `RelayTunnelCarrier::connect_ws`, handshake and records; a hostname TCP relay (`connect_host`) pairs with a WebSocket viewer |
+| `fuzz/fuzz_targets/ws_frames.rs` | cargo-fuzz target over `ovrelay::fuzzing` (feature `fuzzing`; path relative to the repository root) |
 
 ## 10. Known limitations
 
 1. **CONNECT is unauthenticated** and session IDs are low-entropy rendezvous names (four ASCII digits, or the low 32 bits of the device ID). Someone who guesses an ID can park on it first (denial of service only; the handshake protects the session). Widening the ID to 64 bits was deferred — it changes every client and adds no secrecy (see WIRE_PROTOCOL §2.1).
 2. **A same-role duplicate CONNECT** is rejected after `'O'` (the capacity check now runs before `'O'`, the role check cannot without racing the pairing peer's `A` line).
 3. **Lenient upgrade handling.** The server does not check the request path, `Sec-WebSocket-Version`, or `Connection: Upgrade` (client frames must be masked).
-4. **Stale docs.** The crate docs diagram the `A` line as `A sid` only; it now carries 6 more address bytes. See [../WIRE_PROTOCOL.md](../WIRE_PROTOCOL.md) §2.3.
+4. **Stale diagram.** The module-doc diagram in `src/lib.rs` shows the `A` line as `A sid` only; it also carries 6 address bytes (`attach_line`). See [../WIRE_PROTOCOL.md](../WIRE_PROTOCOL.md) §2.3.

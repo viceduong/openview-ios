@@ -1,5 +1,5 @@
 //! Integration test: unattended access (PIN auth) end-to-end through a live
-//! relay — the v0.22 carrier/FFI path that the `ovcore` unit tests cover only
+//! relay — the carrier/FFI path that the `ovcore` unit tests cover only
 //! in-memory. Both ends dial the relay; the host listens under its **stable
 //! device id** (relay session id = device id's low 32 bits) with a PIN, the
 //! viewer dials by that device id + the same PIN. On a PIN match the

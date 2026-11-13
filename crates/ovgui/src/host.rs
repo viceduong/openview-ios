@@ -68,12 +68,15 @@ impl HostArgs {
         }
         if env.dev {
             // Isolated test mode: no real input, no desktop changes, no
-            // router/UDP side effects.
+            // router side effects, no fixed UDP ports (the LAN listener
+            // takes any free port; mDNS announces the test identity).
             a.extend([
                 "--dry-input".into(),
                 "--fx-dry-run".into(),
                 "--no-upnp".into(),
                 "--no-direct".into(),
+                "--lan-port".into(),
+                "0".into(),
             ]);
         } else if !self.direct {
             a.push("--no-direct".into());
@@ -634,6 +637,14 @@ impl Host {
                 self.last_error = message;
                 None
             }
+            StatusEvent::Lan { port, mdns, detail } => {
+                crate::log::line(&format!(
+                    "host LAN sessions: port {port:?}, mDNS {}{}",
+                    if mdns { "on" } else { "off" },
+                    detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                ));
+                None
+            }
             StatusEvent::Waiting { .. }
             | StatusEvent::PairingCode { .. }
             | StatusEvent::Connecting { .. } => None,
@@ -727,7 +738,7 @@ mod tests {
         let j = h.to_argv(&env(false)).join(" ");
         assert!(j.contains("--no-direct") && !j.contains("--no-upnp"));
         let d = args().to_argv(&env(true)).join(" ");
-        assert!(d.contains("--dry-input --fx-dry-run --no-upnp --no-direct --screen"));
+        assert!(d.contains("--dry-input --fx-dry-run --no-upnp --no-direct --lan-port 0 --screen"));
     }
 
     fn status(h: &mut Host, json: &str) -> Option<Notice> {
@@ -741,10 +752,10 @@ mod tests {
         h.gen = 1;
         h.args = Some(args());
         assert_eq!(
-            status(&mut h, r#"{"event":"device_id","id":"309731599215"}"#),
+            status(&mut h, r#"{"event":"device_id","id":"123456789012"}"#),
             None
         );
-        assert_eq!(h.device_id.as_deref(), Some("309731599215"));
+        assert_eq!(h.device_id.as_deref(), Some("123456789012"));
         status(&mut h, r#"{"event":"waiting","relay":"127.0.0.1:4569"}"#);
         assert_eq!(h.phase, Phase::Starting, "waiting is not ready yet");
         status(&mut h, r#"{"event":"ready","relay":"127.0.0.1:4569"}"#);

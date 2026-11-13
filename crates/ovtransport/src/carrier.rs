@@ -1,5 +1,6 @@
 //! The Carrier trait, error type, and statistics — the uniform datagram
-//! surface every transport backend implements (spec §5).
+//! surface every transport backend implements (`docs/WIRE_PROTOCOL.md`,
+//! "Layering").
 
 use std::io;
 
@@ -29,9 +30,13 @@ pub enum TransportError {
 /// Cumulative counters for one carrier instance. Monotonic; `close()` freezes them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CarrierStats {
+    /// Datagrams handed to the transport.
     pub sent_datagrams: u64,
+    /// Datagrams delivered to the consumer.
     pub recv_datagrams: u64,
+    /// Payload bytes sent (datagram bodies, no framing).
     pub bytes_sent: u64,
+    /// Payload bytes received (datagram bodies, no framing).
     pub bytes_recv: u64,
 }
 
@@ -61,8 +66,9 @@ pub type RawSock = i32;
 ///
 /// Implementations must be usable from one thread (the pump's), hence
 /// `Send` but no `Sync` requirement. Datagrams are opaque byte blobs of at
-/// most the carrier's framing limit (65 535 bytes everywhere in v0.3 — the
-/// same bound the ovcore wire formats already enforce).
+/// most the carrier's framing limit: 65 535 bytes for TCP, 65 532 for the
+/// relay tunnel (`tunnel::MAX_FRAME`), and what one UDP datagram carries
+/// for the UDP carriers (the record layer stays below all of them).
 pub trait Carrier: Send {
     /// Send one datagram. Returns the number of bytes handed to the OS
     /// (for UDP this is all-or-nothing). Non-blocking. A stream carrier may
@@ -104,7 +110,7 @@ pub trait Carrier: Send {
         None
     }
 
-    /// Whether this carrier can switch to the Phase 4 reliable framing
+    /// Whether this carrier can switch to the reliable framing
     /// (`ovtransport::rudp`) — i.e. it is a lossy datagram path that
     /// understands it. Lossless carriers say `false` (nothing to fix).
     fn reliable_capable(&self) -> bool {

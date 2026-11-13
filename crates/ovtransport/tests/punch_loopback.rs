@@ -1,13 +1,12 @@
-//! Integration test: the full v0.5 punch sequence on loopback (spec "UDP
-//! hole punching"). Two UDP sockets on 127.0.0.1 play the two NATs, a live
+//! Integration test: the full UDP hole-punch sequence on loopback. Two UDP sockets on 127.0.0.1 play the two NATs, a live
 //! `Relay` provides the default path, both sides exchange PROBE frames
 //! through the tunnel, punch each other with the 0xFE schedule, confirm
 //! with PUNCH_ACK over the tunnel, and finally run a complete ovcore
 //! handshake + one AEAD record over the *direct* UDP path.
 //!
 //! Every poll uses an explicit deadline and non-blocking polls — no
-//! blocking `recv_from` on a live socket (that is how the previous
-//! milestone deadlocked).
+//! blocking `recv_from` on a live socket (a blocking receive here can
+//! deadlock the single-threaded test).
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};

@@ -1,5 +1,4 @@
-//! UDP hole punching over an established relay tunnel (spec v0.5 "UDP hole
-//! punching"). The relay is the **default path**: the ovcore handshake
+//! UDP hole punching over an established relay tunnel. The relay is the **default path**: the ovcore handshake
 //! completes over the relay tunnel, and punching is a pure optimization that
 //! upgrades the session to a direct UDP path when the NATs allow it.
 //!
@@ -16,7 +15,7 @@
 //!    echoing our local port, proving a punch datagram landed.
 //! 5. [`migrate`] — once a punch datagram arrives on our local socket, the
 //!    caller wraps it in a [`UdpP2pCarrier`] and switches subsequent records
-//!    to it. Session keys are path-agnostic (spec §4), so no re-handshake is
+//!    to it. Session keys are path-agnostic (record layer), so no re-handshake is
 //!    needed; "migration" is just using the new carrier.
 //! 6. [`should_demote`] — liveness guard: if the direct path has been silent
 //!    for [`DEMOTE_AFTER`] while the session is active, the caller falls back
@@ -36,8 +35,10 @@ use crate::tunnel::{PROBE, PUNCH_ACK};
 /// The payload byte of every punch datagram (spec: "empty 1-byte `0xFE`").
 pub const PUNCH_BYTE: u8 = 0xFE;
 
-/// Default punch schedule: N datagrams at this interval (spec v0.5).
+/// Default punch schedule: this many datagrams, [`DEFAULT_PUNCH_INTERVAL`]
+/// apart.
 pub const DEFAULT_PUNCH_COUNT: u32 = 10;
+/// Default interval between punch datagrams.
 pub const DEFAULT_PUNCH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Fall back to the relay path when the direct path has been silent this

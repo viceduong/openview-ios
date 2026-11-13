@@ -1,4 +1,4 @@
-//! Host side of the direct connection (Section 5): the direct-path UDP
+//! Host side of the direct connection: the direct-path UDP
 //! socket on a fixed port, and the candidate list offered to viewers — LAN
 //! IPv4 + loopback, the UPnP-mapped public address (mapping refreshed, and
 //! deleted on exit), the STUN reflexive address, and a global IPv6.
@@ -12,24 +12,24 @@ use ovdiscovery::upnp::PortMapping;
 use ovtransport::DirectSockets;
 
 /// Default direct-path UDP port (the relay uses 4569).
-pub const DEFAULT_DIRECT_PORT: u16 = 4570;
+pub(crate) const DEFAULT_DIRECT_PORT: u16 = 4570;
 /// UPnP lease; refreshed at half-life.
 const UPNP_LEASE: Duration = Duration::from_secs(3600);
 
 /// Options from the command line.
 #[derive(Debug, Clone)]
-pub struct DirectOpts {
-    pub port: u16,
-    pub upnp: bool,
-    pub stun: Option<String>,
+pub(crate) struct DirectOpts {
+    pub(crate) port: u16,
+    pub(crate) upnp: bool,
+    pub(crate) stun: Option<String>,
     /// `--direct-advertise`: offer exactly these candidates instead of the
     /// gathered ones (tests / benches route the direct path through a
     /// network emulator this way).
-    pub advertise: Option<Vec<SocketAddr>>,
+    pub(crate) advertise: Option<Vec<SocketAddr>>,
 }
 
 /// The process-wide direct-path state.
-pub struct DirectNet {
+pub(crate) struct DirectNet {
     sockets: DirectSockets,
     candidates: Arc<Mutex<Vec<SocketAddr>>>,
 }
@@ -38,7 +38,7 @@ impl DirectNet {
     /// Bind the port, gather local candidates, run STUN (synchronously,
     /// before any session traffic shares the socket) and start UPnP in the
     /// background.
-    pub fn start(opts: &DirectOpts) -> std::io::Result<Self> {
+    pub(crate) fn start(opts: &DirectOpts) -> std::io::Result<Self> {
         let sockets = DirectSockets::bind(opts.port)?;
         let port = sockets.port();
         let mut cands: Vec<SocketAddr> = Vec::new();
@@ -100,7 +100,7 @@ impl DirectNet {
     }
 
     /// Sockets + candidates for one session.
-    pub fn for_session(&self) -> Option<(DirectSockets, Vec<SocketAddr>)> {
+    pub(crate) fn for_session(&self) -> Option<(DirectSockets, Vec<SocketAddr>)> {
         let s = self.sockets.try_clone().ok()?;
         let c = self.candidates.lock().ok()?.clone();
         Some((s, c))
@@ -188,76 +188,22 @@ fn is_global_v6(ip: &IpAddr) -> bool {
     }
 }
 
-/// The host's LAN IPv4 addresses (every up adapter on Windows; the default
-/// route's address elsewhere).
-pub fn lan_ipv4s() -> Vec<IpAddr> {
-    let mut v: Vec<IpAddr> = Vec::new();
-    #[cfg(windows)]
-    v.extend(win_ipv4s());
+/// The host's LAN IPv4 addresses: every usable adapter address
+/// ([`ovdiscovery::netif`]; loopback, link-local, tunnel and host-only
+/// virtual adapters left out), the default route's address first.
+pub(crate) fn lan_ipv4s() -> Vec<IpAddr> {
+    let mut v: Vec<IpAddr> = ovdiscovery::netif::lan_ipv4s()
+        .into_iter()
+        .map(IpAddr::V4)
+        .collect();
     if let Some(ip) = ovdiscovery::upnp::local_ip_toward(IpAddr::from([8, 8, 8, 8])) {
-        if !v.contains(&ip) {
-            v.insert(0, ip);
+        if let Some(i) = v.iter().position(|a| *a == ip) {
+            v.remove(i);
         }
+        v.insert(0, ip);
     }
     v.retain(|ip| !ip.is_loopback() && !ip.is_unspecified());
     v
-}
-
-/// Every unicast IPv4 of every operational adapter (GetAdaptersAddresses).
-#[cfg(windows)]
-fn win_ipv4s() -> Vec<IpAddr> {
-    use windows::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
-    };
-    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-    use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
-    let mut out = Vec::new();
-    let mut len: u32 = 32 * 1024;
-    let mut buf: Vec<u64> = vec![0; (len as usize).div_ceil(8)];
-    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-    // SAFETY: the buffer is u64-aligned and `len` bytes long; on overflow
-    // the API reports the size needed and we retry once.
-    unsafe {
-        let mut rc = GetAdaptersAddresses(
-            AF_INET.0 as u32,
-            flags,
-            None,
-            Some(buf.as_mut_ptr().cast()),
-            &mut len,
-        );
-        if rc == 111 {
-            buf = vec![0; (len as usize).div_ceil(8)];
-            rc = GetAdaptersAddresses(
-                AF_INET.0 as u32,
-                flags,
-                None,
-                Some(buf.as_mut_ptr().cast()),
-                &mut len,
-            );
-        }
-        if rc != 0 {
-            return out;
-        }
-        let mut a = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
-        while !a.is_null() {
-            let ad = &*a;
-            if ad.OperStatus == IfOperStatusUp {
-                let mut u = ad.FirstUnicastAddress;
-                while !u.is_null() {
-                    let sa = (*u).Address.lpSockaddr;
-                    if !sa.is_null() && (*sa).sa_family == AF_INET {
-                        let sin = &*(sa as *const SOCKADDR_IN);
-                        let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.S_un.S_addr));
-                        out.push(IpAddr::V4(ip));
-                    }
-                    u = (*u).Next;
-                }
-            }
-            a = ad.Next;
-        }
-    }
-    out
 }
 
 #[cfg(test)]

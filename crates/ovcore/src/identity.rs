@@ -6,7 +6,6 @@
 //! to the identity it authenticated (prevents MITM on the x25519 key). The
 //! 16-byte SHA-256 fingerprint of the Ed25519 pubkey is what the user
 //! pins on first pair.
-#![allow(dead_code)]
 
 use crate::crypto::{hkdf_sha256, sha256};
 use ed25519_dalek::Signer;
@@ -19,7 +18,9 @@ const BLOB_VERSION: u8 = 1;
 /// wiped by the `Drop` impl below) and `Debug` prints only the fingerprint.
 #[derive(Clone)]
 pub struct Identity {
+    /// Ed25519 signing key (derived from the master seed).
     pub ed: ed25519_dalek::SigningKey,
+    /// Static X25519 secret (derived from the master seed).
     pub x25519_sk: x25519_dalek::StaticSecret,
     master_seed: [u8; 32],
 }
@@ -40,6 +41,7 @@ impl std::fmt::Debug for Identity {
 }
 
 impl Identity {
+    /// The static X25519 public key.
     pub fn x(&self) -> x25519_dalek::PublicKey {
         x25519_dalek::PublicKey::from(&self.x25519_sk)
     }
@@ -50,6 +52,7 @@ impl Identity {
         Self::from_master_seed(&master_seed)
     }
 
+    /// Deterministically derive the identity (Ed25519 + X25519 keys) from a 32-byte master seed via HKDF.
     pub fn from_master_seed(seed: &[u8; 32]) -> Self {
         let ed_seed: [u8; 32] = hkdf_sha256(seed, b"", b"ov-ed25519", 32)
             .try_into()
@@ -64,6 +67,7 @@ impl Identity {
         }
     }
 
+    /// The 32-byte master seed (the whole secret identity).
     pub fn master_seed(&self) -> &[u8; 32] {
         &self.master_seed
     }
@@ -156,12 +160,17 @@ fn bytes32(b: &[u8]) -> Option<[u8; 32]> {
 /// A peer's public identity (received over the wire).
 #[derive(Clone, Debug)]
 pub struct PublicIdentity {
+    /// The peer's static X25519 public key.
     pub x25519_pk: x25519_dalek::PublicKey,
+    /// The peer's Ed25519 verifying key.
     pub ed_pub: ed25519_dalek::VerifyingKey,
+    /// The peer's advertised pairing code.
     pub pairing_code: String,
+    /// Ed25519 signature of `x25519_pk` by `ed_pub`.
     pub sig: Vec<u8>,
 }
 impl PublicIdentity {
+    /// Whether `sig` is a valid strict Ed25519 signature of the X25519 key.
     pub fn verify(&self) -> bool {
         let sig = match ed25519_dalek::Signature::from_slice(&self.sig) {
             Ok(s) => s,
@@ -171,6 +180,7 @@ impl PublicIdentity {
             .verify_strict(self.x25519_pk.as_bytes(), &sig)
             .is_ok()
     }
+    /// The 16-byte fingerprint: SHA-256 of the Ed25519 public key, truncated.
     pub fn fingerprint(&self) -> [u8; 16] {
         let h = sha256(self.ed_pub.as_bytes());
         let mut f = [0u8; 16];
@@ -191,6 +201,7 @@ impl Identity {
         f.extend_from_slice(&self.master_seed);
         std::fs::write(path, f)
     }
+    /// Load an identity saved by [`Identity::save`].
     pub fn load(path: &Path) -> std::io::Result<Identity> {
         let f = std::fs::read(path)?;
         if f.len() < 5 + 32 || &f[..5] != Self::MAGIC {

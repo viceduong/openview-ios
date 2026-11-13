@@ -1,4 +1,4 @@
-//! DXGI Desktop Duplication capture (Phase 3).
+//! DXGI Desktop Duplication capture.
 //!
 //! `IDXGIOutputDuplication::AcquireNextFrame` hands us the composed desktop
 //! image of one output plus the OS's dirty and move rects since the last
@@ -49,15 +49,16 @@ const MAX_RECT_COPIES: usize = 32;
 /// under-report a dirty rect. Costs one full copy + diff (~1-2 ms).
 const FULL_REFRESH_EVERY: u32 = 300;
 
-/// Section 5 GPU encode input: keep a GPU-resident copy of the region for
-/// the H.264 encoder's D3D11 input. Wave 1: on by default (`--no-gpu-encode`
-/// turns it off); a device without video support, or an encoder that
-/// rejects the textures, falls back to the CPU mirror automatically.
-pub static GPU_ENCODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// GPU encode input: keep a GPU-resident copy of the region for the H.264
+/// encoder's D3D11 input. On by default (`--no-gpu-encode` turns it off);
+/// a device without video support, or an encoder that rejects the
+/// textures, falls back to the CPU mirror automatically.
+pub(crate) static GPU_ENCODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// A failed acquire: re-create the duplication (now or after a backoff).
 #[derive(Debug)]
-pub enum DxgiError {
+pub(crate) enum DxgiError {
     Lost(String),
 }
 
@@ -70,12 +71,12 @@ impl std::fmt::Display for DxgiError {
 }
 
 /// One output's desktop duplication, cropped to a capture region.
-pub struct DxgiCapture {
+pub(crate) struct DxgiCapture {
     _device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
     /// CPU-readable copy targets, the size of the crop region, used
-    /// alternately (Wave 1): a frame's copy never waits on the previous
+    /// alternately: a frame's copy never waits on the previous
     /// frame's Unmap, and the duplication frame is released before Map.
     staging: [ID3D11Texture2D; 2],
     /// Which staging texture the next frame copies into.
@@ -84,7 +85,7 @@ pub struct DxgiCapture {
     /// [`take_present_qpc`](Self::take_present_qpc) (0 = none): the
     /// capture-phase latency probe.
     first_present: i64,
-    /// Wave 1: the OS move rects of the last update (region coordinates,
+    /// The OS move rects of the last update (region coordinates,
     /// source and destination inside the region): copy-rect candidates
     /// the encoder verifies against its mirror.
     moves: Vec<ovapp::bands::MoveRect>,
@@ -109,10 +110,10 @@ pub struct DxgiCapture {
     changed: Vec<RECT>,
     /// Damaged frames since the last whole-region copy.
     since_full: u32,
-    /// Section 5 `--gpu-encode`: the region on the GPU (same pixels as
+    /// GPU encode input: the region on the GPU (same pixels as
     /// `mirror`), for the encoder's D3D11 input.
     gpu_mirror: Option<ID3D11Texture2D>,
-    /// Section 5 (event-driven capture): [`wait`](Self::wait) already
+    /// Event-driven capture: [`wait`](Self::wait) already
     /// pulled a changed image into the mirror; the next
     /// [`update`](Self::update) keeps (and extends) its hints.
     fresh: bool,
@@ -128,7 +129,7 @@ impl DxgiCapture {
     /// image arrives within ~1 s (the tests' strict constructor; the
     /// capture source uses [`open_region`](Self::open_region)).
     #[cfg(test)]
-    pub fn new(x: i32, y: i32, w: u32, h: u32) -> Result<Self, String> {
+    pub(crate) fn new(x: i32, y: i32, w: u32, h: u32) -> Result<Self, String> {
         let me = Self::open_region(x, y, w, h, 1000)?;
         if me.have_image {
             Ok(me)
@@ -137,13 +138,19 @@ impl DxgiCapture {
         }
     }
 
-    /// Like [`new`](Self::new), but waits at most `wait_ms` for the initial
+    /// Like `new`, but waits at most `wait_ms` for the initial
     /// image and returns the duplication even without one
     /// ([`has_image`](Self::has_image) false): DWM presents nothing while
     /// the output has no active monitor (TV off, display asleep), and only
     /// the first present after that fills the mirror. Polling such a
     /// duplication with [`update`](Self::update) never blocks.
-    pub fn open_region(x: i32, y: i32, w: u32, h: u32, wait_ms: u32) -> Result<Self, String> {
+    pub(crate) fn open_region(
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        wait_ms: u32,
+    ) -> Result<Self, String> {
         if w == 0 || h == 0 {
             return Err("empty capture region".into());
         }
@@ -188,7 +195,9 @@ impl DxgiCapture {
         Err(format!("no DXGI output contains {w}x{h} at ({x},{y})"))
     }
 
-    unsafe fn open(
+    /// Create the device, the duplication of `output` and the staging
+    /// textures, then wait up to `wait_ms` for the first image.
+    fn open(
         adapter: &IDXGIAdapter1,
         output: &IDXGIOutput1,
         (out_w, out_h): (u32, u32),
@@ -201,17 +210,21 @@ impl DxgiCapture {
         let mut gpu = GPU_ENCODE.load(std::sync::atomic::Ordering::Relaxed);
         let create =
             |flags, device: &mut Option<ID3D11Device>, ctx: &mut Option<ID3D11DeviceContext>| {
-                D3D11CreateDevice(
-                    adapter,
-                    D3D_DRIVER_TYPE_UNKNOWN,
-                    HMODULE::default(),
-                    flags,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(device),
-                    None,
-                    Some(ctx),
-                )
+                // SAFETY: a live adapter, no software module, and valid
+                // out-slots for the device and its immediate context.
+                unsafe {
+                    D3D11CreateDevice(
+                        adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        HMODULE::default(),
+                        flags,
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(device),
+                        None,
+                        Some(ctx),
+                    )
+                }
             };
         // The H.264 MFT shares this device (video processor + encoder):
         // try with video support first, without it as the fallback.
@@ -233,8 +246,9 @@ impl DxgiCapture {
         let ctx = ctx.ok_or("D3D11CreateDevice returned no context")?;
         // Fails with E_ACCESSDENIED on the secure desktop / in some RDP
         // sessions, DXGI_ERROR_UNSUPPORTED on some drivers: GDI fallback.
-        let dup = output
-            .DuplicateOutput(&device)
+        // SAFETY: COM call on live objects (the device belongs to the
+        // output's adapter).
+        let dup = unsafe { output.DuplicateOutput(&device) }
             .map_err(|e| hr_msg("DuplicateOutput", &e))?;
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
@@ -253,15 +267,17 @@ impl DxgiCapture {
         };
         let mk = || -> Result<ID3D11Texture2D, String> {
             let mut t: Option<ID3D11Texture2D> = None;
-            device
-                .CreateTexture2D(&desc, None, Some(&mut t))
+            // SAFETY: a valid texture description, no initial data, and a
+            // valid out-slot.
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut t)) }
                 .map_err(|e| hr_msg("CreateTexture2D(staging)", &e))?;
             t.ok_or_else(|| "CreateTexture2D returned no texture".to_string())
         };
         let staging = [mk()?, mk()?];
         let gpu_mirror = if gpu {
             if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-                let _ = mt.SetMultithreadProtected(true);
+                // SAFETY: COM call on a live interface of our device.
+                let _ = unsafe { mt.SetMultithreadProtected(true) };
             }
             let gd = D3D11_TEXTURE2D_DESC {
                 Usage: D3D11_USAGE_DEFAULT,
@@ -270,7 +286,10 @@ impl DxgiCapture {
                 ..desc
             };
             let mut t: Option<ID3D11Texture2D> = None;
-            device.CreateTexture2D(&gd, None, Some(&mut t)).ok().and(t)
+            // SAFETY: as for the staging textures above.
+            unsafe { device.CreateTexture2D(&gd, None, Some(&mut t)) }
+                .ok()
+                .and(t)
         } else {
             None
         };
@@ -315,21 +334,21 @@ impl DxgiCapture {
 
     /// Whether the mirror holds a desktop image yet (see
     /// [`open_region`](Self::open_region)).
-    pub fn has_image(&self) -> bool {
+    pub(crate) fn has_image(&self) -> bool {
         self.have_image
     }
 
     /// Poll for a new desktop image (non-blocking). Afterwards
     /// [`frame`](Self::frame) is the current image.
-    pub fn update(&mut self) -> Result<(), DxgiError> {
+    pub(crate) fn update(&mut self) -> Result<(), DxgiError> {
         let r = self.acquire(0).map(|_| ());
         self.fresh = false;
         r
     }
 
-    /// Section 5 `--gpu-encode`: the region's GPU copy (valid after
+    /// GPU encode input: the region's GPU copy (valid after
     /// [`update`](Self::update), like [`frame`](Self::frame)).
-    pub fn gpu_frame(&self) -> Option<ovapp::mfcodec::GpuFrame> {
+    pub(crate) fn gpu_frame(&self) -> Option<ovapp::mfcodec::GpuFrame> {
         Some(ovapp::mfcodec::GpuFrame {
             device: self._device.clone(),
             texture: self.gpu_mirror.clone()?,
@@ -340,7 +359,7 @@ impl DxgiCapture {
     /// to change. A change is pulled into the mirror right away (its hints
     /// kept for the next [`update`](Self::update)); returns whether one
     /// arrived (pointer-only updates do not count).
-    pub fn wait(&mut self, timeout_ms: u32) -> Result<bool, DxgiError> {
+    pub(crate) fn wait(&mut self, timeout_ms: u32) -> Result<bool, DxgiError> {
         let changed = self.acquire(timeout_ms)?;
         if changed {
             self.fresh = true;
@@ -350,22 +369,22 @@ impl DxgiCapture {
 
     /// The current image (tight BGRA, `w x h`) and the rects that changed
     /// in the last [`update`](Self::update) (`None` = compare everything).
-    pub fn frame(&self) -> (&[u8], u32, u32, Option<&[TileRect]>) {
+    pub(crate) fn frame(&self) -> (&[u8], u32, u32, Option<&[TileRect]>) {
         let hints = self.hints_valid.then_some(&self.hints[..]);
         (&self.mirror, self.w, self.h, hints)
     }
 
-    /// Wave 1: the OS move rects since the last [`update`](Self::update)
+    /// The OS move rects since the last [`update`](Self::update)
     /// (region coordinates; candidates only, verify before use). `None`
     /// when the hints are unknown.
-    pub fn moves(&self) -> Option<&[ovapp::bands::MoveRect]> {
+    pub(crate) fn moves(&self) -> Option<&[ovapp::bands::MoveRect]> {
         self.hints_valid.then_some(&self.moves[..])
     }
 
     /// QPC timestamp at which the oldest not-yet-consumed image change was
     /// presented (then reset): `now - it` is how long the change waited
     /// for the capture.
-    pub fn take_present_qpc(&mut self) -> Option<i64> {
+    pub(crate) fn take_present_qpc(&mut self) -> Option<i64> {
         let t = std::mem::take(&mut self.first_present);
         (t != 0).then_some(t)
     }
@@ -599,7 +618,7 @@ impl DxgiCapture {
         };
         for m in &self.move_buf[..need as usize / mv] {
             self.changed.push(m.DestinationRect);
-            // Wave 1 copy-rect candidate: both rects inside the region.
+            // Copy-rect candidate: both rects inside the region.
             let d = m.DestinationRect;
             let (dx, dy) = (d.left - m.SourcePoint.x, d.top - m.SourcePoint.y);
             if inside(d.left, d.top, d.right, d.bottom)
@@ -671,186 +690,4 @@ fn copy_opaque(dst: &mut [u8], src: &[u8]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn copy_opaque_sets_every_alpha_at_any_alignment() {
-        let src: Vec<u8> = (0..400u32).map(|i| (i * 7) as u8).collect();
-        let mut buf = vec![0u8; 404];
-        for off in 0..4 {
-            let n = 4 * 90;
-            copy_opaque(&mut buf[off..off + n], &src[..n]);
-            for (i, (d, s)) in buf[off..off + n].iter().zip(&src[..n]).enumerate() {
-                assert_eq!(*d, if i % 4 == 3 { 255 } else { *s }, "off {off} byte {i}");
-            }
-        }
-    }
-
-    /// CI-safe smoke test: duplicating the primary monitor either works
-    /// (then frames are well-formed and polling never errors spuriously)
-    /// or fails cleanly with an error message (RDP / headless / secure
-    /// desktop) — it must never panic.
-    /// Section 5 `--gpu-encode`: the GPU mirror holds the same picture as
-    /// the CPU mirror — encoding it via D3D11 input and decoding gives the
-    /// CPU pixels back (high PSNR). Skips without DXGI / a GPU encoder.
-    #[test]
-    fn gpu_mirror_matches_cpu_mirror_through_the_encoder() {
-        use ovapp::video::VideoEncode;
-        ovapp::gdisrc::enable_dpi_awareness();
-        GPU_ENCODE.store(true, std::sync::atomic::Ordering::Relaxed);
-        let mons = ovapp::monitors::enumerate_monitors();
-        let Some(m) = mons.iter().find(|m| m.is_primary).or(mons.first()) else {
-            return;
-        };
-        let (w, h) = (m.w.min(640) & !15, m.h.min(352) & !15);
-        let Ok(mut d) = DxgiCapture::new(m.x, m.y, w, h) else {
-            eprintln!("skipping: no DXGI");
-            return;
-        };
-        let Some(gf) = d.gpu_frame() else {
-            eprintln!("skipping: no GPU mirror");
-            return;
-        };
-        let _ = d.update();
-        let (px, w, h, _) = d.frame();
-        let px = px.to_vec();
-        let mut enc = match ovapp::mfcodec::MfVideoEncoder::new(
-            w,
-            h,
-            30,
-            20_000_000,
-            ovapp::mfcodec::EncoderPref::Hardware,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping: {e}");
-                return;
-            }
-        };
-        let mut dec = ovapp::mfcodec::H264Decoder::new().unwrap();
-        let mut out = Vec::new();
-        let mut best = 0.0f64;
-        for t in 0..10u64 {
-            match enc.encode_gpu(&gf, (0, 0, w, h), false, 1_000_000 + t * 33_333) {
-                Some(Ok(aus)) => {
-                    for au in aus {
-                        if ovapp::video::VideoDecode::decode(&mut dec, &au.data, w, h, &mut out)
-                            .unwrap()
-                        {
-                            best = best.max(ovapp::video::psnr_bgra(&px, &out));
-                        }
-                    }
-                }
-                other => {
-                    eprintln!(
-                        "skipping: GPU input unavailable ({:?})",
-                        other.and_then(|r| r.err()).or(enc.gpu_error.clone())
-                    );
-                    return;
-                }
-            }
-        }
-        eprintln!(
-            "GPU mirror via {}: PSNR {best:.1} dB vs the CPU mirror",
-            enc.name()
-        );
-        assert!(
-            best > 30.0,
-            "GPU mirror differs from the CPU mirror: {best:.1} dB"
-        );
-    }
-
-    /// Regression: a duplication opened without waiting returns at once,
-    /// with or without an initial image (a monitor-less output never
-    /// presents one: that wait used to stall the capture thread ~1.1 s on
-    /// every retry). Without an image the mirror is unknown (no hints).
-    #[test]
-    fn open_region_without_wait_never_blocks() {
-        ovapp::gdisrc::enable_dpi_awareness();
-        let mons = ovapp::monitors::enumerate_monitors();
-        let Some(m) = mons.iter().find(|m| m.is_primary).or(mons.first()) else {
-            eprintln!("no monitors: skipping");
-            return;
-        };
-        let t0 = std::time::Instant::now();
-        match DxgiCapture::open_region(m.x, m.y, m.w, m.h, 0) {
-            Err(e) => eprintln!("DXGI unavailable here (fine): {e}"),
-            Ok(mut d) => {
-                for _ in 0..3 {
-                    if let Err(e) = d.update() {
-                        eprintln!("lost mid-test (fine): {e}");
-                        break;
-                    }
-                    let (px, w, h, hints) = d.frame();
-                    assert_eq!(px.len(), (w * h * 4) as usize);
-                    if !d.has_image() {
-                        assert!(hints.is_none(), "no image yet: nothing is known");
-                    }
-                }
-                eprintln!("has image: {}", d.has_image());
-            }
-        }
-        let took = t0.elapsed();
-        assert!(
-            took < std::time::Duration::from_millis(700),
-            "open + polls took {took:?}"
-        );
-    }
-
-    #[test]
-    fn dxgi_smoke_degrades_gracefully() {
-        ovapp::gdisrc::enable_dpi_awareness();
-        let mons = ovapp::monitors::enumerate_monitors();
-        let Some(m) = mons.iter().find(|m| m.is_primary).or(mons.first()) else {
-            eprintln!("no monitors: skipping");
-            return;
-        };
-        match DxgiCapture::new(m.x, m.y, m.w, m.h) {
-            Err(e) => eprintln!("DXGI unavailable here (fine): {e}"),
-            Ok(mut d) => {
-                let (px, w, h, hints) = d.frame();
-                assert_eq!((w, h), (m.w, m.h));
-                assert_eq!(px.len(), (w * h * 4) as usize);
-                assert!(hints.is_none(), "first image: full compare");
-                assert!(px.chunks_exact(4).all(|p| p[3] == 255));
-                for _ in 0..5 {
-                    match d.update() {
-                        Ok(()) => {
-                            let (_, _, _, hints) = d.frame();
-                            for r in hints.unwrap_or(&[]) {
-                                assert!(r.fits(w, h), "{r:?}");
-                            }
-                        }
-                        Err(e) => eprintln!("lost mid-test (fine): {e}"),
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
-        // Event-driven wait (Section 5): returns within the timeout, and an
-        // update afterwards keeps well-formed hints.
-        if let Ok(mut d) = DxgiCapture::new(m.x, m.y, m.w, m.h) {
-            let t0 = std::time::Instant::now();
-            match d.wait(60) {
-                Ok(changed) => {
-                    assert!(t0.elapsed() < std::time::Duration::from_secs(2));
-                    d.update().ok();
-                    let (_, w, h, hints) = d.frame();
-                    if changed {
-                        assert!(
-                            hints.is_some_and(|h| !h.is_empty()),
-                            "a waited change keeps its hints"
-                        );
-                    }
-                    for r in hints.unwrap_or(&[]) {
-                        assert!(r.fits(w, h), "{r:?}");
-                    }
-                }
-                Err(e) => eprintln!("lost mid-test (fine): {e}"),
-            }
-        }
-        // A region no output contains fails cleanly.
-        assert!(DxgiCapture::new(-100_000, -100_000, 10, 10).is_err());
-    }
-}
+mod tests;

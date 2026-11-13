@@ -88,6 +88,8 @@ impl WarpPresenter {
         // Create device with WARP driver and BGRA support
         let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
+        // SAFETY: all out-pointers are valid `Option`s owned by this frame; no adapter or
+        // software module is passed for the WARP driver.
         unsafe {
             D3D11CreateDevice(
                 None,                  // No adapter (use WARP)
@@ -120,7 +122,9 @@ impl WarpPresenter {
     ) -> Result<IDXGISwapChain1> {
         // Get DXGI device and factory
         let dxgi_device: IDXGIDevice = device.cast()?;
+        // SAFETY: COM call on a live interface obtained above.
         let dxgi_adapter = unsafe { dxgi_device.GetAdapter()? };
+        // SAFETY: COM call on a live interface obtained above.
         let dxgi_factory: IDXGIFactory2 = unsafe { dxgi_adapter.GetParent()? };
 
         // SwapChain description
@@ -141,6 +145,8 @@ impl WarpPresenter {
             Flags: DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32,
         };
 
+        // SAFETY: `hwnd` is the live window this presenter renders into and
+        // `desc` outlives the call.
         let swap_chain =
             unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None)? };
 
@@ -172,6 +178,7 @@ impl WarpPresenter {
         };
 
         let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: `desc` and the out-slot outlive the call; no initial data is passed.
         unsafe {
             device
                 .CreateTexture2D(&desc, None, Some(&mut texture))
@@ -207,6 +214,10 @@ impl WarpPresenter {
             );
         }
 
+        // SAFETY: the mapped staging texture is `width` x `height` BGRA, so each row of
+        // `RowPitch` bytes holds at least `width` u32s; `pixels` was checked above
+        // to hold exactly `width * height` elements. The texture is unmapped before
+        // any other use.
         unsafe {
             // Map staging texture
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -272,6 +283,8 @@ impl WarpPresenter {
         ));
 
         // Resize swap chain buffers
+        // SAFETY: no backbuffer reference is held across this call (each `present`
+        // drops its `GetBuffer` result), as `ResizeBuffers` requires.
         unsafe {
             // Must release all references to backbuffer before resize
             self.swap_chain.ResizeBuffers(

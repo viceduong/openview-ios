@@ -1,4 +1,4 @@
-//! Parallel zstd decode of multi-frame payloads (Wave 1, viewer side).
+//! Parallel zstd decode of multi-frame payloads (viewer side).
 //!
 //! A zstd stream may hold several independent frames back to back; every
 //! decoder (C zstd, `ruzstd::FrameDecoder::decode_all`) decodes such a
@@ -9,7 +9,7 @@
 //! `ruzstd` is 3-4x slower than C zstd, so on the phone a full 1080p update
 //! is decode-bound.
 //!
-//! [`decode_parallel`] walks the frame headers and block headers (cheap: no
+//! `decode_parallel` walks the frame headers and block headers (cheap: no
 //! entropy decoding) to find each frame's extent and declared content size,
 //! gives every frame its own disjoint slice of the output, and decodes them
 //! on a small persistent worker pool (one reused `FrameDecoder` per thread)
@@ -21,8 +21,10 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
+use crate::error::AppError;
+
 /// Smallest output worth fanning out (below it thread handoffs dominate).
-pub const MIN_PARALLEL_BYTES: usize = 128 * 1024;
+pub(crate) const MIN_PARALLEL_BYTES: usize = 128 * 1024;
 /// Most worker threads (the caller decodes too).
 const MAX_WORKERS: usize = 7;
 
@@ -31,7 +33,7 @@ const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 /// One zstd frame inside a payload: `data[start..end]` decodes to
 /// `content` bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameSpan {
+pub(crate) struct FrameSpan {
     pub start: usize,
     pub end: usize,
     pub content: usize,
@@ -42,7 +44,7 @@ pub struct FrameSpan {
 /// declare their content size (dictionary / skippable frames, reserved
 /// bits, truncation): the caller then decodes sequentially, which also
 /// produces the proper error for corrupt input.
-pub fn split_frames(data: &[u8]) -> Option<Vec<FrameSpan>> {
+pub(crate) fn split_frames(data: &[u8]) -> Option<Vec<FrameSpan>> {
     let mut spans = Vec::new();
     let mut pos = 0usize;
     while pos < data.len() {
@@ -119,12 +121,18 @@ pub fn split_frames(data: &[u8]) -> Option<Vec<FrameSpan>> {
 /// sequentially instead. `Some(Err)` = a frame is corrupt (`out` is then
 /// partially written — callers already treat their scratch as garbage on
 /// error).
-pub fn decode_parallel(data: &[u8], out: &mut [u8]) -> Option<Result<(), String>> {
+pub(crate) fn decode_parallel(data: &[u8], out: &mut [u8]) -> Option<Result<(), AppError>> {
     if out.len() < MIN_PARALLEL_BYTES {
         return None;
     }
     let spans = split_frames(data)?;
-    if spans.len() < 2 || spans.iter().map(|s| s.content).sum::<usize>() != out.len() {
+    // Checked sum: the content sizes are peer-controlled, and a wrapped total
+    // that happens to equal `out.len()` would hand out-of-bounds ranges to
+    // the raw-pointer slices in `Batch::work`.
+    let total = spans
+        .iter()
+        .try_fold(0usize, |acc, s| acc.checked_add(s.content));
+    if spans.len() < 2 || total != Some(out.len()) {
         return None;
     }
     let pool = pool()?;
@@ -177,7 +185,7 @@ pub fn decode_parallel(data: &[u8], out: &mut [u8]) -> Option<Result<(), String>
     }
     let err = batch.err.lock().ok().and_then(|mut e| e.take());
     Some(match err {
-        Some(e) => Err(e),
+        Some(e) => Err(AppError::malformed(e)),
         None => Ok(()),
     })
 }
@@ -207,6 +215,9 @@ struct Batch {
 // destination ranges (one piece per index, handed out once by `next`),
 // while the owning `decode_parallel` call blocks until every helper is done.
 unsafe impl Send for Batch {}
+// SAFETY: shared access only reads the pointers themselves; every other
+// field is `Sync` (atomics / mutexes / condvar), and the pointees are
+// accessed through disjoint ranges as described for `Send` above.
 unsafe impl Sync for Batch {}
 
 thread_local! {
@@ -222,9 +233,16 @@ impl Batch {
             if self.err.lock().map_or(true, |e| e.is_some()) {
                 continue; // a piece failed: skip the rest (still drain indices)
             }
-            // SAFETY: see `unsafe impl Send for Batch` — the ranges were
-            // computed from the caller's slices and never overlap.
+            // SAFETY: `src_off + src_len <= data.len()` (the span came from
+            // `split_frames(data)`), and `data` outlives this call because
+            // `decode_parallel` waits for every helper before returning.
+            // The source is only ever read.
             let src = unsafe { std::slice::from_raw_parts(self.src.add(p.src_off), p.src_len) };
+            // SAFETY: `dst_off + dst_len <= out.len()` (the offsets are the
+            // running sum of the spans' content sizes, which add up to
+            // exactly `out.len()`); piece `i` is handed out once by `next`,
+            // so no two threads hold overlapping `&mut` ranges, and `out`
+            // outlives the call as above.
             let dst = unsafe { std::slice::from_raw_parts_mut(self.dst.add(p.dst_off), p.dst_len) };
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 DECODER.with(|d| {

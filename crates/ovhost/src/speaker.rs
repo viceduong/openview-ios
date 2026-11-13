@@ -1,4 +1,4 @@
-//! Speaker playback (v0.23 full-duplex audio; Phase 4 rework).
+//! Speaker playback (full-duplex audio).
 //!
 //! The viewer's mic arrives as AUDIO (0x40) commands on the host's command
 //! channel; the hook decodes each tick (raw PCM or Opus) into a shared
@@ -6,22 +6,22 @@
 //! output device. The two ends play ONLY what they receive, so there is no
 //! local feedback loop.
 //!
-//! Phase 4: the bus is a [`ovapp::audio::JitterBuffer`] (60 ms prefill,
-//! 120 ms ceiling) and the device is [`ovapp::winaudio::WinmmSpeaker`] —
-//! three rotating 20 ms `waveOut` headers refilled on the driver's
-//! completion event instead of one header polled with `sleep(2)`. The
-//! playback thread is joined when the session ends (see `HostHooks`'
-//! `Drop`), so neither the thread nor the device outlive a session.
+//! The bus is a [`ovapp::audio::JitterBuffer`] (60 ms prefill, 120 ms
+//! ceiling) and the device is [`ovapp::winaudio::WinmmSpeaker`] — three
+//! rotating 20 ms `waveOut` headers refilled on the driver's completion
+//! event. The playback thread is joined when the session ends (see
+//! `HostHooks`' `Drop`), so neither the thread nor the device outlive a
+//! session.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-pub use ovapp::audio::AudioBus;
+pub(crate) use ovapp::audio::AudioBus;
 
 /// Spawn the playback thread for `bus`. It runs until `stop` is set; join
 /// the returned handle to release the device. `None` off Windows (no
 /// device) or when the thread cannot start.
-pub fn spawn(bus: AudioBus, stop: Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
+pub(crate) fn spawn(bus: AudioBus, stop: Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
     #[cfg(windows)]
     {
         ovapp::winaudio::spawn_playback(bus, stop, "ovhost-audio")

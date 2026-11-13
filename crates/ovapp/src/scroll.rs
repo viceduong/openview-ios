@@ -1,16 +1,16 @@
-//! Wave 1 host-side scroll detection: find a vertical copy-rect (MOVE)
+//! Host-side scroll detection: find a vertical copy-rect (MOVE)
 //! between the frame the viewer holds and the new capture, so a scroll is
 //! sent as one 12-byte MOVE plus the exposed strip instead of every tile
 //! of the scrolled area.
 //!
-//! - [`detect_vertical`]: row hashing over the changed band (previous vs
+//! - `detect_vertical`: row hashing over the changed band (previous vs
 //!   current rows, restricted to the dirty column span), a vote over the
 //!   vertical shifts that map a current row onto a *unique* previous row
 //!   (|dy| <= H/2), then exact verification row by row. The result covers
 //!   the longest run of verified rows (short mismatching gaps — a hover
 //!   highlight, a scrollbar thumb edge — are tolerated and later sent as
 //!   residual tiles).
-//! - [`verify_move`]: checks an OS-reported move (DXGI move rect) against
+//! - `verify_move`: checks an OS-reported move (DXGI move rect) against
 //!   the host mirror before it is used: a move is only trusted when the
 //!   destination rows really equal the shifted source rows.
 //!
@@ -22,30 +22,30 @@ use crate::bands::MoveRect;
 use crate::tiles::{TileMap, TileRect, TILE};
 
 /// Smallest dirty band (tile rows) worth a scroll search.
-pub const MIN_ROWS: u32 = 96;
+pub(crate) const MIN_ROWS: u32 = 96;
 /// Smallest dirty band width (pixels).
-pub const MIN_WIDTH: u32 = 128;
+pub(crate) const MIN_WIDTH: u32 = 128;
 /// Longest run of non-matching rows still bridged inside one MOVE.
-pub const MAX_GAP: usize = 8;
+pub(crate) const MAX_GAP: usize = 8;
 /// A detected move must verify at least this many rows.
-pub const MIN_MATCH_ROWS: usize = 16;
+pub(crate) const MIN_MATCH_ROWS: usize = 16;
 
 /// Fast 64-bit hash of a pixel row (multiply-xor over u64 words).
-pub fn row_hash(row: &[u8]) -> u64 {
+pub(crate) fn row_hash(row: &[u8]) -> u64 {
     let mut h: u64 = 0x9E37_79B9_7F4A_7C15 ^ row.len() as u64;
-    let mut chunks = row.chunks_exact(8);
-    for c in &mut chunks {
-        let v = u64::from_le_bytes(c.try_into().unwrap());
+    let (words, rest) = row.as_chunks::<8>();
+    for c in words {
+        let v = u64::from_le_bytes(*c);
         h = (h ^ v).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
     }
-    for &b in chunks.remainder() {
+    for &b in rest {
         h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
     }
     h ^ (h >> 31)
 }
 
 /// Bounding box (pixels, clipped to `w x h`) of the dirty tiles of `map`.
-pub fn dirty_bbox(map: &TileMap, w: u32, h: u32) -> Option<TileRect> {
+pub(crate) fn dirty_bbox(map: &TileMap, w: u32, h: u32) -> Option<TileRect> {
     let (mut c0, mut r0, mut c1, mut r1) = (u32::MAX, u32::MAX, 0, 0);
     for r in 0..map.rows() {
         for c in 0..map.cols() {
@@ -74,7 +74,12 @@ pub fn dirty_bbox(map: &TileMap, w: u32, h: u32) -> Option<TileRect> {
 
 /// Narrow `area` to the columns that actually changed (scanning every
 /// other row from both ends). `None` when nothing changed.
-pub fn tighten_columns(prev: &[u8], cur: &[u8], stride: usize, area: TileRect) -> Option<TileRect> {
+pub(crate) fn tighten_columns(
+    prev: &[u8],
+    cur: &[u8],
+    stride: usize,
+    area: TileRect,
+) -> Option<TileRect> {
     let (ax0, ax1) = (
         usize::from(area.x),
         usize::from(area.x) + usize::from(area.w),
@@ -83,8 +88,8 @@ pub fn tighten_columns(prev: &[u8], cur: &[u8], stride: usize, area: TileRect) -
     for y in (usize::from(area.y)..usize::from(area.y) + usize::from(area.h)).step_by(2) {
         let a = row(prev, stride, y, ax0, ax1);
         let b = row(cur, stride, y, ax0, ax1);
-        let pa = a.chunks_exact(4);
-        let pb = b.chunks_exact(4);
+        let pa = a.as_chunks::<4>().0.iter();
+        let pb = b.as_chunks::<4>().0.iter();
         // Left edge: only scan up to the best found so far.
         if let Some(i) = pa
             .clone()
@@ -119,7 +124,12 @@ fn row(px: &[u8], stride: usize, y: usize, x0: usize, x1: usize) -> &[u8] {
 /// Search `area` (pixels; BGRA frames `prev`/`cur` with `stride`) for a
 /// vertical scroll. Returns the verified MOVE (destination rect inside
 /// `area`, `dx == 0`) or `None`.
-pub fn detect_vertical(prev: &[u8], cur: &[u8], stride: usize, area: TileRect) -> Option<MoveRect> {
+pub(crate) fn detect_vertical(
+    prev: &[u8],
+    cur: &[u8],
+    stride: usize,
+    area: TileRect,
+) -> Option<MoveRect> {
     if u32::from(area.h) < MIN_ROWS || u32::from(area.w) < MIN_WIDTH {
         return None;
     }
@@ -235,7 +245,14 @@ pub fn detect_vertical(prev: &[u8], cur: &[u8], stride: usize, area: TileRect) -
 
 /// Rows of `m`'s destination that equal the shifted source rows in
 /// `prev` -> `cur` (0 when the move does not fit the frame).
-pub fn verify_move(prev: &[u8], cur: &[u8], w: u32, h: u32, stride: usize, m: &MoveRect) -> usize {
+pub(crate) fn verify_move(
+    prev: &[u8],
+    cur: &[u8],
+    w: u32,
+    h: u32,
+    stride: usize,
+    m: &MoveRect,
+) -> usize {
     if !m.fits(w, h) || prev.len() < stride * h as usize || cur.len() < stride * h as usize {
         return 0;
     }

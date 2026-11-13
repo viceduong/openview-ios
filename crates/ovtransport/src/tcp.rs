@@ -1,8 +1,8 @@
 //! TCP carrier — the fallback path for networks that block UDP. Each logical
 //! datagram is framed `[2B u16-BE len][body]` so the upper layers keep plain
-//! datagram semantics over a byte stream. Spec §5 / implementation status v0.3.
+//! datagram semantics over a byte stream.
 //!
-//! Phase 4: the stream is non-blocking for life (a full send buffer queues
+//! The stream is non-blocking for life (a full send buffer queues
 //! the rest in `tx`, flushed on later sends/polls, visible via
 //! [`Carrier::pending_send`]), so the socket is exposed through
 //! [`Carrier::raw_socket`] and session loops block on it instead of polling
@@ -120,7 +120,7 @@ impl Carrier for TcpCarrier {
         let mut stream = self.stream.take().ok_or(TransportError::Closed)?;
         let mut delivered = 0usize;
         let mut chunk = [0u8; 16 * 1024];
-        // Phase 1: read whatever is available into the accumulator.
+        // Step 1: read whatever is available into the accumulator.
         let read_result = loop {
             match stream.read(&mut chunk) {
                 Ok(0) => {
@@ -140,7 +140,7 @@ impl Carrier for TcpCarrier {
                 Err(e) => break Err(e),
             }
         };
-        // Phase 2: cut complete frames out of the accumulator. A frame's full
+        // Step 2: cut complete frames out of the accumulator. A frame's full
         // length is 2 (prefix) + body; we only deliver when all of it is present.
         let mut off = 0usize;
         while off + 2 <= self.rx.len() {

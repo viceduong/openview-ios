@@ -1,4 +1,4 @@
-//! Event-driven waits for the session loops (Phase 2): block until the
+//! Event-driven waits for the session loops: block until the
 //! carrier's socket is readable, another thread signals (a captured frame
 //! landed, a mic tick is ready), a window message arrives (viewer), or a
 //! timeout — instead of polling on a fixed sleep.
@@ -100,7 +100,7 @@ impl Wakeup {
     }
 }
 
-/// Wave 3: ask the OS for 1 ms timer resolution for this process (Windows:
+/// Ask the OS for 1 ms timer resolution for this process (Windows:
 /// `timeBeginPeriod(1)`; elsewhere a no-op). Waits are then precise enough
 /// for the direct path's packet pacer instead of the default ~15.6 ms
 /// granularity. Call once at startup; it stays in effect until exit.
@@ -111,7 +111,8 @@ pub fn high_res_timers() {
         extern "system" {
             fn timeBeginPeriod(ms: u32) -> u32;
         }
-        // SAFETY: plain Win32 call with a constant argument.
+        // SAFETY: `timeBeginPeriod` takes a plain integer, touches no caller
+        // memory and has no preconditions; 1 ms is a valid period.
         unsafe {
             timeBeginPeriod(1);
         }
@@ -173,14 +174,18 @@ mod imp {
     /// An owned auto-reset Win32 event.
     pub(super) struct Event(Handle);
 
-    // SAFETY: an event handle is a kernel object reference; SetEvent / waits
-    // on it are thread-safe by design.
+    // SAFETY: the wrapped value is a process-wide kernel handle, not a pointer
+    // into thread-local state; it may be used and closed from any thread.
     unsafe impl Send for Event {}
+    // SAFETY: `SetEvent` and the wait functions are documented thread-safe on
+    // a shared event handle, and `Event` exposes no other access.
     unsafe impl Sync for Event {}
 
     impl Event {
         pub(super) fn new() -> std::io::Result<Self> {
-            // SAFETY: null attrs/name are valid; auto-reset, initially unset.
+            // SAFETY: null security attributes and a null name are valid
+            // arguments (default security, unnamed event); no memory is
+            // borrowed beyond the call.
             let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
             if h == 0 {
                 return Err(std::io::Error::last_os_error());
@@ -189,14 +194,16 @@ mod imp {
         }
 
         pub(super) fn set(&self) {
-            // SAFETY: we own a valid event handle.
+            // SAFETY: `self.0` is a valid event handle created in `new` and
+            // only closed in `Drop`, so it is live for the whole borrow.
             unsafe { SetEvent(self.0) };
         }
     }
 
     impl Drop for Event {
         fn drop(&mut self) {
-            // SAFETY: closing the handle we created, exactly once.
+            // SAFETY: `self.0` was created by `CreateEventW` and is closed
+            // exactly once, here; no other copy of the handle outlives `self`.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -236,8 +243,9 @@ mod imp {
         fn drop(&mut self) {
             // Cancel the registration (best effort: the socket may already
             // be closed, which is fine).
-            // SAFETY: plain Winsock call; a stale socket just errors.
             for &s in &self.socks {
+                // SAFETY: passes integers only (no memory); a socket that was
+                // already closed makes Winsock return an error, never UB.
                 unsafe { WSAEventSelect(s, 0, 0) };
             }
         }
@@ -256,7 +264,9 @@ mod imp {
             n = 2;
         }
         let ms = timeout_ms(timeout);
-        // SAFETY: `handles[..n]` are live event handles we own.
+        // SAFETY: `handles` is a stack array of 2 and `n <= 2`, so the pointer
+        // covers `n` valid entries for the duration of the call; each entry is
+        // a live event handle owned by `user` / `sock`, borrowed for this call.
         let rc = unsafe {
             if messages {
                 MsgWaitForMultipleObjectsEx(n, handles.as_ptr(), ms, QS_ALLINPUT, 0)

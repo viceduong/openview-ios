@@ -21,7 +21,7 @@ paths below are relative to that folder unless noted.
 | Deployment target | iOS **15.6**, iPhone and iPad (`TARGETED_DEVICE_FAMILY 1,2`); device arm64, simulator arm64 + x86_64 |
 | Swift | 5.9 |
 | Rust link | `ios/build/OvFFI.xcframework` (static library + `shim.h` + module map, built by `ios/build_ios.sh`); Swift uses `import OvFFI` |
-| C header | `ios/OvFFI/include/shim.h`, kept in sync with `crates/ovffi` by its `header_tests` |
+| C header | `ios/OvFFI/include/shim.h`, kept in sync with `crates/ovffi` by `crates/ovffi/src/tests/header.rs` |
 | Role | Client only: every session is created with `is_server = 0` (`SessionDialer.dial`) |
 
 ---
@@ -70,6 +70,8 @@ paths below are relative to that folder unless noted.
 | `OvFFI.swift` | `OvQueues`, `OvWakeTarget`, `OvSessionBox`, `OvScreenBox` (RAII wrappers; callback ownership contract at the top) |
 | `RelayWebSocket.swift` | WebSocket relay transport |
 | `NwUdpBridge.swift` | LAN UDP transport |
+| `LanDiscovery.swift` | "On this network": `NWBrowser` for `_openview._udp` (Bonjour, TXT included), `DiscoveredPC`, and resolving a host to IPv4 + port with a short-lived UDP `NWConnection` |
+| `LanTxtRecord.swift` | Parsing the host's TXT record (`id`, `v`, `name`); pure, unit-tested |
 | `DirectPaths.swift` | `DirectPathSet`: per-candidate UDP paths for the direct upgrade |
 | **Settings/** | |
 | `AppSettings.swift` | `SettingsKey` (UserDefaults keys), `AppSettings` typed readers (incl. `bundledRelayURL`), `QualityChoice`, `DeviceID`, `DisplayTime`, `AppearanceStyle`, `Haptics` |
@@ -234,7 +236,7 @@ and `.incompatibleVersion` are not auto-reconnected.
 |---|---|---|
 | Relay URL starting `wss://` / `ws://` | `.relayWebSocket(url)` | Swift, `RelayWebSocket` (`URLSessionWebSocketTask`) |
 | Relay `host` or `host:port` (default port **4569**) | `.relay(host, port)` | Rust (blocking TCP inside `ov_session_relay_connect`) |
-| LAN `host` + UDP port (default **4570**) | `.direct(host, port)` | Swift, `NwUdpBridge` (`NWConnection` UDP) |
+| LAN `host` + UDP port (default **4571**, the host's LAN session port) | `.direct(host, port)` | Swift, `NwUdpBridge` (`NWConnection` UDP) |
 
 **Relay configuration.** No relay is bundled. The relay comes from, in
 order: the "Default relay URL" setting (`ov.defaultRelayURL`), else the
@@ -282,6 +284,24 @@ build-time `OVDefaultRelayURL` Info.plist key (`OV_DEFAULT_RELAY_URL` in
   fails with `.disconnected`.
 
 ### 4.3 LAN direct UDP
+
+The host's LAN session port (`ovhost --lan-port`, default 4571) accepts the
+handshake HELLO from any viewer on its network, no relay involved: PIN auth
+for an unattended host (device ID), pairing code for an attended one. The
+session then runs on that UDP path.
+
+**Finding hosts.** `HomeView` shows **On this network** while it is visible
+and no session runs: `LanDiscovery` browses `_openview._udp` with
+`NWBrowser` (`.bonjourWithTXTRecord`, no peer-to-peer). Each result's
+instance name is the device ID and its TXT record carries `id`, `v` and
+`name` (`LanTxtRecord`); one row per device ID, sorted by name, with a note
+when `v` is not this app's protocol version. Tapping a row resolves the
+service: a UDP `NWConnection` to the service endpoint, forced to IPv4, whose
+`currentPath.remoteEndpoint` gives the address and the SRV port (5 s
+timeout). A saved device connects with its stored PIN, name and pinned
+fingerprint, using `.lan(ip, port)` for this attempt only (its saved
+transport is unchanged). A new device asks for the PIN, and after the
+session is established it is saved as a LAN connection.
 
 1. `NwUdpBridge` is created **before** the first pump, because the client
    HELLO goes out during that pump. The bridge buffers up to 256 datagrams
@@ -688,6 +708,7 @@ XcodeGen writes them to `RemoteView/App/Info.plist`.
 | Key | Purpose |
 |---|---|
 | `NSLocalNetworkUsageDescription` | LAN peers and the relay server |
+| `NSBonjourServices` = `[_openview._udp]` | Browsing for OpenView PCs ("On this network") |
 | `NSAppTransportSecurity.NSAllowsLocalNetworking` | Plain connections on the local network |
 | `NSFaceIDUsageDescription` | App lock and protected saved PINs |
 | `UIApplicationSupportsIndirectInputEvents` | iPad mouse/trackpad secondary clicks and scroll |
@@ -707,8 +728,8 @@ encryption (TLS for `wss://` relays and its own end-to-end session
 encryption), so whoever distributes a build must answer App Store Connect's
 export-compliance questions for it; see `ios/README.md`.
 
-There are no Bonjour, microphone, camera or photo-library usage keys. The
-app does not browse for hosts; LAN hosts are entered by IP address.
+There are no microphone, camera or photo-library usage keys. LAN hosts are
+found by Bonjour (above) or entered by IP address.
 
 ---
 
@@ -755,7 +776,8 @@ ios/build_ios.sh --xcframework  # only the XCFramework
 
 - `RemoteViewTests` (XCTest) covers pure logic: relay address parsing
   (`RelayAddress`), direct-path candidate parsing and LAN classification
-  (`DirectPathSet.parse` / `classify`) and the zoom math (`ViewportMath`).
+  (`DirectPathSet.parse` / `classify`), the zoom math (`ViewportMath`) and
+  the hosts' TXT records (`LanTxtRecord`).
   These source files are compiled into the test bundle directly, so the
   tests need neither the app host nor the Rust library.
 - The Rust side is covered by `cargo test -p ovffi`, including the check that

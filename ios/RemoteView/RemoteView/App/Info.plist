@@ -29,6 +29,10 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>OpenView connects to peers on your local network or to your relay server.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_openview._udp</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

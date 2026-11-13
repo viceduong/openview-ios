@@ -20,6 +20,10 @@ build/
 # Per-developer iOS build overrides (signing team, bundle id prefix, relay)
 ios/RemoteView/Config/Local.xcconfig
 
+# Python bytecode (scripts/)
+__pycache__/
+*.pyc
+
 # Logs
 *.log
 

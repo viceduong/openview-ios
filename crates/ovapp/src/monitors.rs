@@ -1,4 +1,4 @@
-//! Multi-monitor awareness (v0.18): enumerate the host's monitors and
+//! Multi-monitor awareness: enumerate the host's monitors and
 //! validate capture regions against the virtual desktop.
 //!
 //! The pure side ([`Monitor`], [`region`], [`validate_region`]) is fully
@@ -9,6 +9,8 @@
 //!
 //! Like the rest of the Windows-facing code, the FFI is declared by hand —
 //! no `windows`/`winapi` crates.
+
+use crate::error::AppError;
 
 /// One host monitor, in virtual-desktop coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,12 +57,12 @@ pub fn validate_region(
     h: u32,
     virt_w: i32,
     virt_h: i32,
-) -> Result<(i32, i32, u32, u32), String> {
+) -> Result<(i32, i32, u32, u32), AppError> {
     if w == 0 || h == 0 {
-        return Err("capture region is empty (w/h == 0)".into());
+        return Err(AppError::invalid("capture region is empty (w/h == 0)"));
     }
     if virt_w <= 0 || virt_h <= 0 {
-        return Err("virtual desktop has no usable size".into());
+        return Err(AppError::platform("virtual desktop has no usable size"));
     }
     // Clamp the origin into the desktop, then shrink the size so the rect
     // fits. Saturating casts keep absurd u32 sizes from wrapping i32.
@@ -69,7 +71,9 @@ pub fn validate_region(
     let w = (w as i64).min(i64::from(virt_w - x)) as u32;
     let h = (h as i64).min(i64::from(virt_h - y)) as u32;
     if w == 0 || h == 0 {
-        return Err("capture region lies entirely outside the virtual desktop".into());
+        return Err(AppError::invalid(
+            "capture region lies entirely outside the virtual desktop",
+        ));
     }
     Ok((x, y, w, h))
 }
@@ -148,13 +152,16 @@ mod imp {
         type MonitorEnumProc =
             extern "system" fn(hMonitor: isize, hdc: isize, rect: *mut RECT, data: isize) -> i32;
 
-        /// Trampoline: `dwData` carries a `Box<Vec<Monitor>>` raw pointer.
+        /// Trampoline: `dwData` carries a `*mut Vec<Monitor>` raw pointer.
         extern "system" fn enum_proc(
             hMonitor: isize,
             _hdc: isize,
             _rect: *mut RECT,
             data: isize,
         ) -> i32 {
+            // SAFETY: `data` is the `&mut Vec<Monitor>` that `enumerate`
+            // passes to `EnumDisplayMonitors`; it outlives the (synchronous)
+            // enumeration and nothing else touches it meanwhile.
             let out = unsafe { &mut *(data as *mut Vec<Monitor>) };
             let mut info = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,

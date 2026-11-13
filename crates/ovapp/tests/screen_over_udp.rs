@@ -1,7 +1,7 @@
-//! Phase 4: CAPS negotiation of the reliable UDP framing between two real
-//! `TerminalSession`s on loopback UDP. Two new peers switch to the framing
-//! (both directions) and stream a large frame intact; a new host facing an
-//! old viewer (no `CAP_RUDP`) keeps sending raw records, as before.
+//! Integration test: CAPS negotiation of the reliable UDP framing between two real
+//! `TerminalSession`s on loopback UDP. Two capable peers switch to the framing
+//! (both directions) and stream a large frame intact; a capable host facing an
+//! older viewer (no `CAP_RUDP`) keeps sending raw records, as before.
 
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};

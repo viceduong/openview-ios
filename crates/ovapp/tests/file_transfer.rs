@@ -1,4 +1,4 @@
-//! Integration test (v0.24): bidirectional file-id-keyed file transfer over a
+//! Integration test: bidirectional file-id-keyed file transfer over a
 //! live relay — the viewer sends a file to the host AND the host sends a file
 //! to the viewer, concurrently, through the same established session. This is
 //! the transport-level proof for `TerminalSession::send_file_xfer` /

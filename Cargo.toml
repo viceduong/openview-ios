@@ -40,9 +40,6 @@ thiserror = "2"
 windows = "0.62"
 
 [workspace.lints.clippy]
-# New in clippy 1.100 (36 call sites). Allowed for now; migrating the
-# constant-size `chunks_exact` loops to `as_chunks` is tracked separately.
-chunks_exact_to_as_chunks = "allow"
 
 [profile.release]
 lto = "thin"

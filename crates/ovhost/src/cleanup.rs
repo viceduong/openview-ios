@@ -1,4 +1,4 @@
-//! Process-exit cleanup (Section 4/5): actions that must run however the
+//! Process-exit cleanup: actions that must run however the
 //! host goes away — session end (normal drop), Ctrl-C / Ctrl-Break /
 //! console close / logoff / shutdown (console control handler), and a
 //! panic (panic hook). Each registered action runs at most once.
@@ -15,7 +15,7 @@ static ACTIONS: Mutex<Vec<(u64, Action)>> = Mutex::new(Vec::new());
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 /// Register `f`; returns a token for [`unregister`].
-pub fn register(f: impl FnOnce() + Send + 'static) -> u64 {
+pub(crate) fn register(f: impl FnOnce() + Send + 'static) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut a) = ACTIONS.lock() {
         a.push((id, Box::new(f)));
@@ -24,14 +24,14 @@ pub fn register(f: impl FnOnce() + Send + 'static) -> u64 {
 }
 
 /// Drop a registered action without running it (its owner cleaned up).
-pub fn unregister(id: u64) {
+pub(crate) fn unregister(id: u64) {
     if let Ok(mut a) = ACTIONS.lock() {
         a.retain(|(i, _)| *i != id);
     }
 }
 
 /// Run (and remove) every registered action, newest first.
-pub fn run_all() {
+pub(crate) fn run_all() {
     let actions = match ACTIONS.lock() {
         Ok(mut a) => std::mem::take(&mut *a),
         // A panic while holding the lock: still try to recover the list.
@@ -44,7 +44,7 @@ pub fn run_all() {
 
 /// Install the console control handler and the panic hook (idempotent
 /// enough: call once from `main`).
-pub fn install() {
+pub(crate) fn install() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         run_all();
@@ -52,23 +52,17 @@ pub fn install() {
     }));
     #[cfg(windows)]
     {
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn SetConsoleCtrlHandler(
-                handler: Option<unsafe extern "system" fn(u32) -> i32>,
-                add: i32,
-            ) -> i32;
-        }
-        unsafe extern "system" fn handler(_ctrl: u32) -> i32 {
+        use windows::core::BOOL;
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+        unsafe extern "system" fn handler(_ctrl: u32) -> BOOL {
             run_all();
             // Not handled: the default handler terminates the process.
-            0
+            BOOL(0)
         }
-        // SAFETY: registering a plain function pointer that lives for the
-        // whole process.
-        unsafe {
-            SetConsoleCtrlHandler(Some(handler), 1);
-        }
+        // SAFETY: registers a plain function pointer that lives for the
+        // whole process; the handler only runs the cleanup registry.
+        let _ = unsafe { SetConsoleCtrlHandler(Some(handler), true) };
     }
 }
 

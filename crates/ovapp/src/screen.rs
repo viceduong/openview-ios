@@ -1,15 +1,12 @@
-//! Screen-stream payload (spec v0.6 "application shells" — the remote-display
-//! core).
+//! Screen-stream payload: the pixel [`Frame`] the remote display moves.
 //!
-//! A remote display is simply a stream of pixel frames over the command
-//! channel. Each frame is declared with `FRAME_BEGIN` (geometry + sequence),
-//! streamed in `FRAME_DATA` chunks, and closed with `FRAME_END`; the receiver
-//! reassembles it byte-exactly into a [`Frame`], exactly mirroring the
-//! file-transfer path. This increment moves *synthetic* frames through the
-//! full stack (AEAD records over any carrier); swapping the source for real
-//! GDI screen capture, and the sink for a render window, is a one-function
-//! change each — the wire layout, reassembly, and transport are already
-//! general.
+//! A remote display is a stream of pixel frames over the command channel.
+//! Each frame is declared with `FRAME_BEGIN` (geometry + sequence), streamed
+//! in `FRAME_DATA` chunks, and closed with `FRAME_END`; the receiver
+//! reassembles it byte-exactly into a [`Frame`], mirroring the file-transfer
+//! path (see [`crate::terminal`]). Frames come from real screen capture
+//! ([`crate::gdisrc`]) or, in tests and demos, from the deterministic
+//! [`synthetic_frame`].
 
 /// How the pixel bytes in a [`Frame`] are laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

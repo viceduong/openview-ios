@@ -21,11 +21,12 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, IsIconic,
-    LoadImageW, PostMessageW, RegisterWindowMessageW, SendMessageW, SetForegroundWindow,
-    ShowWindow, TrackPopupMenu, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, SM_CXICON, SM_CXSMICON, SW_HIDE, SW_RESTORE,
-    SW_SHOW, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON, WM_SETTINGCHANGE, WM_USER,
+    IsWindowVisible, LoadImageW, PostMessageW, RegisterWindowMessageW, SendMessageW,
+    SetForegroundWindow, ShowWindow, TrackPopupMenu, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+    LR_DEFAULTCOLOR, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, SM_CXICON, SM_CXSMICON,
+    SW_HIDE, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
+    WM_CLOSE, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETICON, WM_SETTINGCHANGE,
+    WM_USER,
 };
 
 use crate::events::{post, Event, TrayCmd};
@@ -222,6 +223,13 @@ pub fn show_window() {
         let _ = SetForegroundWindow(h);
     }
     post(Event::Shown);
+}
+
+/// The main window is shown (not hidden in the tray, not minimized).
+pub fn is_window_visible() -> bool {
+    let Some(h) = hwnd() else { return true };
+    // SAFETY: querying our own window's state.
+    unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() }
 }
 
 pub fn hide_window() {

@@ -1,4 +1,4 @@
-//! Delay-based link pacing for the host's screen sender (Phase 4).
+//! Delay-based link pacing for the host's screen sender.
 //!
 //! # Problem
 //!
@@ -6,7 +6,7 @@
 //! scheduler but below it: in the kernel send buffer, the relay's socket
 //! buffers and the bottleneck (~250 KB on the measured relay path). Every
 //! PONG, cursor update and audio tick then waits behind that standing
-//! queue: the Phase 2 bench measured a 241 ms PONG RTT at 10 Mbps (47 ms at
+//! queue: a relay-path bench measured a 241 ms PONG RTT at 10 Mbps (47 ms at
 //! 50 Mbps) although `PrioritySender` already sends control first.
 //!
 //! # Approach (BBR/LEDBAT-like, deliberately simple)
@@ -33,7 +33,7 @@
 //!
 //! Control records (PONG, input echo, cursor, audio) are never gated; only
 //! frame data waits. Before the first rate estimate nothing is gated (the
-//! pre-Phase-4 behaviour).
+//! sender behaves as if pacing were off).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -101,6 +101,7 @@ struct Ack {
 pub struct PacerStats {
     /// Estimated delivery rate, bytes/s.
     pub rate: Option<f64>,
+    /// Minimum RTT over [`MIN_RTT_WINDOW`] (the path's base delay).
     pub min_rtt: Option<Duration>,
     /// Last RTT sample.
     pub rtt: Option<Duration>,
@@ -108,7 +109,9 @@ pub struct PacerStats {
     pub window: Option<u64>,
     /// Times frame data was held back by the window.
     pub holds: u64,
+    /// Probe PINGs sent.
     pub probes_sent: u64,
+    /// Probe PINGs whose PONG came back.
     pub probes_acked: u64,
 }
 
@@ -146,6 +149,7 @@ impl Default for LinkPacer {
 }
 
 impl LinkPacer {
+    /// A pacer with no path model yet (nothing is gated until the first echo).
     pub fn new() -> Self {
         Self {
             next_probe: None,
@@ -168,11 +172,12 @@ impl LinkPacer {
         }
     }
 
-    /// Turn gating and probing off (the pre-Phase-4 sender).
+    /// Turn gating and probing on or off (off: frame data is never held back).
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
     }
 
+    /// Whether gating and probing are on.
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -450,6 +455,7 @@ impl LinkPacer {
         self.next_probe
     }
 
+    /// Snapshot of the current model for logs and tests.
     pub fn stats(&self) -> PacerStats {
         PacerStats {
             rate: self.rate,

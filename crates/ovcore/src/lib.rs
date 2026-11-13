@@ -3,6 +3,7 @@
 //! schedule. Shared byte-for-byte between the desktop app and (via a
 //! staticlib + FFI) the iOS app.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod clocksync;
 pub mod commands;

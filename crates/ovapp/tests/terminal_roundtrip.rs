@@ -1,4 +1,4 @@
-//! Integration test: the v0.6 "money test" — two full `TerminalSession`s
+//! Integration test: the end-to-end "money test" — two full `TerminalSession`s
 //! (host + view) through a complete ovcore handshake over an in-memory
 //! carrier pair, then ECHO round-trip, PING->PONG, a byte-exact file
 //! transfer, and a chat line both ways.

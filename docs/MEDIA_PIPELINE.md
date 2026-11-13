@@ -5,8 +5,8 @@ viewer display. Everything here is derived from the code:
 
 - mainly `crates/ovapp/src/` (see [`crates/ovapp.md`](crates/ovapp.md)
   for the reference tables)
-- plus the wiring in `crates/ovhost/src/main.rs` and
-  `crates/ovview/src/main.rs`
+- plus the wiring in `crates/ovhost/src/session/` (`capture_loop.rs`,
+  `screen.rs`, `hooks.rs`) and `crates/ovview/src/session/`
 
 File references are relative to `crates/`.
 
@@ -21,8 +21,8 @@ Everything else is layered on that channel.
 ```mermaid
 flowchart LR
   subgraph Host["ovhost (capture thread + session thread)"]
-    CAP["Capture<br/>DXGI dup / GdiScreen"] --> ENC["UpdateEncoder::submit_ex<br/>(ovapp/src/sendq.rs)"]
-    CAP --> VS["VideoSession::on_capture<br/>(ovapp/src/video.rs)"]
+    CAP["Capture<br/>DXGI dup / GdiScreen"] --> ENC["UpdateEncoder::submit_ex<br/>(ovapp/src/sendq/)"]
+    CAP --> VS["VideoSession::on_capture<br/>(ovapp/src/video/)"]
     ENC -->|"full frame / tile delta"| MB["FrameMailbox<br/>latest-wins slot + video FIFO"]
     VS -->|"H.264 AU / VIDEO_END"| MB
     MIC["Mic / WASAPI loopback"] --> AENC["AudioEncoder::encode_ticks"]
@@ -36,7 +36,7 @@ flowchart LR
   MEDIA --> NET
   subgraph Viewer["ovview / iOS ovffi"]
     NET --> PUMP["TerminalSession::pump"]
-    PUMP --> SD["ScreenDecoder<br/>(ovapp/src/tiles.rs)"]
+    PUMP --> SD["ScreenDecoder<br/>(ovapp/src/tiles/)"]
     PUMP --> VD["VideoRx + H264Decoder<br/>blit over framebuffer"]
     PUMP -->|"on_cmd hook"| ADEC["AudioDecoder -> AudioBus/JitterBuffer"]
     SD --> TAKE["take_latest_frame()"]
@@ -67,7 +67,7 @@ Three ideas shape the whole design:
 
 When a session starts, the viewer sends `CAPS` and the host replies with its
 own (see `TerminalSession::pump`, `Command::Caps` arm in
-`ovapp/src/terminal.rs`). The host's encoder follows the viewer's bits
+`ovapp/src/terminal/caps.rs`). The host's encoder follows the viewer's bits
 (`UpdateEncoder::set_peer_caps`):
 
 | Viewer advertises | Host may send |
@@ -88,7 +88,7 @@ A default desktop viewer advertises:
 
 - `LOCAL_CAPS | VIEWER_W2_CAPS | audio_caps()`
 - plus `CAP_H264` once `set_video_decoder` installs the Media Foundation
-  decoder (`ovview/src/main.rs`)
+  decoder (`ovview/src/session/mod.rs`)
 - plus `CAP_DIRECT | CAP_MEDIA` when `enable_direct` is used
 
 ---
@@ -114,11 +114,11 @@ The capture interval is chosen as follows:
 ### 3.2 Change detection and tiling
 
 `UpdateEncoder::submit_ex(px, w, h, hints, os_moves, mask, refresh, mailbox)`
-(`ovapp/src/sendq.rs`) compares the capture with `last_px`, the host's mirror
+(`ovapp/src/sendq/encoder.rs`) compares the capture with `last_px`, the host's mirror
 of what the viewer will hold:
 
 ```
-diff_tiles(last_px, px, ..., hints, &mut fresh)     // ovapp/src/tiles.rs
+diff_tiles(last_px, px, ..., hints, &mut fresh)     // ovapp/src/tiles/mod.rs
   for each 64-px tile row with candidates:
     for each pixel row:  memcmp whole row; if different,
       compare only the not-yet-dirty candidate tiles of that row
@@ -156,13 +156,13 @@ When a move is found:
 - The move goes into the update's band container.
 
 A 24 px scroll of a 1305x595 window becomes one MOVE plus a 1305x24 strip
-(about 1 KB instead of about 78 KB, per the `bands.rs` docs).
+(about 1 KB instead of about 78 KB, per the `bands/mod.rs` docs).
 
 ### 3.4 The H.264 region
 
 After `submit_ex`, the host calls `VideoSession::on_capture` with the
-encoder's `fresh` map (`ovhost/src/main.rs`). The `MotionDetector`
-(`ovapp/src/video.rs`) is a hysteresis state machine.
+encoder's `fresh` map (`ovhost/src/session/capture_loop.rs`). The `MotionDetector`
+(`ovapp/src/video/motion.rs`) is a hysteresis state machine.
 
 ```mermaid
 stateDiagram-v2
@@ -258,7 +258,7 @@ flowchart TD
 
 ```
 if viewer has CAP_BANDS:
-    Packed container (bands.rs):
+    Packed container (bands/mod.rs):
       split into ~96 KiB bands (≤ 8, 4-byte aligned), compress in parallel:
         photo-like band (LZ4 ratio estimate < 1.6) and LZ4 allowed -> LZ4
         else zstd level 1 (CAP_ZSTD and zstd-encode build)
@@ -353,7 +353,7 @@ FrameMailbox                       PrioritySender::flush(term, mailbox, max)
 arrive through `pump_media`.
 
 Up to 4 completed updates are kept. The renderer calls `take_latest_frame()`
-(`ovview/src/main.rs`), which works like this:
+(`ovview/src/session/mod.rs`), which works like this:
 
 - Updates older than the newest **full** frame are thrown away without being
   decompressed.
@@ -361,7 +361,7 @@ Up to 4 completed updates are kept. The renderer calls `take_latest_frame()`
 - Video units are always decoded in order, because P-frames chain.
 - The function returns one snapshot of the framebuffer.
 
-### 5.2 Applying an update (`ScreenDecoder`, `ovapp/src/tiles.rs`)
+### 5.2 Applying an update (`ScreenDecoder`, `ovapp/src/tiles/mod.rs`)
 
 ```
 full frame:   decompress(codec) → replace framebuffer; clear cache slots & lossy map
@@ -399,7 +399,7 @@ pictures within one motion period. Both are recorded in `VideoRxStats`.
 
 ### 5.4 Display
 
-`ovview/src/window.rs` scales the framebuffer to the window. Its CPU path is
+`ovview/src/window/paint.rs` scales the framebuffer to the window. Its CPU path is
 `ovapp::scale::Scaler::area_sharpen`:
 
 - an area filter when shrinking and bilinear when enlarging
@@ -462,7 +462,7 @@ sequenceDiagram
   Spk->>JB: pop_tick per free 20 ms header
 ```
 
-- **Format** (`ovapp/src/audio.rs`): `u8 codec | u8 flags | u32 samples (BE)
+- **Format** (`ovapp/src/audio/mod.rs`): `u8 codec | u8 flags | u32 samples (BE)
   | body`, 48 kHz mono.
   - Codec 0 carries s16le PCM (768 kbit/s).
   - Codec 1 carries one Opus packet (about 48 kbit/s).
@@ -480,7 +480,7 @@ sequenceDiagram
   - `ovview` uses `AudioBus::with_ms(30, 90)`.
   - `WinmmSpeaker` keeps 3 rotating 20 ms buffers.
 - **Direction.** AUDIO is direction-agnostic, so viewer mic to host also
-  works (`tests/audio_duplex_over_relay.rs`).
+  works (`ovapp/tests/audio_duplex_over_relay.rs`).
 
 ---
 
@@ -533,15 +533,12 @@ The byte-level tables are in [`crates/ovapp.md` §3.3 and §4.3](crates/ovapp.md
 - `candidate_kind` never yields `CAND_UPNP`, although the constant exists and
   is documented.
 - Stale doc comments:
-  - `terminal.rs` module table and the `OpCode::FrameBegin` comment (old
-    25-byte layout).
-  - `file_transfer.rs` module doc (missing the 8-byte offset).
+  - the `OpCode::FrameBegin` comment in `terminal/command.rs` (old 25-byte
+    layout).
   - `pacing::RATE_WINDOW` ("max-filter"; the code uses the median).
   - `scroll::MIN_ROWS` ("tile rows"; actually pixels).
   - `VideoSession` usage step 3.
   - `OPUS_FEC_LOSS_PERC` ("records travel reliably today").
   - `VideoRx::synced` ("waiting for a keyframe" describes `!synced`).
-- `FileTransfer::sanitize_name` strips only a literal leading `C:`, not
-  arbitrary drive letters.
 - The clipboard spec says kind 0 is non-empty text, but the code uses empty
   text as "clear".

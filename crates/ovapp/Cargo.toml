@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "OpenView application shell: terminal command-channel session + chat over the AEAD record layer"
+description = "OpenView application layer: the command channel, screen / video / audio codecs, file transfer and chat over the AEAD record layer"
 
 [features]
 default = []
@@ -14,11 +14,11 @@ default = []
 # iOS staticlib (`ovffi`) must stay pure Rust, and every peer decodes zstd
 # with the pure-Rust `ruzstd` below regardless of this feature.
 zstd-encode = ["dep:zstd"]
-# Opus audio (Phase 4): the C libopus (via `opus`/`opusic-sys`, built with
+# Opus audio: the C libopus (via `opus`/`opusic-sys`, built with
 # CMake). Desktop binaries only (`ovhost`, `ovview`); the iOS staticlib keeps
 # a pure-Rust tree and decodes Opus in Swift (AVAudioConverter).
 opus = ["dep:opus"]
-# Phase 5: Media Foundation H.264 encoder/decoder MFTs (Windows only;
+# Media Foundation H.264 encoder/decoder MFTs (Windows only;
 # `ovhost` encodes, `ovview` decodes). The iOS staticlib never enables it
 # and decodes with VideoToolbox in Swift.
 mf = ["dep:windows"]
@@ -26,18 +26,19 @@ mf = ["dep:windows"]
 [dependencies]
 ovcore = { path = "../ovcore" }
 ovtransport = { path = "../ovtransport" }
+thiserror.workspace = true
 # Pure-Rust DEFLATE (miniz_oxide backend) — no C toolchain, so the iOS
 # aarch64-apple-ios staticlib keeps building.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
-# Pure-Rust zstd DECODER (Phase 3): viewer + iOS decode the host's zstd frames.
+# Pure-Rust zstd DECODER: viewer + iOS decode the host's zstd frames.
 ruzstd = "0.7"
-# Pure-Rust LZ4 block codec (Wave 1, FrameCodec::Lz4 / CAP_LZ4): decode in
+# Pure-Rust LZ4 block codec (FrameCodec::Lz4 / CAP_LZ4): decode in
 # every build (iOS included), safe decoder for untrusted input.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
-# Pure-Rust data parallelism (Wave 1): host band compression and viewer
+# Pure-Rust data parallelism: host band compression and viewer
 # band-container decode on all cores (iOS included).
 rayon = "1"
-# Wave 2 lossy-first image tiles (CAP_LOSSY): pure-Rust baseline JPEG
+# Lossy-first image tiles (CAP_LOSSY): pure-Rust baseline JPEG
 # encoder (host; `simd` = runtime-detected AVX2 DCT on x86, scalar
 # elsewhere) and pure-Rust decoder (every viewer, iOS staticlib included).
 jpeg-encoder = { version = "0.6", features = ["simd"] }

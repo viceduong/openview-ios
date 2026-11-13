@@ -48,6 +48,7 @@ pub fn x25519_sk_to_pub(sk: &[u8; 32]) -> [u8; 32] {
 
 // ---------------- Hash / HMAC / HKDF ----------------
 
+/// SHA-256 of `data`.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let h = Sha256::digest(data);
     let mut out = [0u8; 32];
@@ -55,11 +56,13 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The first `len` bytes (at most 32) of SHA-256 of `data`.
 pub fn sha256_trunc(data: &[u8], len: usize) -> Vec<u8> {
     let h = sha256(data);
     h[..len.min(32)].to_vec()
 }
 
+/// HMAC-SHA256 of `data` under `key` (any key length).
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     m.update(data);
@@ -104,6 +107,7 @@ pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> 
 
 // ---------------- RNG helpers ----------------
 
+/// `n` bytes from the OS CSPRNG.
 pub fn random_bytes(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
     let mut rng = OsRng;
@@ -111,6 +115,7 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
     v
 }
 
+/// 32 bytes from the OS CSPRNG.
 pub fn random32() -> [u8; 32] {
     let mut a = [0u8; 32];
     let mut rng = OsRng;
@@ -131,6 +136,7 @@ pub fn chacha_nonce(base: &[u8; 12], counter: u64) -> Nonce {
     Nonce::clone_from_slice(&n)
 }
 
+/// ChaCha20-Poly1305 encrypt: returns `(ciphertext, detached 16-byte tag)`.
 pub fn aead_seal(
     key: &[u8; 32],
     nonce: &Nonce,
@@ -145,6 +151,7 @@ pub fn aead_seal(
     (buf, tag.into())
 }
 
+/// ChaCha20-Poly1305 decrypt with a detached tag; `None` if authentication fails.
 pub fn aead_open(
     key: &[u8; 32],
     nonce: &Nonce,
@@ -162,31 +169,39 @@ pub fn aead_open(
 
 // ---------------- Identity (Ed25519) ----------------
 
+/// An Ed25519 signing identity.
 #[derive(Clone)]
 pub struct EdIdentity {
+    /// The Ed25519 secret signing key.
     pub signing: SigningKey,
 }
 
 impl EdIdentity {
+    /// A fresh random identity.
     pub fn generate() -> Self {
         Self {
             signing: SigningKey::generate(&mut OsRng),
         }
     }
+    /// The identity derived from a 32-byte secret seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self {
             signing: SigningKey::from_bytes(seed),
         }
     }
+    /// The public verifying key.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing.verifying_key()
     }
+    /// The 32-byte public key.
     pub fn public_bytes(&self) -> [u8; 32] {
         self.signing.verifying_key().to_bytes()
     }
+    /// Sign `msg`.
     pub fn sign(&self, msg: &[u8]) -> Signature {
         self.signing.sign(msg)
     }
+    /// Whether `sig` is a valid signature of `msg` by this identity.
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> bool {
         self.signing.verifying_key().verify(msg, sig).is_ok()
     }

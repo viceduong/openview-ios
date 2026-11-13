@@ -15,8 +15,8 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// RFC 6455 §1.3 GUID appended to `Sec-WebSocket-Key`.
-const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+use ovtransport::ws::{accept_key, unmask, OP_CLOSE, OP_CONT, OP_PONG, OP_TEXT};
+pub(crate) use ovtransport::ws::{OP_BINARY, OP_PING};
 /// Request head cap (a browser/proxy upgrade is well under 4 KiB).
 const MAX_HEAD: usize = 16 * 1024;
 /// Per-frame payload cap. Clients send relay-protocol chunks (a tunnel frame
@@ -24,16 +24,9 @@ const MAX_HEAD: usize = 16 * 1024;
 /// for a client that coalesces a couple of frames per message.
 pub(crate) const MAX_FRAME: u64 = 128 * 1024;
 /// Control frames (PING/PONG/CLOSE) carry at most 125 bytes (RFC 6455 §5.5).
-const MAX_CONTROL: u64 = 125;
+const MAX_CONTROL: u64 = ovtransport::ws::MAX_CONTROL as u64;
 /// Buffered read size for the deframer (headers are tiny reads otherwise).
 const READ_BUF: usize = 64 * 1024;
-
-const OP_CONT: u8 = 0x0;
-const OP_TEXT: u8 = 0x1;
-pub(crate) const OP_BINARY: u8 = 0x2;
-const OP_CLOSE: u8 = 0x8;
-pub(crate) const OP_PING: u8 = 0x9;
-const OP_PONG: u8 = 0xA;
 
 /// Outcome of reading an HTTP request that started with `GET`.
 pub(crate) enum Upgrade {
@@ -120,13 +113,6 @@ fn read_head(stream: &mut impl Read, deadline: Instant) -> io::Result<Vec<u8>> {
     Ok(head)
 }
 
-/// `Sec-WebSocket-Accept` = base64(SHA-1(key || GUID)).
-pub(crate) fn accept_key(key: &str) -> String {
-    let mut input = key.as_bytes().to_vec();
-    input.extend_from_slice(WS_GUID.as_bytes());
-    base64(&sha1(&input))
-}
-
 /// One unmasked server-to-client frame (FIN set).
 pub(crate) fn encode(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -136,20 +122,7 @@ pub(crate) fn encode(opcode: u8, payload: &[u8]) -> Vec<u8> {
 
 /// [`encode`] into a reusable buffer (cleared first; capacity kept).
 pub(crate) fn encode_into(out: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
-    out.clear();
-    out.reserve(payload.len() + 10);
-    out.push(0x80 | opcode);
-    let n = payload.len();
-    if n < 126 {
-        out.push(n as u8);
-    } else if n <= u16::MAX as usize {
-        out.push(126);
-        out.extend_from_slice(&(n as u16).to_be_bytes());
-    } else {
-        out.push(127);
-        out.extend_from_slice(&(n as u64).to_be_bytes());
-    }
-    out.extend_from_slice(payload);
+    ovtransport::ws::encode_into(out, opcode, payload, None);
 }
 
 /// A normal-closure CLOSE frame (status 1000).
@@ -351,107 +324,6 @@ pub(crate) fn fuzz_deframe(data: &[u8]) {
     }
 }
 
-/// XOR `buf` with the 4-byte WebSocket `mask`, where `buf[0]` is payload
-/// byte number `offset` (so a payload can be unmasked in pieces). Works a
-/// u64 at a time; the tail byte-wise.
-fn unmask(buf: &mut [u8], mask: [u8; 4], offset: usize) {
-    let r = offset % 4;
-    let m = [
-        mask[r],
-        mask[(r + 1) % 4],
-        mask[(r + 2) % 4],
-        mask[(r + 3) % 4],
-    ];
-    let word = u64::from_ne_bytes([m[0], m[1], m[2], m[3], m[0], m[1], m[2], m[3]]);
-    let mut chunks = buf.chunks_exact_mut(8);
-    for c in &mut chunks {
-        let v = u64::from_ne_bytes(c[..8].try_into().expect("8-byte chunk")) ^ word;
-        c.copy_from_slice(&v.to_ne_bytes());
-    }
-    // Chunks are multiples of 8 (and so of 4): the tail starts at phase 0.
-    for (i, b) in chunks.into_remainder().iter_mut().enumerate() {
-        *b ^= m[i % 4];
-    }
-}
-
-/// SHA-1 (FIPS 180-1). Used only for the handshake accept key.
-fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [
-        0x6745_2301,
-        0xEFCD_AB89,
-        0x98BA_DCFE,
-        0x1032_5476,
-        0xC3D2_E1F0,
-    ];
-    let mut msg = data.to_vec();
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = h;
-        for (i, wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | (!b & d), 0x5A82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
-                _ => (b ^ c ^ d, 0xCA62_C1D6),
-            };
-            let t = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = t;
-        }
-        for (hv, v) in h.iter_mut().zip([a, b, c, d, e]) {
-            *hv = hv.wrapping_add(v);
-        }
-    }
-    let mut out = [0u8; 20];
-    for (i, v) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*c.get(2).unwrap_or(&0));
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,45 +395,5 @@ mod tests {
         let future = Instant::now() + std::time::Duration::from_secs(5);
         assert!(read_head(&mut src, future).unwrap().ends_with(b"\r\n\r\n"));
         assert_eq!(src, b"rest", "nothing past the head is consumed");
-    }
-
-    #[test]
-    fn rfc6455_accept_key_example() {
-        // RFC 6455 §1.3.
-        assert_eq!(
-            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
-            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        );
-    }
-
-    #[test]
-    fn sha1_known_vectors() {
-        assert_eq!(base64(&sha1(b"")), "2jmj7l5rSw0yVb/vlWAYkK/YBwk=");
-        assert_eq!(base64(&sha1(b"abc")), "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=");
-    }
-
-    #[test]
-    fn frame_length_encodings() {
-        assert_eq!(&encode(OP_BINARY, &[1, 2])[..2], &[0x82, 2]);
-        assert_eq!(&encode(OP_BINARY, &[0; 300])[..4], &[0x82, 126, 1, 44]);
-        assert_eq!(&encode(OP_BINARY, &vec![0; 70_000])[..2], &[0x82, 127]);
-    }
-
-    #[test]
-    fn unmask_matches_bytewise_at_any_offset_and_split() {
-        let mask = [0x12, 0x34, 0x56, 0x78];
-        let plain: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 256) as u8).collect();
-        let masked: Vec<u8> = plain
-            .iter()
-            .enumerate()
-            .map(|(i, b)| b ^ mask[i % 4])
-            .collect();
-        for split in [0, 1, 3, 5, 8, 13, 999, 1000] {
-            let mut buf = masked.clone();
-            let (a, b) = buf.split_at_mut(split);
-            unmask(a, mask, 0);
-            unmask(b, mask, split);
-            assert_eq!(buf, plain, "split at {split}");
-        }
     }
 }

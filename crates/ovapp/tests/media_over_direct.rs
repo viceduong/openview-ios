@@ -1,4 +1,4 @@
-//! Wave 3 (B2): two real `TerminalSession`s that start on a relay-like
+//! Integration test: two real `TerminalSession`s that start on a relay-like
 //! in-memory carrier, upgrade to a loopback direct UDP path, negotiate
 //! `CAP_MEDIA`, and then move H.264 units (through the host's
 //! `PrioritySender`) and audio over the unreliable media channel while

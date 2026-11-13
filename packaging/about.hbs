@@ -1,0 +1,26 @@
+Third-party software in OpenView for Windows
+============================================================
+
+OpenView itself is MIT licensed (see LICENSE). The binaries include the
+following open-source components. Slint is used under the Slint
+Royalty-free Desktop, Mobile, and Web Applications License 2.0
+(https://slint.dev/terms-and-conditions). The bundled C libraries libopus
+(opusic-sys) and zstd (zstd-sys) are BSD-3-Clause licensed.
+
+Overview
+------------------------------------------------------------
+{{#each overview}}
+{{name}} ({{id}}): {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+------------------------------------------------------------
+{{name}} ({{id}})
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

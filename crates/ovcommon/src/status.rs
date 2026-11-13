@@ -15,6 +15,7 @@
 //! | `peer_disconnected` | `reason` | both | Session over |
 //! | `direct_path` | `state`, `port`?, `addr`?, `detail`? | both | `listening` / `disabled` (host socket), `active` / `fallback` (session path) |
 //! | `upnp` | `mapped`, `addr`? | host | Router port mapping created (`addr` = public address) or unavailable |
+//! | `lan` | `port`?, `mdns`, `detail`? | host (unattended) | LAN sessions: `port` = the UDP port viewers on this network dial (absent = LAN listener off), `mdns` = advertised as `_openview._udp` |
 //! | `session_failed` | `message`, `retry_in_secs` | host (`--service`) | A session attempt failed; the host retries |
 //! | `error` | `message` | both | Fatal error; the process exits non-zero right after |
 //!
@@ -30,39 +31,89 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StatusEvent {
     /// Host (unattended mode): the stable device ID viewers dial.
-    DeviceId { id: String },
+    DeviceId {
+        /// The device ID (digits, as shown to the user).
+        id: String,
+    },
     /// Host (attended mode): the one-time pairing code.
-    PairingCode { code: String, fingerprint: String },
+    PairingCode {
+        /// The pairing code to type into the viewer.
+        code: String,
+        /// The host identity fingerprint (hex).
+        fingerprint: String,
+    },
     /// Host: connecting to (or re-parking on) the relay.
-    Waiting { relay: String },
+    Waiting {
+        /// The relay address.
+        relay: String,
+    },
     /// Host: parked on the relay and reachable.
-    Ready { relay: String },
+    Ready {
+        /// The relay address.
+        relay: String,
+    },
     /// Viewer: dialing `target` through `relay`.
-    Connecting { relay: String, target: String },
+    Connecting {
+        /// The relay address.
+        relay: String,
+        /// The dialed device ID or pairing code.
+        target: String,
+    },
     /// Handshake complete with the peer whose identity fingerprint is given.
-    PeerConnected { fingerprint: String },
+    PeerConnected {
+        /// The peer identity fingerprint (hex).
+        fingerprint: String,
+    },
     /// The session ended.
-    PeerDisconnected { reason: String },
+    PeerDisconnected {
+        /// Why the session ended (human-readable).
+        reason: String,
+    },
     /// Direct-path state change.
     DirectPath {
+        /// The new state.
         state: DirectState,
+        /// The local UDP port, when listening.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
+        /// The peer address of the direct path, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         addr: Option<String>,
+        /// Extra human-readable detail (e.g. why the path failed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
     /// UPnP port mapping result.
     Upnp {
+        /// Whether a mapping was created.
         mapped: bool,
+        /// The external address of the mapping, when mapped.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         addr: Option<String>,
     },
+    /// Host (unattended): LAN session listener / mDNS advertisement state.
+    Lan {
+        /// The UDP port LAN viewers dial; `None` = no LAN listener.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// Advertised on mDNS / Bonjour (`_openview._udp`).
+        mdns: bool,
+        /// Extra human-readable detail (e.g. why LAN is off).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// Host service loop: one session attempt failed; retrying.
-    SessionFailed { message: String, retry_in_secs: u64 },
+    SessionFailed {
+        /// What went wrong.
+        message: String,
+        /// Delay before the next attempt, in seconds.
+        retry_in_secs: u64,
+    },
     /// Fatal error; the process is about to exit with a failure code.
-    Error { message: String },
+    Error {
+        /// What went wrong.
+        message: String,
+    },
 }
 
 /// `direct_path.state`.
@@ -124,12 +175,21 @@ mod tests {
             serde_json::to_string(&ev).unwrap(),
             r#"{"event":"direct_path","state":"listening","port":4570}"#
         );
+        let ev = StatusEvent::Lan {
+            port: Some(4571),
+            mdns: true,
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"event":"lan","port":4571,"mdns":true}"#
+        );
     }
 
     #[test]
     fn parse_round_trips_and_ignores_the_unknown() {
         let ev = StatusEvent::DeviceId {
-            id: "309731599215".into(),
+            id: "123456789012".into(),
         };
         let line = serde_json::to_string(&ev).unwrap();
         assert_eq!(parse(&line), Some(ev));

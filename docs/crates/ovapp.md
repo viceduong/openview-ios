@@ -14,7 +14,7 @@ post-handshake AEAD record channel, and an `ovtransport::Carrier`. It defines
 exactly one command, `[1B opcode][payload]`. Everything the remote-desktop
 product does is built on that channel:
 
-- the command bus and its pump (`src/terminal.rs`)
+- the command bus and its pump (`src/terminal/`)
 - screen streaming: full frames, dirty-tile deltas, band containers, MOVE
   (copy-rect), lossy JPEG tiles, a tile cache, and H.264 regions
 - the host's outbound scheduler, link pacer and adaptive quality
@@ -32,40 +32,36 @@ Rust. C dependencies are gated behind features:
 |---|---|---|
 | `zstd-encode` | C `zstd` crate (encoder only) | `ovhost` |
 | `opus` | C libopus via `opus` crate | `ovhost`, `ovview` |
-| `mf` | `windows` crate: Media Foundation H.264 MFTs, D3D11 (`src/mfcodec.rs`) | `ovhost` encodes, `ovview` decodes |
+| `mf` | `windows` crate: Media Foundation H.264 MFTs, D3D11 (`src/mfcodec/`) | `ovhost` encodes, `ovview` decodes |
 
 Always-on pure-Rust dependencies: `flate2` (miniz_oxide backend, DEFLATE),
 `ruzstd` (zstd decoder), `lz4_flex` (LZ4 block, safe decode), `rayon`,
 `jpeg-encoder` (with `simd`), and `zune-jpeg`.
 
-> The package description in `Cargo.toml` ("terminal command-channel session +
-> chat over the AEAD record layer") and the module list in `src/lib.rs`'s doc
-> comment both describe the v0.6 scope. They are out of date.
-
 ## 2. Module map
 
 | Module | File | Platform | Role |
 |---|---|---|---|
-| `terminal` | `src/terminal.rs` | all | Command enum, wire encode/decode, `TerminalSession` (pump, CAPS negotiation, frame reassembly, video receive path, media channel glue, direct-path glue), every `CAP_*` / `OPT_*` / `CAND_*` constant |
+| `terminal` | `src/terminal/mod.rs` | all | Module doc (opcode table), re-exports. Submodules: `command.rs` (`OpCode`, `Command`, `OPT_*` / `CAND_*` constants), `wire.rs` (encode/decode), `caps.rs` (`CAP_*`), `limits.rs` (record-size limits), `frame_codec.rs` (`FrameCodec`, DEFLATE helpers), `session.rs` (`TerminalSession` state, CAPS bookkeeping, send path), `dispatch.rs` (the receive `pump`), `frames.rs` (frame reassembly, video receive path), `files.rs` (file transfers), `direct.rs` (direct-path and media-channel glue); tests in `wire_session_tests.rs` and `tiles_media_wire_tests.rs` |
 | `screen` | `src/screen.rs` | all | `Frame`, `PixelFormat` (BGRA=0, RGB=1), `synthetic_frame` |
 | `codec` | `src/codec.rs` | all | `Compressor` (zstd L1 / DEFLATE / LZ4 / Packed) and `Decompressor` for every `FrameCodec` |
-| `tiles` | `src/tiles.rs` | all | 64x64 tile maps, `diff_tiles`, `rects_from_map`, `gather`/`scatter`, `ScreenDecoder` (the viewer framebuffer) |
-| `bands` | `src/bands.rs` | all | `FrameCodec::Packed` band container: parallel per-band compression, MOVE records, Wave 2 CACHE/LOSSY sections |
-| `lossy` | `src/lossy.rs` | all | Tile classifier (photo vs UI), JPEG atlases, 128-bit tile hash, host `TileCache` (LRU), viewer `SlotStore` |
+| `tiles` | `src/tiles/mod.rs` (+ `tests.rs`) | all | 64x64 tile maps, `diff_tiles`, `rects_from_map`, `gather`/`scatter`, `ScreenDecoder` (the viewer framebuffer) |
+| `bands` | `src/bands/mod.rs` (+ `tests.rs`) | all | `FrameCodec::Packed` band container: parallel per-band compression, MOVE records, CACHE/LOSSY sections, `MAX_RAW_TOTAL` |
+| `lossy` | `src/lossy/mod.rs` (+ `tests.rs`) | all | Tile classifier (photo vs UI), JPEG atlases, 128-bit tile hash, host `TileCache` (LRU), viewer `SlotStore` |
 | `scroll` | `src/scroll.rs` | all | Vertical scroll detection (`detect_vertical`) and OS move-rect verification (`verify_move`) |
 | `zstd_par` | `src/zstd_par.rs` | all | Parallel decode of multi-frame zstd payloads |
-| `sendq` | `src/sendq.rs` | all | Host send side: `UpdateEncoder` (full vs delta decision), `FrameMailbox` (latest-wins slot plus video FIFO), `PrioritySender` (control-first scheduler), `DrainMeter` |
+| `sendq` | `src/sendq/mod.rs` | all | Host send side: `UpdateEncoder` (full vs delta decision, `encoder.rs`; lossy/cache settings and the refinement lane, `refine.rs`), `FrameMailbox` (latest-wins slot plus video FIFO, `mailbox.rs`), `PrioritySender` (control-first scheduler, `sender.rs`), `DrainMeter`; tests in `tests/` |
 | `pacing` | `src/pacing.rs` | all | `LinkPacer`: delivery rate and min RTT from tagged PING/PONG probes, window gating, queue-delay signal |
 | `adapt` | `src/adapt.rs` | all | Change detection, `RateGovernor` (idle ease-out), `AutoQuality` (queue-delay-driven fps and bitrate scale) |
-| `video` | `src/video.rs` | all | H.264 header/wire, Annex-B/AVCC helpers, BGRA<->NV12 (BT.709 limited), `MotionDetector`, `VideoSession`, `VideoRx`, SPS VUI rewrite, synthetic content |
-| `mfcodec` | `src/mfcodec.rs` | Windows + `mf` | `H264Encoder` (HW MFT first, SW fallback; CPU or D3D11 input), `H264Decoder`, `MfVideoEncoder`, `GpuFrame` |
-| `audio` | `src/audio.rs` | all | AUDIO payload format, `AudioEncoder`/`AudioDecoder` (Opus via feature), `JitterBuffer`, `AudioBus`, `AudioRingBuffer`, `TickClock`, `MicSource`, `SynthMic`, `SineGen` |
+| `video` | `src/video/mod.rs` | all | H.264 header/wire and `VideoRx` (`mod.rs`), Annex-B/AVCC helpers (`annexb.rs`), BGRA<->NV12 BT.709 limited (`convert.rs`), `MotionDetector` (`motion.rs`), `VideoSession` (`session.rs`), SPS VUI rewrite (`pub mod sps`), synthetic content (`synth.rs`), `tests.rs` |
+| `mfcodec` | `src/mfcodec/mod.rs` | Windows + `mf` | `H264Encoder` (HW MFT first, SW fallback; CPU or D3D11 input; `encoder.rs`), `H264Decoder` (`decoder.rs`), `MfVideoEncoder`, `GpuFrame` (`gpu.rs`), shared MFT plumbing (`mft.rs`), `tests.rs` |
+| `audio` | `src/audio/mod.rs` | all | AUDIO payload format, `AudioEncoder`/`AudioDecoder` (Opus via feature); `JitterBuffer`, `AudioBus`, `AudioRingBuffer` (`buffer.rs`); `TickClock`, `MicSource`, `SynthMic`, `run_mic_loop`, `SineGen` (`source.rs`); `tests.rs` |
 | `winaudio` | `src/winaudio.rs` | Windows | Event-driven WinMM `WinmmMic` / `WinmmSpeaker` / `spawn_playback` |
 | `liveness` | `src/liveness.rs` | all | `Keepalive` (PING pacing and RTT), `Liveness` (dead-peer), `LinkStats` (fps/Bps HUD) |
 | `netwait` | `src/netwait.rs` | all (socket watch is Windows-only) | `Wakeup`/`Waker`: block until socket readable, cross-thread signal, window message, or timeout; `high_res_timers` |
 | `clipboard` | `src/clipboard.rs` | all | `ClipboardSync` echo-loop guard, `clipboard_command` |
 | `chat` | `src/chat.rs` | all | `ChatSession`: one line = one TYPE record |
-| `file_transfer` | `src/file_transfer.rs` | all | v0.24 file-id-keyed transfers (`FileTransfer`), `sanitize_name` |
+| `file_transfer` | `src/file_transfer/mod.rs` (+ `tests.rs`) | all | File-id-keyed transfers (`FileTransfer`), `sanitize_name` |
 | `gdisrc` | `src/gdisrc.rs` | Windows (stubs elsewhere) | `GdiScreen` BitBlt capture into a top-down DIB, `enable_dpi_awareness` |
 | `monitors` | `src/monitors.rs` | all (Win32 enumeration on Windows) | `Monitor`, `enumerate_monitors`, `validate_region` |
 | `scale` | `src/scale.rs` | all | Viewer scaler: area or bilinear (or Catmull-Rom), then a 0.5 unsharp mask |
@@ -78,7 +74,7 @@ The crate root (`src/lib.rs`) re-exports the most-used items, for example
 
 ---
 
-## 3. The command bus (`src/terminal.rs`)
+## 3. The command bus (`src/terminal/`)
 
 ### 3.1 Framing and limits
 
@@ -153,11 +149,10 @@ Any other opcode fails `decode` (`"unknown opcode"`). The pump counts it as a
 `decode_errors` increment and keeps going, so new opcodes are always gated
 behind CAPS bits.
 
-> The opcode table in the `terminal.rs` module doc comment is incomplete: it
-> lists neither `0x14/0x18/0x20-0x22/0x27/0x40/0x50/0x61-0x63` nor the 30-byte
-> FRAME_BEGIN. The `OpCode::FrameBegin` doc comment still describes the old
-> 25-byte form (`seq+w+h+stride+fmt+total`, without `codec` and
-> `compressed_len`).
+> The `OpCode::FrameBegin` doc comment (`terminal/command.rs`) still
+> describes a 25-byte form (`seq+w+h+stride+fmt+total`, without `codec` and
+> `compressed_len`); the module doc table in `terminal/mod.rs` and the codec
+> use the 30-byte form.
 
 #### Sub-enumerations
 
@@ -211,7 +206,7 @@ behind CAPS bits.
 
 On receive, the stride of a delta is implied as `width * bpp`.
 
-**VIDEO_BEGIN (`0x25`) / `VideoHeader`, 38 bytes** (`src/video.rs`)
+**VIDEO_BEGIN (`0x25`) / `VideoHeader`, 38 bytes** (`src/video/mod.rs`)
 
 | Off | Size | Field |
 |---|---|---|
@@ -238,7 +233,14 @@ An update is always `*_BEGIN` + `FRAME_DATA`... + `FRAME_END(seq)`. On
 | 1 | DEFLATE (raw, `Compression::fast`) | always (the legacy default) |
 | 2 | zstd (one or more concatenated frames) | `CAP_ZSTD` |
 | 3 | LZ4 block (no frame header) | `CAP_LZ4` |
-| 4 | Packed band container (`src/bands.rs`) | `CAP_BANDS` |
+| 4 | Packed band container (`src/bands/mod.rs`) | `CAP_BANDS` |
+
+Decompression is bounded before any buffer is sized: `codec::Decompressor::decompress_into`
+rejects a declared length above `bands::MAX_RAW_TOTAL` (8192 × 8192 × 4 bytes
+= 256 MiB) for every codec, and the DEFLATE helper
+`terminal/frame_codec.rs` `decompress_into` does the same and caps its
+up-front reservation at the input size × 1032 (`MAX_DEFLATE_RATIO`, the
+largest DEFLATE expansion), so a small payload cannot claim a huge allocation.
 
 ### 3.4 Capability negotiation (`CAP_*`)
 
@@ -367,7 +369,7 @@ IDR requests use the same 300 ms rate limit. `VideoRxStats` records:
 - stalls, meaning gaps of more than `VIDEO_STALL_GAP = 100 ms` between
   pictures within one motion period
 
-**Media channel glue (Wave 3):**
+**Media channel glue** (`terminal/direct.rs`):
 
 - `media_ready()` is true when:
   - both sides have `CAP_MEDIA`, and
@@ -397,8 +399,8 @@ SESSION_OPTION (`0x62`, `u8 key, u8 value`, V->H, only to a host with
 | 2 | `OPT_NO_ANIMATIONS` | 1 disables host UI animations, 0 restores them |
 
 The pump only passes these through to the hook. The host acts on them in
-`ovhost/src/main.rs` (the `Command::SessionOption` arm, via
-`desktop_fx.rs`).
+`ovhost/src/session/hooks.rs` (the `Command::SessionOption` arm, via
+`session/fx.rs` and `desktop_fx.rs`).
 
 ---
 
@@ -437,7 +439,7 @@ capture (ovhost: DXGI dup / GdiScreen) -> UpdateEncoder::submit_ex
 - `validate_region()` rejects an empty rect, or a rect that clamps down to
   nothing, and clamps everything else into the virtual desktop.
 
-### 4.2 Tiles and deltas (`src/tiles.rs`)
+### 4.2 Tiles and deltas (`src/tiles/`)
 
 Constants:
 
@@ -473,7 +475,7 @@ iOS FFI assembler):
 - `blit()` paints decoded video pixels at a rect without changing `seq`, so
   tile deltas keep chaining. It also marks those tiles lossy.
 
-### 4.3 Band container, MOVE, cache and lossy sections (`src/bands.rs`)
+### 4.3 Band container, MOVE, cache and lossy sections (`src/bands/`)
 
 `FrameCodec::Packed` layout (all big-endian):
 
@@ -564,7 +566,7 @@ equal their shifted source. `UpdateEncoder::find_move` accepts an OS move only
 when at least 90 % of its rows verify. It only runs the detector when at least
 8 tiles are dirty.
 
-### 4.5 Lossy tiles and the tile cache (`src/lossy.rs`)
+### 4.5 Lossy tiles and the tile cache (`src/lossy/`)
 
 | Constant | Value |
 |---|---|
@@ -604,7 +606,7 @@ when at least 90 % of its rows verify. It only runs the detector when at least
   never hashes anything.
 - Both sides clear on a full frame.
 
-### 4.6 The host encoder: full frame vs delta (`src/sendq.rs` `UpdateEncoder`)
+### 4.6 The host encoder: full frame vs delta (`src/sendq/encoder.rs`, `src/sendq/refine.rs` `UpdateEncoder`)
 
 These are the decision rules in `submit_ex` (the full narrative is in
 `MEDIA_PIPELINE.md`):
@@ -632,7 +634,7 @@ These are the decision rules in `submit_ex` (the full narrative is in
   - Without `CAP_BANDS`: zstd (`CAP_ZSTD`). A payload of at least 192 KiB goes
     out as concatenated zstd bands.
   - Otherwise DEFLATE.
-- **Wave 2 refinement:**
+- **Lossy refinement:**
   - Lossy tiles are only used for tiles that changed within
     `REFINE_DELAY = 300 ms`. A tile that has settled is sent lossless.
   - Lossy and video-painted tiles join a `backlog`. Once a tile has been
@@ -643,7 +645,7 @@ These are the decision rules in `submit_ex` (the full narrative is in
   - `submit_refine()` sends a refinement-only update when the link is idle.
 - **Row trimming:** for chained deltas, `trim_rows` drops rows of a changed
   tile that did not change. Tiles owed a refinement are always sent whole.
-- `set_lossy(false)` / `set_cache(false)` turn Wave 2 off on the host.
+- `set_lossy(false)` / `set_cache(false)` turn lossy tiles and the tile cache off on the host.
   `ovhost`'s `--lossless` flag maps to the `NO_LOSSY` switch.
 
 `SubmitOutcome` is one of: `Unchanged`, `Full{bytes}`,
@@ -653,7 +655,7 @@ These are the decision rules in `submit_ex` (the full narrative is in
 `lz4_bands`, `zstd_bands`, `raw_bands`, `lossy_tiles`, `lossy_bytes`,
 `refined_tiles`, `cache_refs`, `cache_stores`.
 
-### 4.7 H.264 regions (`src/video.rs`, `src/mfcodec.rs`)
+### 4.7 H.264 regions (`src/video/`, `src/mfcodec/`)
 
 **`MotionConfig` defaults:**
 
@@ -714,7 +716,7 @@ These are the decision rules in `submit_ex` (the full narrative is in
 - The iOS shell instead uses `AccessUnit::from_annexb`, which produces AVCC
   plus SPS/PPS, for VideoToolbox.
 
-### 4.8 Send queue and scheduler (`src/sendq.rs`)
+### 4.8 Send queue and scheduler (`src/sendq/mailbox.rs`, `src/sendq/sender.rs`)
 
 **`FrameMailbox`:**
 
@@ -825,7 +827,7 @@ These are the decision rules in `submit_ex` (the full narrative is in
   Each step integrates over at most `MAX_STEP = 500 ms`. The output is
   `QualityDecision{fps, bitrate_scale, degraded}`.
 
-How `ovhost` wires it (outside this crate, `ovhost/src/main.rs`):
+How `ovhost` wires it (outside this crate, `ovhost/src/session/capture_loop.rs`):
 
 - QUALITY_SET with a value other than 0 overrides AUTO.
 - The AUTO base is `link_base_fps(base, MAX_AUTO_FPS = 60, rate,
@@ -862,7 +864,7 @@ How `ovhost` wires it (outside this crate, `ovhost/src/main.rs`):
 
 ---
 
-## 7. Audio (`src/audio.rs`, `src/winaudio.rs`)
+## 7. Audio (`src/audio/`, `src/winaudio.rs`)
 
 **AUDIO payload (`0x40`):**
 
@@ -905,7 +907,7 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 - `decode_fec(next, lost)` recovers a lost packet from the following packet's
   FEC data.
 - `conceal(lost)` runs Opus PLC. Without Opus, it produces silence.
-- The `ovview` hook (in `ovview/src/main.rs`) responds to MEDIA_GAP(audio)
+- The `ovview` hook (in `ovview/src/session/hooks.rs`) responds to MEDIA_GAP(audio)
   with FEC or PLC.
 
 **Buffers:**
@@ -927,9 +929,9 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
   - `WinmmSpeaker` / `spawn_playback` use `SPEAKER_BUFFERS = 3` rotating
     20 ms headers, refilled from the `AudioBus`.
 
-> `OPUS_FEC_LOSS_PERC`'s doc comment still says "our records travel reliably
-> today". Since Wave 3, audio can ride the unreliable media channel, which is
-> exactly where FEC applies.
+> `OPUS_FEC_LOSS_PERC`'s doc comment (`audio/mod.rs`) still says "our records
+> travel reliably today". Audio rides the unreliable media channel whenever it
+> is open, which is exactly where FEC applies.
 
 ---
 
@@ -946,7 +948,7 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
     of that value is recognised as an echo.
   - Clearing goes through the same guard.
 - `ovhost` polls the clipboard every `CLIPBOARD_POLL = 50 ms`
-  (`ovhost/src/main.rs`).
+  (`ovhost/src/session/mod.rs`).
 
 > Kind 0 is UTF-8 text; empty text means "clear the clipboard".
 
@@ -961,16 +963,16 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 - `wait_for_line(timeout)` builds on `TerminalSession::wait_for`, which pumps
   every 2 ms.
 
-## 10. File transfer (`src/file_transfer.rs` + legacy path)
+## 10. File transfer (`src/file_transfer/` + legacy path)
 
-**Legacy v0.6 path:**
+**Legacy single-transfer path (FILE_BEGIN / FILE_DATA / FILE_END):**
 
 - `TerminalSession::send_file(name, data, chunk)` sends FILE_BEGIN, then
   FILE_DATA chunks (16 KiB by default), then FILE_END.
 - Only one transfer can be in progress at a time.
 - `take_file()` returns `(name, bytes)`.
 
-**v0.24 path:**
+**File-id-keyed path (FILE_XFER_DATA / FILE_XFER_COMPLETE):**
 
 - `send_file_xfer`:
   - It uses `FileTransfer::send_commands`.
@@ -987,14 +989,11 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
   - An empty name becomes `file-<id>`.
   - Transfers can interleave.
 - `take_xfer_file()` returns the completed file.
-- `sanitize_name()` keeps only the last path segment, replaces control
-  characters, and maps an empty name, `.` or `..` to `_`.
-
-> - The module doc lists FILE_XFER_DATA as `file_id + chunk` without the 8-byte
->   `offset`. The encoder and decoder do include it.
-> - `sanitize_name` claims to strip "drive/UNC prefixes", but it only strips a
->   literal leading `C:` after splitting on separators. A name such as
->   `D:evil` keeps its drive prefix.
+- `sanitize_name()` keeps only the last path segment (split on `/` and `\`),
+  replaces control characters and `: < > " | ? *` with `_`, trims leading
+  whitespace and trailing spaces and dots, maps an empty result to `_`,
+  prefixes reserved Windows device names (`CON`, `NUL`, `COM1`, ...) with `_`,
+  and truncates to 255 bytes while keeping the extension.
 
 ## 11. Other helpers
 
@@ -1014,7 +1013,7 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
   - It then applies a 5-tap unsharp mask with `k = DEFAULT_SHARPEN = 0.5`.
   - It uses 14-bit fixed-point weights and runs bands across up to 8 threads
     for images of 256 KiB and larger.
-  - `ovview` uses it as its CPU scaler (`ovview/src/window.rs`).
+  - `ovview` uses it as its CPU scaler (`ovview/src/window/paint.rs`).
 - **`record`**: the `.ovrec` container (layout below).
   - The payload is always DEFLATE (`CODEC_DEFLATE = 1`).
   - `image::frame_pacing` turns the timestamps back into playback delays.
@@ -1039,7 +1038,8 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 | Tiles | `TILE`, `FULL_FRAME_NUM/DEN`, `MAX_TILE_RECTS` | 64, 6/10, 4096 |
 | Bands | `MAX_BANDS`, `TARGET_BANDS`, `MIN_BAND`, `MAX_MOVES`, `LZ4_MAX_RATIO`, `MIN_PARALLEL_DECODE` | 64, 8, 96 KiB, 256, 1.6, 128 KiB |
 | zstd | `codec::ZSTD_LEVEL`, `zstd_par::MIN_PARALLEL_BYTES` | 1, 128 KiB |
-| Wave 1/2 | `LZ4_MIN_LINK_RATE`, `REFRESH_CHUNK_BYTES`, `REFINE_DELAY`, `REFINE_SLICE`, `REFINE_MIN_CHUNK` (sendq) | 4 MB/s, 64 KiB, 300 ms, 15 ms, 8 KiB |
+| LZ4 / refinement | `LZ4_MIN_LINK_RATE`, `REFRESH_CHUNK_BYTES`, `REFINE_DELAY`, `REFINE_SLICE`, `REFINE_MIN_CHUNK` (sendq) | 4 MB/s, 64 KiB, 300 ms, 15 ms, 8 KiB |
+| Decode bound | `bands::MAX_RAW_TOTAL`, `MAX_DEFLATE_RATIO` (terminal/frame_codec) | 256 MiB, 1032 |
 | Lossy | `DEFAULT_QUALITY`, `CACHE_SLOTS`, `ATLAS_COLS`, `MAX_ATLAS_TILES`, `MAX_IMAGES` | 75, 4096, 8, 64, 256 |
 | Video | `VIDEO_HEADER_LEN`, `MAX_VIDEO_QUEUE`, `ENCODER_BUCKET`, default bpp | 38, 3, 128, 0.2 |
 | Pacer | see §5.1 | |
@@ -1050,34 +1050,39 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 
 ## 13. Tests
 
-**Unit tests** (`#[test]` counts per file):
+**Unit tests** (`#[test]` counts per module; a directory module counts all
+its files, usually a `tests.rs` or `tests/` next to `mod.rs`):
 
-| File | Tests |
+| Module | Tests |
 |---|---|
-| `sendq.rs` | 32 |
-| `terminal.rs` | 23 |
-| `video.rs` | 20 |
+| `sendq/` | 32 |
+| `terminal/` | 24 |
+| `file_transfer/` | 23 |
+| `video/` | 20 |
 | `adapt.rs` | 17 |
-| `audio.rs` | 14 |
-| `file_transfer.rs` | 13 |
+| `audio/` | 14 |
 | `liveness.rs`, `monitors.rs` | 9 each |
-| `tiles.rs` | 8 |
+| `bands/`, `tiles/` | 8 each |
 | `scale.rs` | 7 |
-| `clipboard.rs`, `gdisrc.rs`, `image.rs`, `lossy.rs`, `mfcodec.rs`, `pacing.rs` | 6 each |
-| `bands.rs`, `record.rs`, `scroll.rs` | 5 each |
+| `clipboard.rs`, `gdisrc.rs`, `image.rs`, `lossy/`, `mfcodec/`, `pacing.rs` | 6 each |
+| `record.rs`, `scroll.rs` | 5 each |
 | `codec.rs`, `netwait.rs`, `screen.rs`, `zstd_par.rs` | 3 each |
 
-`chat.rs`, `lib.rs` and `winaudio.rs` have none.
+`chat.rs`, `error.rs`, `lib.rs` and `winaudio.rs` have none.
 
-`terminal.rs` covers:
+`terminal/` (`wire_session_tests.rs`, `tiles_media_wire_tests.rs`) covers:
 
 - wire round-trips for every command family
 - rejection of malformed TILES_BEGIN, CURSOR_SHAPE, MONITORS_INFO and
-  CLIPBOARD payloads
+  CLIPBOARD payloads, and of unknown opcodes without breaking the session
+- DEFLATE helpers: lossless round trip, the declared-length bound
+  (`decompress_bounds_the_declared_length`), corrupt or short streams
 - rejecting an oversized command without desyncing the session
 - `take_latest_frame` skipping stale frames
-- CAPS fitting the 9-byte reply path
-- `CAP_MEDIA` being a fresh bit
+- CAPS advertising input v2
+
+`bands/tests.rs` includes `raw_len_is_bounded_before_any_allocation`,
+`decode_bands_rejects_hand_built_lies` and `hostile_containers_never_panic`.
 
 **Integration tests** (`tests/`, 13 tests in 10 files):
 
@@ -1087,11 +1092,11 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 | `relay_terminal.rs` | Same over a live in-process relay (`ovrelay`): pairing-code session, chat + terminal |
 | `screen_over_relay.rs` | Synthetic frames streamed host->viewer through the relay, byte-exact |
 | `screen_over_udp.rs` | `CAP_RUDP` negotiation on loopback UDP: two new peers switch to reliable framing and stream a large frame intact (`new_peers_negotiate_reliable_udp_and_stream_a_frame`); a new host stays raw for an old viewer without `CAP_RUDP` (`new_host_keeps_raw_udp_for_an_old_viewer`) |
-| `media_over_direct.rs` | Wave 3: sessions start on an in-memory carrier, upgrade to a loopback direct UDP path, negotiate `CAP_MEDIA`. `video_and_audio_ride_the_media_channel`: 20 H.264 units through `PrioritySender` plus 20 audio payloads arrive via the media channel (`frames_tx == 20`, `parity_tx > 0`, no drops, `transport_rate()` is `Some`). `without_cap_media_everything_stays_reliable`: direct path but no `CAP_MEDIA` -> units arrive over the reliable path, `media_stats()` is `None` |
+| `media_over_direct.rs` | Sessions start on an in-memory carrier, upgrade to a loopback direct UDP path, negotiate `CAP_MEDIA`. `video_and_audio_ride_the_media_channel`: 20 H.264 units through `PrioritySender` plus 20 audio payloads arrive via the media channel (`frames_tx == 20`, `parity_tx > 0`, no drops, `transport_rate()` is `Some`). `without_cap_media_everything_stays_reliable`: direct path but no `CAP_MEDIA` -> units arrive over the reliable path, `media_stats()` is `None` |
 | `audio_over_relay.rs` | 20 ms PCM ticks + a screen frame over the relay, byte-exact |
-| `audio_duplex_over_relay.rs` | AUDIO in both directions concurrently (v0.23) |
+| `audio_duplex_over_relay.rs` | AUDIO in both directions concurrently |
 | `input_over_relay.rs` | POINTER down/move/up + KEY down/up arrive in order with exact fields |
-| `file_transfer.rs` | v0.24 `send_file_xfer` in both directions concurrently over the relay |
+| `file_transfer.rs` | file-id-keyed `send_file_xfer` in both directions concurrently over the relay |
 | `unattended_over_relay.rs` | PIN-authenticated unattended access via device id: correct PIN establishes, wrong PIN rejected with `PIN proof mismatch` |
 
 No `TODO`/`FIXME`/`todo!()`/`unimplemented!()` markers exist in `src/` or
