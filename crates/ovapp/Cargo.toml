@@ -35,7 +35,8 @@ thiserror.workspace = true
 # aarch64-apple-ios staticlib keeps building.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 # Pure-Rust zstd DECODER: viewer + iOS decode the host's zstd frames.
-ruzstd = "0.7"
+# >= 0.9.1: RUSTSEC-2026-0344 (unbounded per-block output, decompression bomb).
+ruzstd = "0.9.1"
 # Pure-Rust LZ4 block codec (FrameCodec::Lz4 / CAP_LZ4): decode in
 # every build (iOS included), safe decoder for untrusted input.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }

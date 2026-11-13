@@ -74,7 +74,7 @@ if [[ "${SKIP_RUST}" == "1" && -d "${XCFRAMEWORK}" ]]; then
 else
   [[ "${SKIP_RUST}" == "1" ]] && log "${XCFRAMEWORK} missing, building it anyway"
   log "building ${XCFRAMEWORK} (ios/build_ios.sh --xcframework)"
-  "${IOS_DIR}/build_ios.sh" --xcframework
+  bash "${IOS_DIR}/build_ios.sh" --xcframework
 fi
 
 # 2. Xcode project.

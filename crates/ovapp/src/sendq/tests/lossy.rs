@@ -82,7 +82,6 @@ fn lossy_first_then_refined_to_exact_pixels() {
         h: 256,
     }; // 5x4 tiles
     let px = desk(w, h, Some(photo), 1);
-    let t0 = Instant::now();
     // Lossless reference (a viewer without the lossy / cache CAPS).
     let lossless_bytes = {
         let mb = FrameMailbox::default();
@@ -95,6 +94,11 @@ fn lossy_first_then_refined_to_exact_pixels() {
     };
     let mb = FrameMailbox::default();
     let mut enc = UpdateEncoder::new();
+    // The injected clock must not predate the encoder's epoch (its
+    // `Instant::now()` at construction): `now_ms` saturates below it, so a
+    // `t0` taken before the (slow, debug-build) lossless reference encode
+    // would shorten every later offset and make "settled" flaky under load.
+    let t0 = Instant::now();
     let mut dec = ScreenDecoder::new();
     enc.set_peer_caps(LOSSY_CACHE_CAPS);
     enc.set_clock(Some(t0));
@@ -156,9 +160,9 @@ fn refinement_is_cancelled_when_the_tile_changes_again() {
         h: 256,
     };
     let mut px = desk(w, h, Some(photo), 1);
-    let t0 = Instant::now();
     let mb = FrameMailbox::default();
     let mut enc = UpdateEncoder::new();
+    let t0 = Instant::now(); // not before the encoder's epoch
     let mut dec = ScreenDecoder::new();
     enc.set_peer_caps(LOSSY_CACHE_CAPS);
     enc.set_clock(Some(t0));

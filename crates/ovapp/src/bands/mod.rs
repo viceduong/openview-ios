@@ -486,7 +486,7 @@ pub fn parse_bounded(data: &[u8], max_raw: usize) -> Result<Packed<'_>, AppError
 }
 
 thread_local! {
-    static ZSTD_DEC: RefCell<Option<ruzstd::FrameDecoder>> = const { RefCell::new(None) };
+    static ZSTD_DEC: RefCell<Option<ruzstd::decoding::FrameDecoder>> = const { RefCell::new(None) };
 }
 
 /// Decode one band into `out` (exactly `band.raw_len` bytes).
@@ -527,7 +527,7 @@ fn decode_band(b: &BandRef<'_>, out: &mut [u8]) -> Result<(), AppError> {
             }
             let r = ZSTD_DEC.with(|d| {
                 let mut d = d.borrow_mut();
-                let dec = d.get_or_insert_with(ruzstd::FrameDecoder::new);
+                let dec = d.get_or_insert_with(ruzstd::decoding::FrameDecoder::new);
                 dec.decode_all(b.data, out)
             });
             match r {

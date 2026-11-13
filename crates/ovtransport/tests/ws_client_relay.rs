@@ -130,7 +130,11 @@ fn host_and_viewer_handshake_over_websocket_relay() {
     assert_eq!(pt, b"viewer over websocket");
 
     // A burst larger than one WebSocket message (64 KiB chunks) from the
-    // host, every datagram intact and in order.
+    // host, every datagram intact and in order. Once the path backs up the
+    // host carrier queues the tail (up to `TX_SOFT_CAP`) and only pushes it
+    // out on its next send/poll, so keep polling the host while the viewer
+    // drains, exactly as a real host's loop does. (Polling only the viewer
+    // stranded the queued tail on slow CI runners.)
     let mut sent = Vec::new();
     for i in 0..64u32 {
         let d = vec![(i % 251) as u8; 30_000 + i as usize];
@@ -138,9 +142,20 @@ fn host_and_viewer_handshake_over_websocket_relay() {
         sent.push(d);
     }
     let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
     while got.len() < sent.len() {
-        got.extend(recv(&mut viewer).unwrap());
+        assert_eq!(host.poll_recv(&mut |_| {}).unwrap(), 0, "host got data");
+        viewer.poll_recv(&mut |d| got.push(d.to_vec())).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "burst stalled: {}/{} datagrams, {} bytes still queued on the host",
+            got.len(),
+            sent.len(),
+            host.pending_send()
+        );
+        thread::sleep(Duration::from_millis(2));
     }
+    assert_eq!(host.pending_send(), 0);
     assert_eq!(got, sent);
 
     // PING through both pumps, auto-answered by the far carrier.

@@ -305,7 +305,7 @@ fn zstd_bands_decode_sequentially_and_in_parallel() {
         .unwrap();
     assert_eq!(out, data);
     let mut seq = vec![0u8; data.len()];
-    ruzstd::FrameDecoder::new()
+    ruzstd::decoding::FrameDecoder::new()
         .decode_all(&wire, &mut seq)
         .unwrap();
     assert_eq!(seq, data);

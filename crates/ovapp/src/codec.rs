@@ -90,7 +90,7 @@ impl Compressor {
 /// Reusable payload decompressor (one per receiving screen).
 #[derive(Default)]
 pub struct Decompressor {
-    zstd: Option<ruzstd::FrameDecoder>,
+    zstd: Option<ruzstd::decoding::FrameDecoder>,
 }
 
 impl Decompressor {
@@ -131,7 +131,9 @@ impl Decompressor {
             }
             FrameCodec::Deflate => decompress_into(data, expected_len, out),
             FrameCodec::Zstd => {
-                let dec = self.zstd.get_or_insert_with(ruzstd::FrameDecoder::new);
+                let dec = self
+                    .zstd
+                    .get_or_insert_with(ruzstd::decoding::FrameDecoder::new);
                 // Every byte gets overwritten on success: only (re)size, do not
                 // re-zero a buffer that already has the right length.
                 if out.len() != expected_len {

@@ -35,7 +35,12 @@ fn term_pair() -> (TerminalSession, TerminalSession) {
             break;
         }
     }
-    assert!(client.is_established() && server.is_established());
+    assert!(
+        client.is_established() && server.is_established(),
+        "handshake: client {:?}, server {:?}",
+        client.failed(),
+        server.failed()
+    );
     (
         TerminalSession::new(client.take_session().expect("client"), cc),
         TerminalSession::new(server.take_session().expect("server"), sc),

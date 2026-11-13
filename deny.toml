@@ -7,6 +7,27 @@ all-features = true
 [advisories]
 version = 2
 yanked = "warn"
+# "Unmaintained" notices for crates we do not depend on directly: all of them
+# arrive only through the Slint GUI toolkit (pinned `~1.14` in ovgui) and are
+# compile-time / font / Linux-desktop plumbing, none of it on the network
+# path. No maintained drop-in exists at these versions; revisit on every
+# Slint upgrade and drop entries as they disappear from Cargo.lock.
+# Vulnerabilities are never ignored here: fix them (e.g. RUSTSEC-2026-0344
+# was fixed by moving to ruzstd 0.9.1).
+ignore = [
+    # paste: proc-macro helper; via image -> exr/pulp, rav1e (slint image loading).
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained, transitive via slint (image/exr/rav1e); compile-time macro only" },
+    # pin-utils: via spin_on, used by slint-build / slint-macros at build time.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, transitive via slint-build/slint-macros (spin_on); build time only" },
+    # rustybuzz / ttf-parser: text shaping and font parsing for bundled UI fonts.
+    { id = "RUSTSEC-2026-0206", reason = "unmaintained, transitive via slint (usvg/resvg); parses only our bundled fonts/SVGs" },
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained, transitive via slint (fontdb, fontdue, ab_glyph, rustybuzz); local fonts only" },
+    # zbus_names / zvariant / zvariant_derive: D-Bus (Linux accessibility) via
+    # i-slint-backend-winit; merged into zbus 6, which slint 1.14 does not use.
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained (merged into zbus 6), transitive via slint winit backend; Linux D-Bus only" },
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained (merged into zbus 6), transitive via slint winit backend; Linux D-Bus only" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained (merged into zbus 6), transitive via slint winit backend; Linux D-Bus only" },
+]
 
 [licenses]
 version = 2

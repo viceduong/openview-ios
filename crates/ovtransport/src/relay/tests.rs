@@ -166,16 +166,40 @@ fn wait_attached_times_out_without_a_verdict() {
     server.join().unwrap();
 }
 
+/// A fake relay that accepts the CONNECT, then reads and discards
+/// everything in small, paced reads: a slow consumer that never writes back,
+/// so the client's send buffer fills without any risk of a two-way stall.
+fn slow_sink_relay() -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut connect = [0u8; 6];
+        stream.read_exact(&mut connect).unwrap();
+        stream.write_all(b"O").unwrap();
+        stream.write_all(b"A").unwrap();
+        stream.write_all(&connect[1..5]).unwrap();
+        stream.write_all(&[0u8; 6]).unwrap();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => thread::sleep(std::time::Duration::from_micros(200)),
+            }
+        }
+    });
+    (addr, handle)
+}
+
 #[test]
 fn full_send_buffer_completes_without_blocking_mode() {
     // A reader that drains slowly: the writer hits WouldBlock and must
     // finish via the retry path (the socket stays non-blocking).
-    let (addr, server) = fake_relay(false);
+    let (addr, server) = slow_sink_relay();
     let mut c = RelayTunnelCarrier::connect(addr, 8, TunnelRole::Initiator).unwrap();
     let big = vec![0x5Au8; 60 * 1024];
     for _ in 0..64 {
         c.send(&big).unwrap();
-        // Drain echoes so the fake relay's writes never back up.
         let _ = c.poll_recv(&mut |_| {});
     }
     assert_eq!(c.stats().sent_datagrams, 64);

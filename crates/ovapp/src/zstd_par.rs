@@ -1,7 +1,7 @@
 //! Parallel zstd decode of multi-frame payloads (viewer side).
 //!
 //! A zstd stream may hold several independent frames back to back; every
-//! decoder (C zstd, `ruzstd::FrameDecoder::decode_all`) decodes such a
+//! decoder (C zstd, `ruzstd::decoding::FrameDecoder::decode_all`) decodes such a
 //! stream sequentially into one contiguous output. A host that compresses an
 //! update as N independent horizontal bands therefore stays wire compatible
 //! with old viewers (same `FrameCodec::Zstd`, no new CAPS bit), while this
@@ -221,7 +221,7 @@ unsafe impl Send for Batch {}
 unsafe impl Sync for Batch {}
 
 thread_local! {
-    static DECODER: RefCell<Option<ruzstd::FrameDecoder>> = const { RefCell::new(None) };
+    static DECODER: RefCell<Option<ruzstd::decoding::FrameDecoder>> = const { RefCell::new(None) };
 }
 
 impl Batch {
@@ -247,7 +247,7 @@ impl Batch {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 DECODER.with(|d| {
                     let mut d = d.borrow_mut();
-                    let dec = d.get_or_insert_with(ruzstd::FrameDecoder::new);
+                    let dec = d.get_or_insert_with(ruzstd::decoding::FrameDecoder::new);
                     dec.decode_all(src, dst)
                 })
             }));
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(out, want);
         // The sequential decoder agrees (old viewers keep working).
         let mut seq = vec![0u8; want.len()];
-        let n = ruzstd::FrameDecoder::new()
+        let n = ruzstd::decoding::FrameDecoder::new()
             .decode_all(&wire, &mut seq)
             .unwrap();
         assert_eq!(n, want.len());
