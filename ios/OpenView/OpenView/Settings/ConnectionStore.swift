@@ -173,9 +173,26 @@ struct SavedConnection: Codable, Identifiable, Equatable {
         return trimmed.isEmpty ? DeviceID.format(deviceId) : trimmed
     }
 
-    /// "123 456 789 · Relay · 2h ago".
+    /// A LAN connection to a known device ID: the session tries the LAN
+    /// address first (on Wi-Fi / Ethernet) and falls back to the default
+    /// relay by device ID (`TransportPlan`). Derived, not stored, so LAN
+    /// entries saved by earlier builds get it too.
+    var hasRelayFallback: Bool {
+        transport.kind == .lan && UInt64(DeviceID.digits(deviceId)) != nil
+    }
+
+    /// "Relay" / "LAN" / "LAN + relay" (the relay part only while a relay
+    /// is configured to fall back to).
+    var transportLabel: String {
+        if hasRelayFallback && !AppSettings.defaultRelayURL.isEmpty {
+            return "LAN + relay"
+        }
+        return transport.label
+    }
+
+    /// "123 456 789 · LAN + relay · 2h ago".
     var subtitle: String {
-        var parts = [DeviceID.format(deviceId), transport.label]
+        var parts = [DeviceID.format(deviceId), transportLabel]
         if let lastConnected {
             parts.append(DisplayTime.relative(lastConnected))
         }
@@ -258,6 +275,28 @@ final class ConnectionStore: ObservableObject {
         change(&c)
         connections[i] = c
         persist()
+    }
+
+    /// Bonjour found this device ID at `host`:`port`: update the saved LAN
+    /// address of its LAN connections (relay ones keep their transport).
+    /// Returns whether anything changed.
+    @discardableResult
+    func refreshLanAddress(deviceId: String, host: String, port: UInt16) -> Bool {
+        let digits = DeviceID.digits(deviceId)
+        guard !digits.isEmpty, !host.isEmpty, port > 0 else { return false }
+        var changed = false
+        for i in connections.indices {
+            let t = connections[i].transport
+            guard connections[i].deviceId == digits, t.kind == .lan,
+                  t.lanHost != host || t.lanPort != port else { continue }
+            connections[i].transport.lanHost = host
+            connections[i].transport.lanPort = port
+            changed = true
+        }
+        if changed {
+            persist()
+        }
+        return changed
     }
 
     /// Remove the connection and its stored PIN.

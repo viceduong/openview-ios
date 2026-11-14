@@ -68,6 +68,18 @@ enum SessionError: Equatable {
         }
     }
 
+    /// This error as a failed attempt leg (LAN -> relay fallback,
+    /// `TransportPlan.shouldFallBack`).
+    var legFailure: LegFailure {
+        switch self {
+        case .authFailed: return .authFailed
+        case .rateLimited: return .rateLimited
+        case .incompatibleVersion: return .incompatibleVersion
+        case .hostUnreachable: return .timedOut
+        case .disconnected, .transport: return .unreachable
+        }
+    }
+
     /// "Too many attempts" text shared by the log line and the error card.
     static func rateLimitText(_ seconds: Int) -> String {
         seconds > 0

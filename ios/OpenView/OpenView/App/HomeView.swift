@@ -54,6 +54,9 @@ struct HomeView: View {
     /// The LAN device being resolved (its row shows a spinner).
     @State private var resolvingID: String?
     @State private var lanError: String?
+    /// Device IDs whose saved LAN address was re-resolved since Home
+    /// appeared (one background resolve per device and visit).
+    @State private var refreshedLanIDs: Set<String> = []
 
     var body: some View {
         NavigationView {
@@ -115,11 +118,22 @@ struct HomeView: View {
         }
         .navigationViewStyle(.stack)
         .onAppear(perform: firstAppear)
-        .onAppear { if !app.sessionActive && !ScreenshotMode.isActive { lan.start() } }
+        .onAppear {
+            refreshedLanIDs = []
+            if !app.sessionActive && !ScreenshotMode.isActive { lan.start() }
+        }
         .onDisappear { lan.stop() }
         .onChange(of: app.sessionActive) { active in
             // No browsing while a session runs (nor in screenshot mode).
-            if active || ScreenshotMode.isActive { lan.stop() } else { lan.start() }
+            if active || ScreenshotMode.isActive {
+                lan.stop()
+            } else {
+                refreshedLanIDs = []
+                lan.start()
+            }
+        }
+        .onChange(of: lan.hosts) { hosts in
+            refreshSavedLanAddresses(hosts)
         }
         .sheet(item: $sheet) { which in
             sheetView(which)
@@ -132,7 +146,7 @@ struct HomeView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This connection goes through a relay server, but none is configured. Add your relay in Settings > Connection, or use a LAN connection.")
+            Text("This connection needs a relay server, but none is configured. Add your relay in Settings > Connection, or connect over the PC's local network.")
         }
     }
 
@@ -246,11 +260,35 @@ struct HomeView: View {
                 return
             }
             let transport = ConnectionTransport.lan(host: host, port: port)
-            if let saved = store.find(deviceId: pc.deviceID) {
-                connect(saved, via: transport)
+            if var saved = store.find(deviceId: pc.deviceID) {
+                // A saved LAN connection keeps the address just found; a
+                // relay one dials LAN for this attempt only.
+                if saved.transport.kind == .lan {
+                    store.refreshLanAddress(deviceId: pc.deviceID, host: host, port: port)
+                    saved = store.connection(id: saved.id) ?? saved
+                    connect(saved)
+                } else {
+                    connect(saved, via: transport)
+                }
             } else {
                 sheet = .pin(PinRequest(deviceID: pc.deviceID, saved: nil,
                                         name: pc.name, transport: transport))
+            }
+        }
+    }
+
+    /// Keep saved LAN addresses fresh: resolve each listed PC that has a
+    /// saved LAN connection (once per Home visit) and store a changed
+    /// IP / port, so the connection (and its relay fallback) dials the PC's
+    /// current address.
+    private func refreshSavedLanAddresses(_ hosts: [DiscoveredPC]) {
+        guard !app.sessionActive, !ScreenshotMode.isActive else { return }
+        for pc in hosts where !refreshedLanIDs.contains(pc.deviceID) {
+            guard let saved = store.find(deviceId: pc.deviceID), saved.transport.kind == .lan else { continue }
+            refreshedLanIDs.insert(pc.deviceID)
+            LanDiscovery.resolve(pc) { host, port in
+                guard let host, let port, port > 0 else { return }
+                store.refreshLanAddress(deviceId: pc.deviceID, host: host, port: port)
             }
         }
     }
@@ -344,7 +382,7 @@ struct HomeView: View {
         if let override {
             c.transport = override
         }
-        guard !c.transport.isMissingRelay else {
+        guard !app.needsMissingRelay(c.transport, hasDeviceID: UInt64(DeviceID.digits(c.deviceId)) != nil) else {
             app.relayMissing = true
             return
         }
@@ -845,7 +883,7 @@ struct ConnectionEditView: View {
                 }
                 if useLan {
                     Section(header: Text("Advanced"),
-                            footer: Text("Direct UDP to the host on your local network.")) {
+                            footer: Text("Direct UDP to the host on your local network. Away from it (or when the address does not answer), the app connects through your relay by device ID.")) {
                         TextField("Host IP, e.g. 192.168.1.10", text: $lanHost)
                             .keyboardType(.decimalPad)
                             .disableAutocorrection(true)

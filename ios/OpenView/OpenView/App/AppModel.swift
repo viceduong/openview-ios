@@ -23,6 +23,9 @@ final class AppModel: ObservableObject {
     private var storeChange: AnyCancellable?
 
     init() {
+        // Wi-Fi vs cellular for the LAN-or-relay decision; started now so
+        // the first connect already knows the path.
+        NetworkPathWatcher.shared.start()
         // Re-publish store changes so views observing only the app model
         // refresh too.
         storeChange = store.objectWillChange.sink { [weak self] _ in
@@ -61,6 +64,18 @@ final class AppModel: ObservableObject {
         KeychainPIN.load(for: c.id, reason: "Use the saved PIN for \(c.displayName)", completion: completion)
     }
 
+    /// The attempt would start on the relay and none is configured: a
+    /// relay connection without a relay, or a LAN connection with relay
+    /// fallback while the phone is off its LAN (cellular), where only the
+    /// relay can reach the PC.
+    func needsMissingRelay(_ transport: ConnectionTransport, hasDeviceID: Bool) -> Bool {
+        if transport.isMissingRelay { return true }
+        guard transport.kind == .lan, AppSettings.defaultRelayURL.isEmpty else { return false }
+        let plan = TransportPlan.make(isLan: true, hasDeviceID: hasDeviceID,
+                                      network: NetworkPathWatcher.shared.current)
+        return plan.first == .relay
+    }
+
     // MARK: Session lifecycle
 
     /// Build the session controller and present the immersive session.
@@ -68,7 +83,7 @@ final class AppModel: ObservableObject {
     /// (`relayMissing`) instead of failing inside the session.
     func connect(_ req: ConnectRequest) {
         guard controller == nil else { return }
-        if req.transport.isMissingRelay {
+        if needsMissingRelay(req.transport, hasDeviceID: req.deviceID != nil) {
             relayMissing = true
             return
         }

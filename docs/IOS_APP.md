@@ -45,6 +45,7 @@ paths below are relative to that folder unless noted.
 | `SessionController+Files.swift` | Sending and receiving files |
 | `SessionModels.swift` | `SessionPhase`, `SessionError`, `LogLine`, `ChatMessage`, `ReceivedFile`, `IdentityMismatch` |
 | `SessionDialer.swift` | `ConnectMode`, `ConnectRequest`, `SessionDialer.dial`, `PairingState` |
+| `TransportPlan.swift` | `TransportPlan`, `DialRoute`, `NetworkReach`, `LegFailure`: LAN first or relay, and when a LAN leg falls back to the relay; pure, unit-tested |
 | `RemoteAudioPlayer.swift` | PC audio playback (PCM / Opus, jitter cushion) |
 | `ClipboardBridge.swift` | Pasteboard sync with echo guard |
 | `SessionHost.swift` | `SessionChrome`, `SessionHostingController` (full-screen UIKit host), `SessionPresenter` |
@@ -73,6 +74,7 @@ paths below are relative to that folder unless noted.
 | `NwUdpBridge.swift` | LAN UDP transport |
 | `LanDiscovery.swift` | "On this network": `NWBrowser` for `_openview._udp` (Bonjour, TXT included), `DiscoveredPC`, and resolving a host to IPv4 + port with a short-lived UDP `NWConnection` |
 | `LanTxtRecord.swift` | Parsing the host's TXT record (`id`, `v`, `name`); pure, unit-tested |
+| `NetworkPathWatcher.swift` | `NWPathMonitor` reduced to `NetworkReach` (Wi-Fi / Ethernet, cellular only, offline) for the LAN-or-relay decision |
 | `DirectPaths.swift` | `DirectPathSet`: per-candidate UDP paths for the direct upgrade |
 | **Settings/** | |
 | `AppSettings.swift` | `SettingsKey` (UserDefaults keys), `AppSettings` typed readers (incl. `bundledRelayURL`), `QualityChoice`, `DeviceID`, `DisplayTime`, `AppearanceStyle`, `Haptics` |
@@ -157,7 +159,8 @@ dialing(transport) ─► authenticating ─► waitingForFirstFrame ─► live
 | Trigger | Effect |
 |---|---|
 | `start()` (from `SessionContainer.onAppear`) | Wires clipboard, input and video failure, then `beginAttempt()` |
-| `beginAttempt()` | Increments the `generation`, resets per-attempt UI, arms the **15 s handshake timeout**, runs `startOnQueue` |
+| `beginAttempt()` | Plans the attempt's legs (`TransportPlan`, see 4.3.1), then `launchAttempt()` |
+| `launchAttempt()` | Increments the `generation`, resets per-attempt UI, arms the **15 s handshake timeout** (and the **3 s LAN probe** on a LAN leg with a relay behind it), runs `startOnQueue` |
 | `startOnQueue` | Resets attempt state, installs screen sinks on a fresh `OvScreenBox`, calls `SessionDialer.dial`, wires the transport, first `pump()`, starts a 50 ms `DispatchSourceTimer` (`tick`) |
 | Transport up | `didDial` → `.authenticating` |
 | State sink, or `peerFingerprint()` after the first pump | `noteEstablished` → `didEstablish` → `.waitingForFirstFrame`. Re-sends quality. Checks the TOFU pin. |
@@ -184,6 +187,11 @@ and `.incompatibleVersion` are not auto-reconnected.
 **Failures and reconnects.**
 
 - The handshake timeout produces `.hostUnreachable`.
+- **LAN -> relay fallback** (`handleFailure`, before anything else): a LAN
+  leg that never reached a secure session and failed with a timeout or a
+  transport error continues on the relay within the same attempt (see
+  4.3.1). Auth failures, rate limiting and version mismatches are reported
+  at once.
 - **Auto-reconnect** (`handleFailure`) runs only when all of these hold:
   - the error is not `.authFailed`, `.rateLimited` or `.incompatibleVersion`,
   - the session was live at least once,
@@ -300,9 +308,15 @@ when `v` is not this app's protocol version. Tapping a row resolves the
 service: a UDP `NWConnection` to the service endpoint, forced to IPv4, whose
 `currentPath.remoteEndpoint` gives the address and the SRV port (5 s
 timeout). A saved device connects with its stored PIN, name and pinned
-fingerprint, using `.lan(ip, port)` for this attempt only (its saved
-transport is unchanged). A new device asks for the PIN, and after the
+fingerprint: a saved LAN connection stores the address just resolved, a
+saved relay connection uses `.lan(ip, port)` for this attempt only (its
+saved transport is unchanged). A new device asks for the PIN, and after the
 session is established it is saved as a LAN connection.
+
+**Keeping the address fresh.** While Home lists a PC that has a saved LAN
+connection, it resolves that PC once per visit in the background and
+updates the saved IP / port when they changed
+(`ConnectionStore.refreshLanAddress`).
 
 1. `NwUdpBridge` is created **before** the first pump, because the client
    HELLO goes out during that pump. The bridge buffers up to 256 datagrams
@@ -316,6 +330,44 @@ session is established it is saved as a LAN connection.
 5. A receive error other than cancellation (e.g. ECONNREFUSED after an ICMP
    port-unreachable) does not stop the receive loop; it re-arms after
    50 ms.
+
+#### 4.3.1 Relay fallback for LAN connections
+
+A LAN connection whose target is a device ID (every saved connection and a
+PC added from **On this network**) also reaches its host through the relay
+by device ID, like `ovview --id … --relay-fallback` on Windows. The
+decision is `TransportPlan` (pure, unit-tested), fed with the phone's
+network from `NetworkPathWatcher` (`NWPathMonitor`, started by `AppModel`):
+
+| Connection | Phone network | Legs |
+|---|---|---|
+| LAN + device ID | Wi-Fi / Ethernet (or not known yet, or only a VPN interface) | LAN, then relay |
+| LAN + device ID | cellular only / offline | relay |
+| LAN without a device ID (pairing code over LAN) | any | LAN only |
+| Relay | any | relay |
+
+- Nothing is stored: the fallback is derived from the saved LAN transport
+  and the device ID, so LAN connections saved by earlier builds get it
+  without a migration. Their row subtitle reads **LAN + relay** while a
+  relay is configured.
+- The relay leg dials `.relay(AppSettings.defaultRelayURL)` with the same
+  target, PIN and pinned fingerprint, so the TOFU check applies on both
+  legs, and the session saved afterwards keeps its LAN transport.
+- The LAN leg gets a **3 s probe** (`TransportPlan.lanProbeTimeout`): if no
+  datagram from the host arrived by then (`noteLanProgress`), the leg is
+  halted and the relay is dialed. A host that answered keeps the normal
+  15 s handshake timeout. The session log shows "LAN unreachable —
+  connecting via relay".
+- Only timeouts and transport errors fall back (`TransportPlan.shouldFallBack`);
+  `.authFailed`, `.rateLimited` and `.incompatibleVersion` come from the
+  host itself and are shown at once.
+- No relay configured: on cellular the connect is refused up front with the
+  "No relay server" alert (`AppModel.needsMissingRelay`); on Wi-Fi the LAN
+  leg runs alone and, if it fails, the error card shows the same guidance.
+- Every attempt and every auto-reconnect plans again, so a session that
+  dropped when the phone left Wi-Fi reconnects through the relay.
+- The stats chip and the session menu show the leg actually dialed
+  (`SessionController.transportDetail`).
 
 ### 4.4 Direct upgrade next to a relay
 
@@ -800,7 +852,8 @@ auto-connect and the Bonjour browse.
 - `OpenViewTests` (XCTest) covers pure logic: relay address parsing
   (`RelayAddress`), direct-path candidate parsing and LAN classification
   (`DirectPathSet.parse` / `classify`), the zoom math (`ViewportMath`) and
-  the hosts' TXT records (`LanTxtRecord`).
+  the hosts' TXT records (`LanTxtRecord`) and the LAN / relay transport
+  plan (`TransportPlan`).
   These source files are compiled into the test bundle directly, so the
   tests need neither the app host nor the Rust library.
 - The Rust side is covered by `cargo test -p ovffi`, including the check that

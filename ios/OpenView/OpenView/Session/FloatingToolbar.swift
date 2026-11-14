@@ -14,7 +14,9 @@ import UIKit
 /// off) — purely visual: every tap acts immediately, faded or not.
 /// Cmd+Shift+Space toggles it (SessionHostingController). While the soft
 /// keyboard or the key accessory bar is up (`input.keyInputActive`) the
-/// toolbar collapses to its handle (tap to expand over the keyboard).
+/// toolbar collapses to its handle (tap to expand over the keyboard). That
+/// handle is UIKit (KeyboardHandleOverlay.swift), constrained to the
+/// keyboard layout guide so it moves with the keyboard and its key row.
 ///
 /// The pill / handle report their frames (`reportsChromeFrame`) so the
 /// remote surface underneath never takes touches meant for them.
@@ -42,7 +44,8 @@ struct FloatingToolbar: View {
     private static let spacing: CGFloat = 2
     private static let pillInset: CGFloat = 4
     private static let edgeGap: CGFloat = 12
-    /// Gap between the keyboard's top edge and the handle / pill.
+    /// Gap between the keyboard's top edge and the pill (the keyboard
+    /// handle uses the same gap, see KeyboardHandleOverlay).
     private static let keyboardGap: CGFloat = 8
     /// Length of the pill along its axis (4 x 44 + spacing + insets).
     private static let pillLength: CGFloat =
@@ -54,12 +57,17 @@ struct FloatingToolbar: View {
         GeometryReader { geo in
             ZStack {
                 if isCollapsed {
-                    handle(in: geo)
+                    // Keyboard up: the handle is the UIKit one riding the
+                    // keyboard (keyboardHandle below), not this one.
+                    if !keyboardUp {
+                        handle(in: geo)
+                    }
                 } else {
                     expanded(in: geo)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            .background(keyboardHandle)
         }
         // Don't resize with the keyboard: the area changing size mid-way
         // through the collapse spring made the animation jumpy. Positions
@@ -201,21 +209,40 @@ struct FloatingToolbar: View {
 
     // MARK: Collapsed handle
 
+    /// The collapsed handle while the keyboard / key bar is up: a UIKit
+    /// view constrained to the keyboard layout guide (trailing edge, just
+    /// above the key row), so UIKit moves it in the keyboard's own
+    /// animation. This view only says when it shows (see
+    /// KeyboardHandleOverlay.swift).
+    private var keyboardHandle: some View {
+        KeyboardHandleAnchor(visible: keyboardUp && isCollapsed,
+                             faded: chrome.toolbarFaded,
+                             onTap: {
+                                 chrome.poke()
+                                 setCollapsed(false)
+                             },
+                             onPoke: {
+                                 chrome.poke()
+                             },
+                             onDragEnded: { x, y in
+                                 handleEdge = x < 0.5 ? "leading" : "trailing"
+                                 handleY = Double(min(max(y, 0.08), 0.92))
+                             })
+            .frame(width: 1, height: 1)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+
+    /// The handle with the keyboard down: on the side edge the user dragged
+    /// it to, at the persisted height.
     private func handle(in geo: GeometryProxy) -> some View {
         let size = geo.size
-        // Keyboard-collapsed: always the trailing edge, high enough to stay
-        // clear of the keyboard (the layout ignores the keyboard, so the
-        // height here is the full screen).
-        let keyboardHandle = keyboardUp
-        let onTrailing = keyboardHandle || handleEdge != "leading"
+        let onTrailing = handleEdge != "leading"
         let halfWidth = Self.target / 2
         let halfHeight = Self.handleHeight / 2
         let x = onTrailing ? size.width - halfWidth : halfWidth
         let maxY = max(halfHeight, size.height - halfHeight)
-        // Keyboard up: just above the keyboard (follows it as it moves).
-        let y = keyboardHandle
-            ? max(keyboardTop(in: geo) - Self.keyboardGap - halfHeight, halfHeight)
-            : min(max(CGFloat(handleY) * size.height, halfHeight), maxY)
+        let y = min(max(CGFloat(handleY) * size.height, halfHeight), maxY)
         return Image(systemName: onTrailing ? "chevron.compact.left" : "chevron.compact.right")
             .font(.system(size: 22, weight: .bold))
             .foregroundColor(.white)

@@ -91,6 +91,9 @@ final class SessionController: ObservableObject {
     /// The host announced CAP_DESKTOP_FX (wallpaper / animation switches in
     /// the session menu).
     @Published private(set) var hostSupportsDesktopFx = false
+    /// The transport the current attempt dials ("LAN 192.168.1.5:4571",
+    /// "Relay wss://…"): a LAN connection may fall back to the relay.
+    @Published private(set) var transportDetail: String
 
     let screenModel = ScreenModel()
     let livenessModel = LivenessModel()
@@ -123,6 +126,13 @@ final class SessionController: ObservableObject {
     var attemptEstablished = false
     /// Monitor to restore when the host announces its monitors.
     var pendingMonitor: Int?
+    /// The attempt's legs (LAN first and / or relay, `TransportPlan`) and
+    /// the one being dialed; re-planned on every attempt / reconnect.
+    var plan = TransportPlan(routes: [.relay])
+    var routeIndex = 0
+    /// The LAN leg heard from the host (a datagram arrived), so the short
+    /// LAN probe timeout no longer applies.
+    var lanProgress = false
     var started = false
     var stopped = false
     var observers: [NSObjectProtocol] = []
@@ -155,6 +165,9 @@ final class SessionController: ObservableObject {
     static let directBatchMax = 64
     /// Set once the handshake completes (picks the -3 error wording).
     var established = false
+    /// Direct mode: the first datagram from the host was reported to main
+    /// (`noteLanProgress`).
+    var lanHeard = false
     /// Set on a fatal error / teardown: the pump is stopped and inbound
     /// traffic is ignored until the next attempt.
     var halted = false
@@ -210,6 +223,7 @@ final class SessionController: ObservableObject {
     init(request: ConnectRequest) {
         self.request = request
         self.phase = .dialing(request.transport.label)
+        self.transportDetail = request.transport.detail
         self.targetFps = request.defaultFps
         self.pendingMonitor = request.lastMonitor > 0 ? request.lastMonitor : nil
     }
@@ -321,16 +335,53 @@ final class SessionController: ObservableObject {
         onEstablished?(mismatch.got)
     }
 
-    /// Start (or restart) one connection attempt with a new generation.
+    /// Start (or restart) one connection attempt: plan its legs from the
+    /// current network (a LAN connection with a device ID tries LAN first
+    /// on Wi-Fi / Ethernet, the relay directly on cellular) and dial the
+    /// first one.
     func beginAttempt() {
+        guard !stopped else { return }
+        plan = Self.makePlan(for: request, network: NetworkPathWatcher.shared.current)
+        routeIndex = 0
+        launchAttempt()
+    }
+
+    /// The legs for `req` on `network`.
+    static func makePlan(for req: ConnectRequest, network: NetworkReach) -> TransportPlan {
+        TransportPlan.make(isLan: req.transport.kind == .lan,
+                           hasDeviceID: req.deviceID != nil,
+                           network: network)
+    }
+
+    /// The leg being dialed.
+    var route: DialRoute {
+        plan.routes.indices.contains(routeIndex) ? plan.routes[routeIndex] : plan.first
+    }
+
+    /// The request as dialed on `route`: a LAN connection's relay leg
+    /// reaches the same device ID through the default relay. Target, PIN
+    /// and pinned fingerprint are unchanged, so TOFU applies on both legs.
+    func dialRequest(on route: DialRoute) -> ConnectRequest {
+        var req = request
+        if route == .relay, req.transport.kind == .lan {
+            req.transport = .relay(AppSettings.defaultRelayURL)
+        }
+        return req
+    }
+
+    /// Dial the current leg with a new generation.
+    func launchAttempt() {
         guard !stopped else { return }
         generation += 1
         let gen = generation
         attemptEstablished = false
+        lanProgress = false
+        let req = dialRequest(on: route)
+        transportDetail = req.transport.detail
         if case .reconnecting = phase {
             // keep the capsule
         } else {
-            phase = .dialing(request.transport.label)
+            phase = .dialing(req.transport.label)
         }
         // Nothing stays pressed; the next host's CAPS decide the commands.
         input.releaseAll()
@@ -341,10 +392,16 @@ final class SessionController: ObservableObject {
         livenessModel.path = nil
         hostSupportsDesktopFx = false
         screenModel.video.hide(generation: screenModel.video.generation)
-        let req = request
         log("Connecting to \(req.displayName) via \(req.transport.detail)")
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
             self?.handshakeTimedOut(generation: gen)
+        }
+        // A LAN leg with a relay behind it gets a short probe: a host that
+        // has not answered at all by then is not on this network.
+        if route == .lan, plan.hasFallback(after: routeIndex) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + TransportPlan.lanProbeTimeout) { [weak self] in
+                self?.lanProbeTimedOut(generation: gen)
+            }
         }
         queue.async { [weak self] in
             self?.startOnQueue(request: req, generation: gen)
@@ -360,12 +417,47 @@ final class SessionController: ObservableObject {
         handleFailure(.hostUnreachable, generation: gen)
     }
 
-    /// An attempt ended with `error`: auto-reconnect (an established
-    /// session that dropped, up to 3 attempts) or show the error.
+    /// The LAN leg heard nothing from the host within the probe timeout:
+    /// end it and let `handleFailure` move on to the relay.
+    func lanProbeTimedOut(generation gen: Int) {
+        guard gen == generation, !stopped, !attemptEstablished, !lanProgress else { return }
+        debug("LAN: no answer from the host after \(Int(TransportPlan.lanProbeTimeout)) s")
+        queue.async { [weak self] in
+            self?.haltOnQueue()
+        }
+        handleFailure(.hostUnreachable, generation: gen)
+    }
+
+    /// Main: the LAN leg received its first datagram from the host.
+    func noteLanProgress(generation gen: Int) {
+        guard gen == generation, !stopped else { return }
+        lanProgress = true
+    }
+
+    /// An attempt ended with `error`: fall back from LAN to the relay (a
+    /// LAN leg that never reached a secure session, unless the host itself
+    /// refused: wrong PIN, rate limited, incompatible version), else
+    /// auto-reconnect (an established session that dropped, up to 3
+    /// attempts) or show the error.
     func handleFailure(_ error: SessionError, generation gen: Int) {
         guard gen == generation, !stopped else { return }
         // Invalidate late events of the failed attempt.
         generation += 1
+        var error = error
+        if route == .lan, !attemptEstablished,
+           let next = plan.fallback(after: routeIndex, failure: error.legFailure) {
+            routeIndex += 1
+            if next == .relay, AppSettings.defaultRelayURL.isEmpty {
+                // Nothing to fall back to: say how to reach this PC away
+                // from its network.
+                log("LAN unreachable — no relay server is configured")
+                error = .transport(ConnectionTransport.ConfigError.noRelay.message)
+            } else {
+                log("LAN unreachable — connecting via relay")
+                launchAttempt()
+                return
+            }
+        }
         let inBackground = UIApplication.shared.applicationState == .background
         if error.canAutoReconnect, everLive, !inBackground, AppSettings.autoReconnect,
            reconnectAttempts < Self.maxReconnectAttempts {

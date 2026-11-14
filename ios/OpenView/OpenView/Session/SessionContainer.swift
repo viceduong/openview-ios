@@ -109,7 +109,7 @@ struct SessionContainer: View {
                 HStack(alignment: .top) {
                     if showStats {
                         StatsChip(liveness: controller.livenessModel,
-                                  transport: controller.request.transport.detail,
+                                  transport: controller.transportDetail,
                                   fingerprint: controller.peerPine)
                     }
                     Spacer(minLength: 0)

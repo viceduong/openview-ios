@@ -32,6 +32,10 @@ First public release (0.1.0).
   with relay fallback.
 - LAN sessions without any relay: hosts announce themselves over mDNS /
   Bonjour and are listed as **Computers on this network**.
+- iOS: LAN connections with a device ID fall back to the relay. On Wi-Fi the
+  app tries the LAN address first (3 s), on cellular it dials the relay
+  directly; saved LAN addresses follow the PC when Bonjour sees it at a new
+  address.
 
 #### Streaming and interaction
 - DXGI Desktop Duplication capture; lossless dirty tiles with scroll
@@ -45,6 +49,11 @@ First public release (0.1.0).
   Linux relay archives, an unsigned iOS `.ipa`, `SHA256SUMS`, build
   provenance attestations and `THIRD_PARTY_LICENSES.txt`.
 - Docker image definition and a hardened systemd unit for the relay.
+
+### Fixed
+- iOS: a PC added from **On this network** could not be reached away from
+  home: the app kept dialing its private LAN address and never tried the
+  relay. Existing LAN connections get the relay fallback automatically.
 
 ### Security
 - End-to-end encryption: X25519 key exchange with Ed25519 identities and a

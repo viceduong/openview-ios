@@ -69,6 +69,13 @@ extension SessionController {
             udpBridge = NwUdpBridge(host: host, port: port, queue: queue,
                                     onReceive: { [weak self] data in
                 guard let self, !self.halted, let session = self.session else { return }
+                if !self.lanHeard {
+                    // The host answered: the LAN probe timeout no longer
+                    // applies (the handshake timeout still does).
+                    self.lanHeard = true
+                    let gen = self.queueGeneration
+                    self.onMain { $0.noteLanProgress(generation: gen) }
+                }
                 do {
                     try session.onDatagram(data)
                 } catch {
@@ -206,6 +213,7 @@ extension SessionController {
         halted = false
         established = false
         isDirect = false
+        lanHeard = false
         directQueued = 0
         lastErrorLine = nil
         lastLiveness = (alive: true, rtt: -1, fpsTenths: 0)

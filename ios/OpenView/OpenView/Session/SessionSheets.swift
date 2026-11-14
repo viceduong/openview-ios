@@ -161,7 +161,7 @@ struct SessionMenuSheet: View {
             HStack {
                 Text("Connection")
                 Spacer()
-                Text(controller.request.transport.detail)
+                Text(controller.transportDetail)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)

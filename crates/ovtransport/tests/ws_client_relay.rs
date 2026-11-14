@@ -136,12 +136,15 @@ fn host_and_viewer_handshake_over_websocket_relay() {
     // drains, exactly as a real host's loop does. (Polling only the viewer
     // stranded the queued tail on slow CI runners.)
     let mut sent = Vec::new();
+    let mut got = Vec::new();
     for i in 0..64u32 {
         let d = vec![(i % 251) as u8; 30_000 + i as usize];
         host.send(&d).unwrap();
         sent.push(d);
+        // Drain the viewer between sends: once the path is full, `send`
+        // waits for room, and only a reading peer makes room.
+        viewer.poll_recv(&mut |d| got.push(d.to_vec())).unwrap();
     }
-    let mut got = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     while got.len() < sent.len() {
         assert_eq!(host.poll_recv(&mut |_| {}).unwrap(), 0, "host got data");
