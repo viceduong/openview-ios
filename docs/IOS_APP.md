@@ -52,6 +52,7 @@ paths below are relative to that folder unless noted.
 | `SessionContainer.swift` | The immersive session view: phase overlays, stats chip, reconnect capsule, toasts, error card, gesture help, sheet routing |
 | `SessionSheets.swift` | Session menu, chat, files, session log, `DocumentPicker`, `ShareSheet` |
 | `FloatingToolbar.swift` | Collapsible toolbar pill and drag handle |
+| `KeyBarToolbarLink.swift` | Shares toolbar state and actions with the key bar (keyboard-up handle and toolbar button) |
 | **Screen/** | |
 | `RemoteScreenSurface.swift` | `RemoteScreenSurface` (SwiftUI wrapper) and `RemoteSurfaceView`: layers, rendering, cursor, keyboard |
 | `RemoteSurfaceView+Viewport.swift` | Safe area / keyboard geometry, zoom presets, cursor-following viewport |
@@ -573,6 +574,8 @@ Touch always behaves as a trackpad:
   - With a sticky non-Shift modifier active, a single ASCII letter or digit
     is sent as that key, so Ctrl+C works.
   - Otherwise text is sent as TEXT, or as per-character KEYs for old hosts.
+- `KeyAccessoryBar` has a fixed toolbar button next to hide-keyboard and
+  draws the collapsed toolbar handle above its top-right corner.
 - `KeyAccessoryBar` is a horizontally scrolling ribbon:
   ⊞ Shift Ctrl Alt | ScrLk Fn | Esc Tab PrtScn Pause Ins Del Home End PgUp
   PgDn | ← ↑ → ↓.
@@ -603,7 +606,10 @@ Touch always behaves as a trackpad:
 - It collapses to a handle that can be dragged anywhere. The handle snaps to
   the nearest side edge and its position is persisted.
 - With "Fade toolbar when idle" on, it fades to 70% after 3 s.
-- It auto-collapses while the keyboard is up.
+- It auto-collapses while the keyboard is up. The collapsed handle then sits
+  on the key bar (above its top-right corner), so it moves with the key row;
+  tapping it, or the bar's toolbar button, expands the toolbar over the
+  keyboard.
 
 **`SessionContainer`** overlays, by phase:
 

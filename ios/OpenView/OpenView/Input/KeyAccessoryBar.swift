@@ -11,6 +11,12 @@ import UIKit
 /// `RemoteInputController.tapModifier`): tap = one-shot (tinted), double
 /// tap = locked (filled). The first time the bar appears, a hint says the
 /// ribbon scrolls.
+///
+/// Toolbar: a fixed toolbar button (next to "hide keyboard") expands /
+/// collapses the floating toolbar over the keyboard, and while the toolbar
+/// is collapsed its handle is drawn by this bar, protruding above the
+/// top-trailing corner, so it moves with the key row by construction
+/// (`KeyBarToolbarLink` carries the state and actions).
 final class KeyAccessoryBar: UIView {
     static let barHeight: CGFloat = 46
     /// UserDefaults flag: the "swipe for more keys" hint was shown.
@@ -28,22 +34,56 @@ final class KeyAccessoryBar: UIView {
     private var cancellable: AnyCancellable?
     private var hintLabel: UILabel?
 
+    // Floating-toolbar handle / button.
+    private let link: KeyBarToolbarLink
+    private var linkCancellable: AnyCancellable?
+    private let toolbarHandle = KeyBarToolbarHandle()
+    private var toolbarButton: UIButton?
+    private var handleFramePending = false
+    /// Geometry of the floating toolbar's own handle: 44 pt wide touch
+    /// target, 26 x 64 capsule, 8 pt above the key row.
+    private static let handleWidth: CGFloat = 44
+    private static let handleHeight: CGFloat = 64
+    private static let handleGap: CGFloat = 8
+    private static let toolbarButtonWidth: CGFloat = 44
+
     init(input: RemoteInputController) {
         self.input = input
+        self.link = KeyBarToolbarLink.link(for: input)
         super.init(frame: CGRect(x: 0, y: 0, width: 320, height: KeyAccessoryBar.barHeight))
         autoresizingMask = [.flexibleWidth]
         backgroundColor = .secondarySystemBackground
+        // The toolbar handle protrudes above the bar.
+        clipsToBounds = false
         buildLayout()
         buildKeys()
+        buildToolbarHandle()
         showFunctionKeys(false)
         cancellable = input.$modifierStates.sink { [weak self] states in
             self?.applyModifierStates(states)
         }
         applyModifierStates(input.modifierStates)
+        // @Published emits before the property changes: use the values
+        // passed in, never read them back from the link here.
+        linkCancellable = Publishers.CombineLatest3(link.$attached, link.$handleVisible, link.$faded)
+            .sink { [weak self] attached, visible, faded in
+                self?.applyToolbarState(attached: attached, handleVisible: visible, faded: faded)
+            }
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(keyboardDidMove(_:)),
+                           name: UIResponder.keyboardDidChangeFrameNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardDidMove(_:)),
+                           name: UIResponder.keyboardDidShowNotification, object: nil)
+        center.addObserver(self, selector: #selector(keyboardWillHide(_:)),
+                           name: UIResponder.keyboardWillHideNotification, object: nil)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     override var intrinsicContentSize: CGSize {
@@ -55,6 +95,25 @@ final class KeyAccessoryBar: UIView {
         if window != nil {
             showHintIfNeeded()
         }
+        scheduleHandleFramePublish()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        scheduleHandleFramePublish()
+    }
+
+    /// Touches on the protruding handle belong to the bar too (whether
+    /// they reach it depends on the keyboard's host views; the toolbar
+    /// keeps a tap target under the handle and the toolbar button for
+    /// when they do not).
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if super.point(inside: point, with: event) { return true }
+        return handleTakesTouches && toolbarHandle.frame.contains(point)
+    }
+
+    private var handleTakesTouches: Bool {
+        !toolbarHandle.isHidden && toolbarHandle.alpha > 0.01 && toolbarHandle.isUserInteractionEnabled
     }
 
     // MARK: Layout
@@ -76,6 +135,14 @@ final class KeyAccessoryBar: UIView {
         hide.configuration = hideCfg
         hide.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hide)
+
+        // Floating toolbar: show (or hide) it over the keyboard.
+        let toolbar = makeButton(title: nil, symbol: "sidebar.right", label: "Show toolbar",
+                                 width: Self.toolbarButtonWidth) { [weak self] in
+            self?.link.onToggleToolbar?()
+        }
+        addSubview(toolbar)
+        toolbarButton = toolbar
 
         let divider = UIView()
         divider.backgroundColor = .separator
@@ -101,7 +168,9 @@ final class KeyAccessoryBar: UIView {
         NSLayoutConstraint.activate([
             hide.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             hide.centerYAnchor.constraint(equalTo: centerYAnchor),
-            divider.trailingAnchor.constraint(equalTo: hide.leadingAnchor, constant: -4),
+            toolbar.trailingAnchor.constraint(equalTo: hide.leadingAnchor, constant: -4),
+            toolbar.centerYAnchor.constraint(equalTo: centerYAnchor),
+            divider.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -4),
             divider.widthAnchor.constraint(equalToConstant: 1),
             divider.heightAnchor.constraint(equalToConstant: 26),
             divider.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -177,6 +246,90 @@ final class KeyAccessoryBar: UIView {
             content.addArrangedSubview(v)
         }
         scroll.setContentOffset(.zero, animated: false)
+    }
+
+    // MARK: Floating-toolbar handle
+
+    /// The collapsed toolbar's handle, above the bar's top-trailing corner
+    /// (same look as the toolbar's SwiftUI handle). A subview of the bar, so
+    /// UIKit animates it together with the key row.
+    private func buildToolbarHandle() {
+        let handle = toolbarHandle
+        handle.translatesAutoresizingMaskIntoConstraints = false
+        handle.alpha = 0
+        handle.isUserInteractionEnabled = false
+        handle.accessibilityElementsHidden = true
+        handle.onActivate = { [weak self] in
+            self?.link.onShowToolbar?()
+        }
+        addSubview(handle)
+        NSLayoutConstraint.activate([
+            handle.widthAnchor.constraint(equalToConstant: Self.handleWidth),
+            handle.heightAnchor.constraint(equalToConstant: Self.handleHeight),
+            // The right edge, like the toolbar's handle (chevron points left).
+            handle.rightAnchor.constraint(equalTo: safeAreaLayoutGuide.rightAnchor),
+            handle.bottomAnchor.constraint(equalTo: topAnchor, constant: -Self.handleGap),
+        ])
+    }
+
+    private func applyToolbarState(attached: Bool, handleVisible: Bool, faded: Bool) {
+        let show = attached && handleVisible
+        toolbarHandle.isUserInteractionEnabled = show
+        toolbarHandle.accessibilityElementsHidden = !show
+        let target: CGFloat = show ? (faded ? CGFloat(SessionChrome.fadedOpacity) : 1) : 0
+        if toolbarHandle.alpha != target {
+            // Alpha only: the position always follows the bar.
+            UIView.animate(withDuration: 0.2, delay: 0,
+                           options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseInOut]) {
+                self.toolbarHandle.alpha = target
+            }
+        }
+        if let button = toolbarButton {
+            // Expanded over the keyboard: tinted, and the button hides it.
+            let expanded = attached && !handleVisible
+            var cfg = Self.baseConfiguration(expanded ? .latched : .off)
+            cfg.image = button.configuration?.image
+            button.configuration = cfg
+            button.accessibilityLabel = expanded ? "Hide toolbar" : "Show toolbar"
+            button.isEnabled = attached
+        }
+    }
+
+    @objc private func keyboardDidMove(_ note: Notification) {
+        scheduleHandleFramePublish()
+    }
+
+    @objc private func keyboardWillHide(_ note: Notification) {
+        if !link.handleFrame.isNull {
+            link.handleFrame = .null
+        }
+    }
+
+    /// Publish the handle's frame (app window coordinates) for the
+    /// toolbar's tap target, on the next main-queue turn (never from inside
+    /// a layout or SwiftUI update; coalesced).
+    private func scheduleHandleFramePublish() {
+        guard !handleFramePending else { return }
+        handleFramePending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.handleFramePending = false
+            let frame = self.currentHandleFrame()
+            if self.link.handleFrame != frame {
+                self.link.handleFrame = frame
+            }
+        }
+    }
+
+    /// The handle's frame in the session window (SwiftUI `.global`): the
+    /// bar lives in the keyboard's window, so go through screen
+    /// coordinates. Model values, i.e. where it ends up after an animation.
+    private func currentHandleFrame() -> CGRect {
+        guard window != nil else { return .null }
+        let screenSpace = UIScreen.main.coordinateSpace
+        let onScreen = toolbarHandle.convert(toolbarHandle.bounds, to: screenSpace)
+        guard let appWindow = (input?.activeSurface as? UIView)?.window else { return onScreen }
+        return appWindow.convert(onScreen, from: screenSpace)
     }
 
     // MARK: First-use hint
@@ -296,6 +449,7 @@ final class KeyAccessoryBar: UIView {
     }
 
     private func makeButton(title: String?, symbol: String?, label: String,
+                            width: CGFloat = KeyAccessoryBar.keyWidth,
                             action: @escaping () -> Void) -> UIButton {
         var cfg = Self.baseConfiguration(.off)
         if let title { cfg.title = title }
@@ -304,7 +458,7 @@ final class KeyAccessoryBar: UIView {
         b.accessibilityLabel = label
         // Every key the same width (fits the longest label, "PrtScn").
         b.translatesAutoresizingMaskIntoConstraints = false
-        b.widthAnchor.constraint(equalToConstant: Self.keyWidth).isActive = true
+        b.widthAnchor.constraint(equalToConstant: width).isActive = true
         b.titleLabel?.adjustsFontSizeToFitWidth = true
         b.titleLabel?.minimumScaleFactor = 0.8
         // Visible press feedback that lingers a moment after the finger
@@ -327,6 +481,65 @@ final class KeyAccessoryBar: UIView {
             b.configuration = cfg
             b.accessibilityValue = s == .off ? nil : (s == .locked ? "locked" : "latched")
         }
+    }
+}
+
+/// The floating toolbar's collapsed handle as drawn above the key bar: a
+/// 26 x 64 ultra-thin capsule with a left chevron in a 44 x 64 target. Tap
+/// (or VoiceOver activate) shows the toolbar.
+final class KeyBarToolbarHandle: UIView {
+    var onActivate: (() -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        // The session chrome is always dark.
+        overrideUserInterfaceStyle = .dark
+        isAccessibilityElement = true
+        accessibilityLabel = "Show toolbar"
+        accessibilityTraits = .button
+
+        let capsuleWidth: CGFloat = 26
+        let capsule = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
+        capsule.translatesAutoresizingMaskIntoConstraints = false
+        capsule.isUserInteractionEnabled = false
+        capsule.layer.cornerRadius = capsuleWidth / 2
+        capsule.layer.masksToBounds = true
+        capsule.layer.borderWidth = 0.5
+        capsule.layer.borderColor = UIColor(white: 1, alpha: 0.15).cgColor
+        addSubview(capsule)
+
+        let symbol = UIImage.SymbolConfiguration(pointSize: 22, weight: .bold)
+        let chevron = UIImageView(image: UIImage(systemName: "chevron.compact.left", withConfiguration: symbol))
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+        chevron.tintColor = .white
+        chevron.contentMode = .center
+        capsule.contentView.addSubview(chevron)
+
+        NSLayoutConstraint.activate([
+            capsule.centerXAnchor.constraint(equalTo: centerXAnchor),
+            capsule.centerYAnchor.constraint(equalTo: centerYAnchor),
+            capsule.widthAnchor.constraint(equalToConstant: capsuleWidth),
+            capsule.heightAnchor.constraint(equalTo: heightAnchor),
+            chevron.centerXAnchor.constraint(equalTo: capsule.contentView.centerXAnchor),
+            chevron.centerYAnchor.constraint(equalTo: capsule.contentView.centerYAnchor),
+        ])
+
+        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    @objc private func tapped(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        onActivate?()
+    }
+
+    override func accessibilityActivate() -> Bool {
+        onActivate?()
+        return true
     }
 }
 
