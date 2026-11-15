@@ -81,7 +81,7 @@ extension RemoteSurfaceView {
         ViewportMath.fillScale(frame: frameSize, bounds: bounds.size)
     }
 
-    /// The remote screen's height fills 2/5 of the view's height.
+    /// The remote screen's height fills 1/3 of the view's height.
     var openDefaultScale: CGFloat {
         ViewportMath.openDefaultScale(frame: frameSize, viewHeight: bounds.height)
     }

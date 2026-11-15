@@ -23,12 +23,12 @@ final class ViewportMathTests: XCTestCase {
 
     func testOpenDefaultIsTwoFifthsOfTheViewHeight() {
         let s = ViewportMath.openDefaultScale(frame: frame, viewHeight: 844)
-        XCTAssertEqual(s * frame.height, 844 * 0.4, accuracy: 1e-9)
+        XCTAssertEqual(s * frame.height, 844.0 / 3.0, accuracy: 1e-9)
         XCTAssertEqual(ViewportMath.openDefaultScale(frame: frame, viewHeight: 0), 0)
     }
 
     func testOpenDefaultNeverGoesBelowFit() {
-        // Landscape phone: 2/5 of the height is smaller than fit, so the
+        // Landscape phone: 1/3 of the height is smaller than fit, so the
         // clamp keeps the whole screen visible.
         let fit = ViewportMath.fitScale(frame: frame, safe: CGRect(x: 47, y: 0, width: 750, height: 369))
         let open = ViewportMath.openDefaultScale(frame: frame, viewHeight: 390)

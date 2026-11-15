@@ -138,6 +138,20 @@ final class RelayWebSocket {
         }
     }
 
+    /// Block the calling thread (never main) until every send handed to
+    /// URLSession has completed, at most `timeout`. Used only at app
+    /// termination, where nothing may be scheduled for later.
+    func waitForSends(timeout: DispatchTimeInterval) {
+        let deadline = DispatchTime.now() + timeout
+        while DispatchTime.now() < deadline {
+            sendLock.lock()
+            let idle = inFlight == 0
+            sendLock.unlock()
+            if idle { return }
+            usleep(5_000)
+        }
+    }
+
     /// A `send` completed (URLSession's delegate queue).
     private func sendCompleted() {
         sendLock.lock()

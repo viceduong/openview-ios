@@ -76,6 +76,8 @@ final class SessionController: ObservableObject {
     /// How long the sockets stay open after a goodbye so its bytes leave
     /// the device.
     static let goodbyeLinger: DispatchTimeInterval = .milliseconds(300)
+    /// The most main blocks in `willTerminate` for the goodbye.
+    static let terminateWait: DispatchTimeInterval = .milliseconds(100)
 
     // ---- published UI state (main thread only) ----
     @Published private(set) var phase: SessionPhase
@@ -245,6 +247,14 @@ final class SessionController: ObservableObject {
         // parts, not self, and tear them down on the queue that owns them.
         // Everything here is idempotent.
         clipboardTimer?.cancel()
+        // A background task must never outlive its owner (iOS kills the app
+        // when an expired task is not ended).
+        let bgTask = backgroundTask
+        if bgTask != .invalid {
+            DispatchQueue.main.async {
+                UIApplication.shared.endBackgroundTask(bgTask)
+            }
+        }
         let nc = NotificationCenter.default
         for o in observers {
             nc.removeObserver(o)
@@ -610,11 +620,23 @@ final class SessionController: ObservableObject {
     func didEnterBackground() {
         input.releaseAll()
         if backgroundTask == .invalid {
-            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "OpenView session") { [weak self] in
+            // The handler ends the task it was registered for even when the
+            // controller is gone or holds another id: an expired task that
+            // is not ended gets the app killed (0xbada5e47).
+            let token = BackgroundTaskToken()
+            token.id = UIApplication.shared.beginBackgroundTask(withName: "OpenView session") { [weak self] in
                 // About to be suspended: the goodbye must leave now.
-                self?.pauseForBackground(wait: .milliseconds(300))
-                self?.endBackgroundTask()
+                DiagLog.shared.log("Background task expired")
+                if let self, self.backgroundTask == token.id {
+                    self.pauseForBackground(wait: .milliseconds(200))
+                    self.endBackgroundTask()
+                } else if token.id != .invalid {
+                    UIApplication.shared.endBackgroundTask(token.id)
+                }
+                token.id = .invalid
             }
+            backgroundTask = token.id
+            DiagLog.shared.log("Background task began (\(Int(Self.backgroundGrace)) s grace)")
         }
         backgroundPause?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -648,12 +670,27 @@ final class SessionController: ObservableObject {
     }
 
     /// The app is being terminated (swiped away while still running): say
-    /// goodbye so the host is free at once, and give the bytes a moment on
-    /// the wire before the process ends.
+    /// goodbye so the host is free at once. Main blocks at most
+    /// `terminateWait` and nothing is scheduled to run later: UIKit calls
+    /// exit() as soon as this returns, and work still running then (socket
+    /// closes, audio teardown, a lingering asyncAfter) races the process
+    /// teardown. The sockets are not closed here; the kernel closes them at
+    /// exit after sending what was handed to it.
     func willTerminate() {
         guard started, !stopped else { return }
-        haltWithGoodbye(wait: .milliseconds(300))
-        Thread.sleep(forTimeInterval: 0.25)
+        stopped = true
+        generation += 1
+        backgroundPause?.cancel()
+        backgroundPause = nil
+        let done = DispatchSemaphore(value: 0)
+        queue.async { [weak self] in
+            self?.goodbyeForTerminationOnQueue()
+            done.signal()
+        }
+        let sent = done.wait(timeout: .now() + Self.terminateWait) == .success
+        DiagLog.shared.logSync(sent ? "Session: goodbye sent at terminate"
+                                    : "Session: terminate — session queue busy, goodbye skipped")
+        endBackgroundTask()
     }
 
     /// Main: disconnect the running attempt because the app stays in the
@@ -688,6 +725,7 @@ final class SessionController: ObservableObject {
         guard backgroundTask != .invalid else { return }
         UIApplication.shared.endBackgroundTask(backgroundTask)
         backgroundTask = .invalid
+        DiagLog.shared.log("Background task ended")
     }
 
     // MARK: Published-state setters (main thread)
@@ -804,4 +842,10 @@ final class SessionController: ObservableObject {
             String(hex.dropFirst($0).prefix(8))
         }.joined(separator: " ")
     }
+}
+
+/// The id of one background task, shared with its expiration handler so the
+/// handler can end exactly that task (main thread only).
+final class BackgroundTaskToken {
+    var id: UIBackgroundTaskIdentifier = .invalid
 }

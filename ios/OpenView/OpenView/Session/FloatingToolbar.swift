@@ -385,7 +385,6 @@ final class KeyboardTracker: ObservableObject {
     @Published private(set) var up = false
     @Published private(set) var height: CGFloat = 0
     private var observers: [NSObjectProtocol] = []
-    private var hideWork: DispatchWorkItem?
     /// The latest keyboard height iOS reported. The deferred first slide
     /// reads this, not the value captured when it was scheduled: iOS often
     /// sends a second frame change right away (the key row joining the
@@ -423,8 +422,6 @@ final class KeyboardTracker: ObservableObject {
         let newHeight = hiding ? 0 : max(screen.maxY - end.minY, 0)
         let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
         let animation = Self.keyboardAnimation(duration)
-        hideWork?.cancel()
-        hideWork = nil
         targetHeight = newHeight
         if newHeight > 0 {
             if !up {
@@ -440,15 +437,13 @@ final class KeyboardTracker: ObservableObject {
                 withAnimation(animation) { height = newHeight }
             }
         } else if up {
-            // Slide the handle down with the keyboard, then restore the
-            // normal toolbar once it is gone.
-            withAnimation(animation) { height = 0 }
-            let work = DispatchWorkItem { [weak self] in
-                self?.up = false
+            // Restore the normal toolbar right away, while the keyboard slides
+            // down: the keyboard-up handle lives on the key bar and leaves
+            // with it, so there is nothing to wait for.
+            withAnimation(animation) {
+                height = 0
+                up = false
             }
-            hideWork = work
-            // The keyboard spring settles in about 0.5 s.
-            DispatchQueue.main.asyncAfter(deadline: .now() + max(duration, 0.45), execute: work)
         }
     }
 }

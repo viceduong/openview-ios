@@ -38,6 +38,9 @@ final class DiagLog {
     private var lastPath = ""
     private var observers: [NSObjectProtocol] = []
     private var started = false
+    /// How the previous launch's log ended (`previousRunSummary`), read
+    /// before this launch's file is created; logged by `start()`.
+    private var previousRun: String?
 
     private init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -53,8 +56,14 @@ final class DiagLog {
         f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         lineFormatter = f
         Self.prune(directory, keep: Self.maxFiles - 1)
-        FileManager.default.createFile(atPath: currentURL.path, contents: nil)
-        handle = try? FileHandle(forWritingTo: currentURL)
+        if let last = Self.files(directory).last {
+            previousRun = Self.previousRunSummary(last)
+        }
+        // A file this launch cannot create or open (e.g. protected data not
+        // available yet) only means no log: `handle` stays nil.
+        if FileManager.default.createFile(atPath: currentURL.path, contents: nil) {
+            handle = try? FileHandle(forWritingTo: currentURL)
+        }
     }
 
     /// Start the extra sources (lifecycle, network path, hang monitor).
@@ -64,7 +73,14 @@ final class DiagLog {
         started = true
         let info = Bundle.main.infoDictionary
         let version = (info?["CFBundleShortVersionString"] as? String ?? "?") + " (" + (info?["CFBundleVersion"] as? String ?? "?") + ")"
-        log("App launch: OpenView \(version), iOS \(UIDevice.current.systemVersion), \(UIDevice.current.model)")
+        // iOS 15+ may "prewarm" the process well before the user opens the
+        // app; opening it then resumes that process.
+        let prewarm = ProcessInfo.processInfo.environment["ActivePrewarm"] == "1"
+        log("App launch: OpenView \(version), iOS \(UIDevice.current.systemVersion), \(UIDevice.current.model)"
+            + (prewarm ? " (prewarmed)" : ""))
+        if let previousRun {
+            log(previousRun)
+        }
         let nc = NotificationCenter.default
         let events: [(Notification.Name, String)] = [
             (UIApplication.didBecomeActiveNotification, "App: active"),
@@ -76,8 +92,16 @@ final class DiagLog {
             (UIApplication.protectedDataDidBecomeAvailableNotification, "Device: unlocked"),
         ]
         for (name, text) in events {
+            // The terminate line is in the file before the observer returns
+            // (exit() follows right after); it is the clean-exit marker the
+            // next launch looks for.
+            let sync = name == UIApplication.willTerminateNotification
             observers.append(nc.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
-                self?.log(text)
+                if sync {
+                    self?.logSync(text)
+                } else {
+                    self?.log(text)
+                }
             })
         }
         let monitor = NWPathMonitor()
@@ -97,18 +121,34 @@ final class DiagLog {
         }
     }
 
+    /// Append one line and return once it is in the file (app terminate
+    /// only: waits for the log queue, which never waits on anything else).
+    func logSync(_ text: String) {
+        let now = Date()
+        queue.sync {
+            write("\(lineFormatter.string(from: now)) \(text)\n")
+        }
+    }
+
     private func write(_ line: String) {
         guard let handle, !capped else { return }
         let data = Data(line.utf8)
         if written + data.count > Self.maxBytes {
             capped = true
-            handle.write(Data("(log size cap reached; further lines dropped)\n".utf8))
+            try? handle.write(contentsOf: Data("(log size cap reached; further lines dropped)\n".utf8))
             return
         }
-        // FileHandle.write is an unbuffered write(2): the line is in the
-        // file even if the app is killed / frozen right after.
-        handle.write(data)
-        written += data.count
+        // An unbuffered write(2): the line is in the file even if the app
+        // is killed / frozen right after. The throwing variant on purpose:
+        // the legacy `write(_:)` raises an Objective-C exception (a crash)
+        // on an I/O error such as a full disk; here a failed write only
+        // stops the log.
+        do {
+            try handle.write(contentsOf: data)
+            written += data.count
+        } catch {
+            self.handle = nil
+        }
     }
 
     private func notePath(_ path: NWPath) {
@@ -173,6 +213,41 @@ final class DiagLog {
         return all
             .filter { $0.lastPathComponent.hasPrefix("session-") }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// One line on how the previous launch's log ended: with the terminate
+    /// marker (clean), in the background (suspended and then killed — a
+    /// force close or memory pressure, normal on iOS — or a background
+    /// crash), or while in the foreground (crash / watchdog / jetsam).
+    static func previousRunSummary(_ url: URL) -> String {
+        let name = url.lastPathComponent
+        guard let fh = try? FileHandle(forReadingFrom: url) else {
+            return "Previous run (\(name)): log unreadable"
+        }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        let tailBytes: UInt64 = 8_192
+        try? fh.seek(toOffset: size > tailBytes ? size - tailBytes : 0)
+        let data = (try? fh.readToEnd()) ?? Data()
+        let lines = String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
+        guard let lastLine = lines.last else {
+            return "Previous run (\(name)): log empty"
+        }
+        let markers = ["App: terminate", "App: background", "App: active", "App: foreground", "App launch"]
+        // (Skip the summary line itself: its quoted last line may name a
+        // marker.)
+        let lastState = lines.last { line in
+            !line.contains("Previous run (") && markers.contains { line.contains($0) }
+        } ?? ""
+        if lastState.contains("App: terminate") {
+            return "Previous run (\(name)) ended cleanly (terminate). Last line: \(lastLine)"
+        }
+        if lastState.contains("App: background") {
+            return "Previous run (\(name)) ended in the background without terminate "
+                + "(suspended then killed, or crashed there). Last line: \(lastLine)"
+        }
+        return "Previous run (\(name)) ended UNCLEANLY in the foreground "
+            + "(crash / watchdog / jetsam). Last line: \(lastLine)"
     }
 
     private static func prune(_ dir: URL, keep: Int) {

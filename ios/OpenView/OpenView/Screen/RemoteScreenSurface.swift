@@ -13,7 +13,7 @@ import UIKit.UIGestureRecognizerSubclass
 // keyboard handling; RemoteSurfaceView+Viewport.swift the zoom / pan
 // geometry (scale math in ViewportMath.swift), +Gestures.swift the touch
 // gestures, +Pointer.swift the iPad pointer. A session opens at the
-// `.openDefault` zoom (remote height = 2/5 of the view, never below fit).
+// `.openDefault` zoom (remote height = 1/3 of the view, never below fit).
 //
 // Gestures (familiar remote-desktop trackpad model). Mouse
 // (trackpad) input is the only touch interpretation:

@@ -7,7 +7,7 @@ enum ViewportMath {
     static let maxZoomScale: CGFloat = 2
     /// `ZoomPreset.openDefault`: the remote screen's height fills this
     /// fraction of the view's height.
-    static let openDefaultHeightFraction: CGFloat = 0.4
+    static let openDefaultHeightFraction: CGFloat = 1.0 / 3.0
     /// Pinch release snaps to fit / fill / 1:1 within this ratio.
     static let snapTolerance: CGFloat = 0.2
 
@@ -24,7 +24,7 @@ enum ViewportMath {
         return max(bounds.width / frame.width, bounds.height / frame.height)
     }
 
-    /// `ZoomPreset.openDefault`: the frame's height fills 2/5 of the view.
+    /// `ZoomPreset.openDefault`: the frame's height fills 1/3 of the view.
     static func openDefaultScale(frame: CGSize, viewHeight: CGFloat) -> CGFloat {
         guard frame.height > 0, viewHeight > 0 else { return 0 }
         return viewHeight * openDefaultHeightFraction / frame.height

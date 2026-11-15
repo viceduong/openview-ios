@@ -553,7 +553,7 @@ Touch always behaves as a trackpad:
 | 2-finger tap / 3-finger tap | Right click / middle click |
 | 2-finger pan | Wheel: 120 per 10 pt, natural direction, both axes, no inertia |
 | pinch | Local zoom around the cursor. On release it snaps to fit, fill or 1:1 within ±20%. Range: fit … max(2 pt/px, fit). |
-| (session start) | The viewport opens at `ZoomPreset.openDefault`: the remote screen's height fills 2/5 of the view, clamped to the zoom range (`ViewportMath`). |
+| (session start) | The viewport opens at `ZoomPreset.openDefault`: the remote screen's height fills 1/3 of the view, clamped to the zoom range (`ViewportMath`). |
 | "Lock local zoom" on | Pinch becomes Ctrl+wheel on the host |
 
 - The soft keyboard does not resize the image. Instead the viewport scrolls

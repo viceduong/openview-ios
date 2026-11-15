@@ -601,6 +601,27 @@ extension SessionController {
         audioPlayer.stop()
     }
 
+    /// App termination (`willTerminate`): stop pumping and say goodbye, but
+    /// leave the sockets and the audio engine alone and schedule nothing —
+    /// the process exits right after, and a socket close / audio teardown /
+    /// asyncAfter still running then races exit(). The goodbye's WebSocket
+    /// sends get a short, bounded wait to reach the connection; the kernel
+    /// closes the sockets at exit.
+    func goodbyeForTerminationOnQueue() {
+        guard !halted else { return }
+        halted = true
+        pumpTimer?.cancel()
+        pumpTimer = nil
+        p2pTimer?.cancel()
+        p2pTimer = nil
+        p2pTimerDue = nil
+        relaySocket?.onMessage = nil
+        relaySocket?.onClose = nil
+        guard let session else { return }
+        session.goodbye()
+        relaySocket?.waitForSends(timeout: .milliseconds(80))
+    }
+
     /// Full teardown (session closed): stop the pump, close the transports
     /// and release every callback so the session box can deinit.
     func teardownOnQueue() {
