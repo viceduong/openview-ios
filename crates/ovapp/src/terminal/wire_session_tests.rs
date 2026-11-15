@@ -807,3 +807,34 @@ fn take_latest_frame_skips_stale_frames_and_queue_is_capped() {
     assert_eq!(g.seq, 10);
     assert_eq!(g.pixels, synthetic_frame(10, 64, 32).pixels);
 }
+
+#[test]
+fn bye_ends_the_receiving_session_after_its_batch() {
+    assert_eq!(encode(&Command::Bye), vec![0x64]);
+    assert_eq!(decode(&[0x64]).unwrap(), Command::Bye);
+    let (mut host, mut view) = inmem_pair();
+    // BYE goes only to a peer that advertised CAP_BYE: before the CAPS
+    // exchange the goodbye is just the close.
+    view.announce_caps().unwrap();
+    host.pump().unwrap();
+    view.pump().unwrap();
+    assert!(view.peer_caps().is_some_and(|c| c & CAP_BYE != 0));
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Command>::new()));
+    let sink = got.clone();
+    host.on_cmd(Some(Box::new(move |c: &Command| {
+        sink.lock().unwrap().push(c.clone());
+    })));
+    // A record sent before the goodbye still reaches the hook.
+    view.send(&Command::Text("last".into())).unwrap();
+    view.goodbye().unwrap();
+    assert!(!host.peer_said_goodbye());
+    assert!(matches!(host.pump(), Err(TransportError::Closed)));
+    assert!(host.peer_said_goodbye());
+    assert!(
+        matches!(host.pump(), Err(TransportError::Closed)),
+        "stays closed"
+    );
+    let got = got.lock().unwrap();
+    assert_eq!(got.first(), Some(&Command::Text("last".into())));
+    assert!(got.contains(&Command::Bye));
+}

@@ -118,6 +118,7 @@ fn run(cli: Cli) -> Result<(), String> {
         pin,
         data_dir,
         send_file: cli.send_file,
+        standby: cli.service,
     };
     let fx = FxCfg {
         hide_wallpaper: !cli.keep_wallpaper,
@@ -176,8 +177,10 @@ fn run(cli: Cli) -> Result<(), String> {
         start_lan(&opts, cli.lan_port, opts.pin.is_some() && !cli.no_mdns)
     };
 
+    // The standby park handed from one session to the next (service mode).
+    let mut carry = None;
     if !cli.service {
-        return session::listen_once(&opts, lan.as_mut());
+        return session::listen_once(&opts, lan.as_mut(), &mut carry);
     }
     // Serve forever; back off after errors so a wedged relay or bad peer
     // cannot spin the CPU. An idle relay park (`XT`, nobody dialed within
@@ -185,7 +188,7 @@ fn run(cli: Cli) -> Result<(), String> {
     // internally without touching the backoff.
     let mut backoff = Duration::from_secs(1);
     loop {
-        match session::listen_once(&opts, lan.as_mut()) {
+        match session::listen_once(&opts, lan.as_mut(), &mut carry) {
             Ok(()) => backoff = Duration::from_secs(1),
             Err(e) => {
                 warn!("session failed: {e}; retrying in {backoff:?}");

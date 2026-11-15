@@ -133,6 +133,11 @@ int32_t ov_session_begin(OvSession *s, int32_t auth_mode);
 int32_t ov_session_begin_pin(OvSession *s, const uint8_t *pin, size_t pin_len);
 int32_t ov_session_pump(OvSession *s);
 int32_t ov_session_send_record(OvSession *s, uint8_t channel, const uint8_t *data, size_t len);
+// Goodbye before teardown: BYE on the current path (twice) + the relay
+// tunnel's DISCONNECT, so the host frees its session slot at once. Keep the
+// sockets open a few hundred ms afterwards so the bytes leave. 0, -1, or -2
+// (not established; the relay tunnel is closed all the same).
+int32_t ov_session_goodbye(OvSession *s);
 int32_t ov_session_set_record_sink(OvSession *s, void *user, ov_record_sink sink);
 int32_t ov_session_set_state_sink(OvSession *s, void *user, ov_state_sink sink);
 int32_t ov_session_peer_fingerprint(OvSession *s, uint8_t *out /*16*/);

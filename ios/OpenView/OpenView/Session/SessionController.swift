@@ -69,6 +69,13 @@ final class SessionController: ObservableObject {
     static let watchdogMs: Int64 = 8_000
     /// No secure session after this long = host not responding.
     static let handshakeTimeout: TimeInterval = 15
+    /// How long a session survives in the background (a quick app switch
+    /// keeps it) before it says goodbye and disconnects; it reconnects when
+    /// the app comes back. Well inside the ~30 s a background task gets.
+    static let backgroundGrace: TimeInterval = 10
+    /// How long the sockets stay open after a goodbye so its bytes leave
+    /// the device.
+    static let goodbyeLinger: DispatchTimeInterval = .milliseconds(300)
 
     // ---- published UI state (main thread only) ----
     @Published private(set) var phase: SessionPhase
@@ -137,6 +144,11 @@ final class SessionController: ObservableObject {
     var stopped = false
     var observers: [NSObjectProtocol] = []
     var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// The pending end of the background grace (`didEnterBackground`).
+    var backgroundPause: DispatchWorkItem?
+    /// The session was disconnected because the app stayed in the
+    /// background; it reconnects when the app returns.
+    var pausedInBackground = false
     /// Echo-guarded pasteboard bridge, polled on main.
     let clipboard = ClipboardBridge()
     var clipboardTimer: DispatchSourceTimer?
@@ -295,6 +307,8 @@ final class SessionController: ObservableObject {
         stopped = true
         generation += 1
         removeLifecycleObservers()
+        backgroundPause?.cancel()
+        backgroundPause = nil
         endBackgroundTask()
         clipboardTimer?.cancel()
         clipboardTimer = nil
@@ -542,6 +556,10 @@ final class SessionController: ObservableObject {
                                         object: nil, queue: .main) { [weak self] _ in
             self?.willEnterForeground()
         })
+        observers.append(nc.addObserver(forName: UIApplication.willTerminateNotification,
+                                        object: nil, queue: .main) { [weak self] _ in
+            self?.willTerminate()
+        })
         // Thermal state / Low Power Mode changes re-apply the requested host
         // frame rate.
         observers.append(nc.addObserver(forName: PowerGovernor.didChange,
@@ -582,23 +600,87 @@ final class SessionController: ObservableObject {
         observers.removeAll()
     }
 
-    /// Nothing stays pressed on the host while we are away, and ask iOS
-    /// for a little time so a short app switch keeps the session.
+    /// Nothing stays pressed on the host while we are away. A background
+    /// task keeps the session through a short app switch; after
+    /// `backgroundGrace` (or when iOS ends the task first) the session says
+    /// goodbye and disconnects, so the host is free at once instead of
+    /// holding a session for a suspended app until its liveness timeout
+    /// (which also blocked this app's own reconnect). Back in the
+    /// foreground it reconnects (`willEnterForeground`).
     func didEnterBackground() {
         input.releaseAll()
-        guard backgroundTask == .invalid else { return }
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "OpenView session") { [weak self] in
-            self?.endBackgroundTask()
+        if backgroundTask == .invalid {
+            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "OpenView session") { [weak self] in
+                // About to be suspended: the goodbye must leave now.
+                self?.pauseForBackground(wait: .milliseconds(300))
+                self?.endBackgroundTask()
+            }
+        }
+        backgroundPause?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, UIApplication.shared.applicationState == .background else { return }
+            self.pauseForBackground(wait: nil)
+            // Give the goodbye its linger, then let iOS suspend the app.
+            DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + Self.goodbyeLinger + .milliseconds(200)) { [weak self] in
+                guard let self, UIApplication.shared.applicationState == .background else { return }
+                self.endBackgroundTask()
+            }
+        }
+        backgroundPause = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.backgroundGrace, execute: work)
+    }
+
+    /// Back in the foreground: a session paused in the background, or one
+    /// that dropped meanwhile, reconnects.
+    func willEnterForeground() {
+        backgroundPause?.cancel()
+        backgroundPause = nil
+        endBackgroundTask()
+        guard started, !stopped else { return }
+        if pausedInBackground {
+            pausedInBackground = false
+            log("Back in the foreground — reconnecting")
+            retry()
+        } else if case .failed(let error) = phase, error.canAutoReconnect, everLive {
+            log("Back in the foreground — reconnecting")
+            retry()
         }
     }
 
-    /// Back in the foreground: a session that dropped meanwhile reconnects.
-    func willEnterForeground() {
-        endBackgroundTask()
+    /// The app is being terminated (swiped away while still running): say
+    /// goodbye so the host is free at once, and give the bytes a moment on
+    /// the wire before the process ends.
+    func willTerminate() {
         guard started, !stopped else { return }
-        if case .failed(let error) = phase, error.canAutoReconnect, everLive {
-            log("Back in the foreground — reconnecting")
-            retry()
+        haltWithGoodbye(wait: .milliseconds(300))
+        Thread.sleep(forTimeInterval: 0.25)
+    }
+
+    /// Main: disconnect the running attempt because the app stays in the
+    /// background (goodbye included); `willEnterForeground` reconnects.
+    /// `wait` bounds how long main blocks for the goodbye to be handed to
+    /// the sockets (when iOS is about to suspend the app); nil = don't.
+    func pauseForBackground(wait: DispatchTimeInterval?) {
+        guard started, !stopped, !pausedInBackground else { return }
+        if case .failed = phase { return }
+        pausedInBackground = true
+        log("Disconnected while in the background — reconnecting when back")
+        haltWithGoodbye(wait: wait)
+        phase = .failed(.disconnected("paused in the background"))
+    }
+
+    /// Main: end the running attempt with a goodbye (`haltOnQueue`) and
+    /// invalidate its late events. Waits up to `wait` for the session
+    /// queue (it may be busy, e.g. in a blocking dial).
+    func haltWithGoodbye(wait: DispatchTimeInterval?) {
+        generation += 1
+        let done = DispatchSemaphore(value: 0)
+        queue.async { [weak self] in
+            self?.haltOnQueue()
+            done.signal()
+        }
+        if let wait {
+            _ = done.wait(timeout: .now() + wait)
         }
     }
 

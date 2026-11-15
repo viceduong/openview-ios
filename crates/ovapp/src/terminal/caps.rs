@@ -88,9 +88,21 @@ pub const VIEWER_W2_CAPS: u32 = CAP_LOSSY | CAP_CACHE;
 /// set it, and only while the direct path is active (the relay stays
 /// reliable).
 pub const CAP_MEDIA: u32 = 1 << 15;
+/// [`Command::Caps`] bit: "I act on BYE" ([`Command::Bye`]: a peer that
+/// ends the session on purpose ends it here at once, instead of after the
+/// liveness timeout). A peer sends BYE only to one that set it. Every
+/// [`TerminalSession`] handles BYE, so it is part of [`LOCAL_CAPS`].
+pub const CAP_BYE: u32 = 1 << 16;
 /// What every build supports (tiles + zstd decode in pure Rust; every UDP
 /// carrier understands the reliable framing). The session advertises this
 /// plus `crate::audio::audio_caps` (Opus with the `opus` feature); see
 /// [`TerminalSession::set_local_caps`].
-pub const LOCAL_CAPS: u32 =
-    CAP_TILES | CAP_ZSTD | CAP_KEYFRAME | CAP_RUDP | CAP_INPUT2 | CAP_LZ4 | CAP_BANDS | CAP_MOVE;
+pub const LOCAL_CAPS: u32 = CAP_TILES
+    | CAP_ZSTD
+    | CAP_KEYFRAME
+    | CAP_RUDP
+    | CAP_INPUT2
+    | CAP_LZ4
+    | CAP_BANDS
+    | CAP_MOVE
+    | CAP_BYE;

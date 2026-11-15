@@ -54,6 +54,21 @@ First public release (0.1.0).
 - iOS: a PC added from **On this network** could not be reached away from
   home: the app kept dialing its private LAN address and never tried the
   relay. Existing LAN connections get the relay fallback automatically.
+- Reconnecting right after the app was closed or sent to the background
+  failed ("the relay closed the connection", "error: wrongState") until the
+  host gave the old session up:
+  - the app says goodbye (new `BYE` command, `CAP_BYE`; `ov_session_goodbye`)
+    on disconnect, termination, reconnect and after 10 s in the background
+    (it reconnects on return), so the host frees its session at once — also
+    when the session ran on the direct path;
+  - the relay reads parked clients: one that left is never paired (the host
+    was paired with the app's abandoned attempt and dropped within 0.2 s),
+    WebSocket PINGs are answered (a parked app gave up after ~10 s), and a
+    newer viewer replaces a parked one instead of being refused;
+  - an unattended host keeps a standby park while serving and makes way for
+    a waiting viewer once the current one has been silent for 2.5 s;
+  - iOS no longer sends keepalives or input before the secure session is
+    up, and never shows FFI usage errors in the session log.
 
 ### Security
 - End-to-end encryption: X25519 key exchange with Ed25519 identities and a

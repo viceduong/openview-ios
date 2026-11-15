@@ -145,10 +145,19 @@ the pump from the media channel).
 | `0x61` | DIRECT_CANDIDATES | H->V | `u8 n` (<= 32 on encode), n x (`u8 kind`, `u8 family` 4 or 6, 4 or 16 B addr, `u16 port`) | strict per-entry length check |
 | `0x62` | SESSION_OPTION | V->H (needs `CAP_DESKTOP_FX`) | `u8 key`, `u8 value` | >= 2 B |
 | `0x63` | MEDIA_GAP | local | `u8 kind` (0 video, 1 audio), `u16 packets`, `u32 samples` | >= 7 B |
+| `0x64` | BYE | both (only to a peer with `CAP_BYE`) | empty: the sender ends the session on purpose | extra bytes ignored |
 
 Any other opcode fails `decode` (`"unknown opcode"`). The pump counts it as a
 `decode_errors` increment and keeps going, so new opcodes are always gated
 behind CAPS bits.
+
+**BYE.** `TerminalSession::goodbye` sends BYE (when the peer's CAPS have
+`CAP_BYE`) and closes the carrier (DISCONNECT on a relay tunnel). The
+receiving pump still dispatches the batch that carried it, then returns
+`TransportError::Closed` from then on; `peer_said_goodbye()` tells it from a
+lost carrier. It matters most on a direct path, where nothing else tells
+the peer that the session is over (it would wait for the liveness timeout).
+The iOS app sends it through `ov_session_goodbye` ([ovffi.md](ovffi.md)).
 
 > The `OpCode::FrameBegin` doc comment (`terminal/command.rs`) still
 > describes a 25-byte form (`seq+w+h+stride+fmt+total`, without `codec` and
@@ -263,6 +272,7 @@ largest DEFLATE expansion), so a small payload cannot claim a huge allocation.
 | 13 | `CAP_LOSSY` | decodes lossy JPEG atlases (needs `CAP_BANDS`) |
 | 14 | `CAP_CACHE` | keeps host-assigned tile-cache slots (needs `CAP_BANDS`) |
 | 15 | `CAP_MEDIA` | v2 direct framing: delay-based CC, pacing, unreliable media channel with RS-FEC (set by `enable_direct`) |
+| 16 | `CAP_BYE` | acts on BYE (every `TerminalSession`; part of `LOCAL_CAPS`) |
 
 The caps sets are built up as follows:
 

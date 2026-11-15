@@ -26,7 +26,13 @@ pub(crate) mod fx;
 mod hooks;
 mod liveness;
 mod screen;
+mod standby;
+#[cfg(test)]
+mod takeover_tests;
 mod terminal;
+
+pub(crate) use standby::Handoff;
+use standby::Standby;
 
 /// Everything a session needs from the command line.
 pub(crate) struct SessionOpts {
@@ -41,6 +47,9 @@ pub(crate) struct SessionOpts {
     pub(crate) pin: Option<String>,
     pub(crate) data_dir: PathBuf,
     pub(crate) send_file: Option<PathBuf>,
+    /// Keep a standby park on the relay while a session runs (service +
+    /// unattended: the session id is stable), see [`standby`].
+    pub(crate) standby: bool,
 }
 
 /// How long the relay may take to answer a park before we re-park (its own
@@ -61,8 +70,9 @@ const MAX_RELAY_RETRY: Duration = Duration::from_secs(30);
 
 /// Where the session's viewer came from.
 enum Inbound {
-    /// A viewer attached through the relay.
-    Relay(Box<RelayTunnelCarrier>),
+    /// A viewer attached through the relay, with what it already sent
+    /// (a viewer that waited on the standby park).
+    Relay(Box<RelayTunnelCarrier>, Vec<Vec<u8>>),
     /// A viewer's HELLO arrived on the LAN port.
     Lan(LanPending),
 }
@@ -75,7 +85,14 @@ const UNWATCHED_WAIT: Duration = Duration::from_millis(2);
 
 /// Serve exactly one inbound session (blocks until the peer disconnects).
 /// `lan` (unattended mode) also accepts a viewer on the LAN port.
-pub(crate) fn listen_once(opts: &SessionOpts, lan: Option<&mut LanListener>) -> Result<(), String> {
+/// `carry` passes the standby park between sessions: taken at the start
+/// (a viewer already waiting is served at once, a park is kept), and set
+/// again when this session's standby has something to hand over.
+pub(crate) fn listen_once(
+    opts: &SessionOpts,
+    lan: Option<&mut LanListener>,
+    carry: &mut Option<Handoff>,
+) -> Result<(), String> {
     let relay = &opts.relay;
     // Unattended mode: a STABLE identity persisted in the data dir (the
     // device id must not change between runs — viewers dial it by ID), and
@@ -120,8 +137,21 @@ pub(crate) fn listen_once(opts: &SessionOpts, lan: Option<&mut LanListener>) -> 
     // viewer never falls into a gap.
     let my_dev = unattended::device_id(&me);
     let mut hs = Handshake::new(Role::Server, my_dev, &me, auth);
-    match acquire(addr, session_id, lan)? {
-        Inbound::Relay(carrier) => serve(*carrier, hs, opts),
+    let inbound = match carry.take() {
+        Some(Handoff::Attached { carrier, backlog }) => {
+            info!("a viewer waited on the standby park; serving it");
+            Inbound::Relay(carrier, backlog)
+        }
+        Some(Handoff::Parked { carrier, since }) => {
+            acquire(addr, session_id, lan, Some((carrier, since)))?
+        }
+        None => acquire(addr, session_id, lan, None)?,
+    };
+    // Unattended service: hold a standby park while this session runs
+    // (same identity and session id next time).
+    let standby = (opts.standby && opts.pin.is_some()).then_some((addr, session_id));
+    match inbound {
+        Inbound::Relay(carrier, backlog) => serve(*carrier, hs, opts, backlog, standby, carry),
         Inbound::Lan(p) => {
             info!("LAN viewer {}", p.peer);
             // Per-source PIN attempt limiting (the viewer's address is real
@@ -135,16 +165,22 @@ pub(crate) fn listen_once(opts: &SessionOpts, lan: Option<&mut LanListener>) -> 
             // the viewer's CAPS, which the iOS app sends only once it saw
             // the first screen update.
             carrier.enable_reliable();
-            serve(carrier, hs, opts)
+            serve(carrier, hs, opts, Vec::new(), standby, carry)
         }
     }
 }
 
-/// Run the handshake on `carrier` and serve the session.
+/// Run the handshake on `carrier` (`pending` = datagrams the viewer already
+/// sent) and serve the session. With `standby` (relay + session id) a
+/// standby park runs while the session does; what it holds afterwards goes
+/// to `carry`.
 fn serve<C: Carrier + 'static>(
     mut carrier: C,
     mut hs: Handshake,
     opts: &SessionOpts,
+    pending: Vec<Vec<u8>>,
+    standby: Option<(&RelayAddr, u32)>,
+    carry: &mut Option<Handoff>,
 ) -> Result<(), String> {
     let SessionOpts {
         screen,
@@ -156,7 +192,7 @@ fn serve<C: Carrier + 'static>(
     } = *opts;
     // The viewer starts its handshake the moment the relay attaches it (or
     // already sent it, on the LAN), so the handshake timer only starts now.
-    let backlog = handshake_over(&mut hs, &mut carrier, HANDSHAKE_AFTER_ATTACH)?;
+    let backlog = handshake_over(&mut hs, &mut carrier, HANDSHAKE_AFTER_ATTACH, pending)?;
     let peer_fp = hs
         .peer()
         .ok_or("handshake established without peer info")?
@@ -167,6 +203,7 @@ fn serve<C: Carrier + 'static>(
     });
 
     let session = hs.take_session().ok_or("no session after handshake")?;
+    let standby = standby.map(|(relay, sid)| Standby::start(relay.clone(), sid));
     let mut term = TerminalSession::new(session, carrier);
     // Datagrams polled in the batch that completed the handshake.
     term.queue_inbound(backlog);
@@ -190,7 +227,13 @@ fn serve<C: Carrier + 'static>(
     let result = match screen {
         // Terminal mode; with `--audio` a playback bus for the viewer's mic
         // rides along (full-duplex audio).
-        None => terminal::serve_terminal(term, clipboard, audio_playback, &opts.data_dir),
+        None => terminal::serve_terminal(
+            term,
+            clipboard,
+            audio_playback,
+            &opts.data_dir,
+            standby.as_ref(),
+        ),
         Some(region) => {
             // Hide the wallpaper / stop animations while the viewer
             // watches; restored when `fx` drops.
@@ -208,11 +251,15 @@ fn serve<C: Carrier + 'static>(
                     fx: Some(Arc::clone(&fx.fx)),
                 },
                 &opts.data_dir,
+                standby.as_ref(),
             );
             drop(fx);
             r
         }
     };
+    if let Some(sb) = standby {
+        *carry = sb.finish();
+    }
     if let Err(e) = &result {
         info!("session ended: {e}");
         status::emit(&StatusEvent::PeerDisconnected { reason: e.clone() });
@@ -226,14 +273,16 @@ fn serve<C: Carrier + 'static>(
 /// at all is an error (the service loop backs off on those).
 #[cfg(test)]
 fn park_until_attached(addr: &RelayAddr, session_id: u32) -> Result<RelayTunnelCarrier, String> {
-    match acquire(addr, session_id, None)? {
-        Inbound::Relay(c) => Ok(*c),
+    match acquire(addr, session_id, None, None)? {
+        Inbound::Relay(c, _) => Ok(*c),
         Inbound::Lan(_) => Err("no LAN listener was given".into()),
     }
 }
 
 /// Wait for the next viewer: park on the relay (re-parking after idle
 /// timeouts) and, with a LAN listener, accept a LAN HELLO meanwhile.
+/// `initial` is a park that is already open (the previous session's standby
+/// park, with when it started): used first instead of dialing.
 ///
 /// Without a LAN listener a relay that cannot be reached is an error (the
 /// service loop backs off). With one the host stays reachable on the LAN:
@@ -243,6 +292,7 @@ fn acquire(
     addr: &RelayAddr,
     session_id: u32,
     mut lan: Option<&mut LanListener>,
+    mut initial: Option<(Box<RelayTunnelCarrier>, Instant)>,
 ) -> Result<Inbound, String> {
     if let Some(l) = lan.as_deref_mut() {
         l.discard_stale();
@@ -253,8 +303,15 @@ fn acquire(
         if let Some(p) = lan.as_deref_mut().and_then(LanListener::poll) {
             return Ok(Inbound::Lan(p));
         }
-        let parked_at = Instant::now();
-        let mut carrier = match dial(addr, session_id, TunnelRole::Responder) {
+        let mut parked_at = Instant::now();
+        let dialed = match initial.take() {
+            Some((carrier, since)) => {
+                parked_at = since;
+                Ok(*carrier)
+            }
+            None => dial(addr, session_id, TunnelRole::Responder),
+        };
+        let mut carrier = match dialed {
             Ok(c) => {
                 retry = Duration::from_secs(1);
                 c
@@ -294,7 +351,7 @@ fn acquire(
                 left
             };
             match carrier.wait_attached(slice) {
-                Ok(true) => return Ok(Inbound::Relay(Box::new(carrier))),
+                Ok(true) => return Ok(Inbound::Relay(Box::new(carrier), Vec::new())),
                 Ok(false) if Instant::now() < deadline => {
                     if let Some(p) = lan.as_deref_mut().and_then(LanListener::poll) {
                         // Give the relay slot up; the LAN viewer wins.
@@ -306,7 +363,7 @@ fn acquire(
             }
         };
         match outcome {
-            Ok(true) => return Ok(Inbound::Relay(Box::new(carrier))),
+            Ok(true) => return Ok(Inbound::Relay(Box::new(carrier), Vec::new())),
             // Relay silent for the whole window, or it timed the park out:
             // both are idle, not failure.
             Ok(false) | Err(ovtransport::TransportError::Closed) => {
@@ -351,16 +408,26 @@ fn dial(
     }
 }
 
-/// Pump the server-side handshake to completion. Returns any datagrams that
-/// arrived after establishment within the same poll batch (they are session
-/// records — feeding them to the established handshake would drop them).
+/// Pump the server-side handshake to completion; `pending` (datagrams that
+/// arrived before, e.g. while a viewer waited on the standby park) is fed
+/// first. Returns any datagrams that arrived after establishment within the
+/// same poll batch (they are session records — feeding them to the
+/// established handshake would drop them).
 fn handshake_over(
     hs: &mut Handshake,
     carrier: &mut dyn Carrier,
     timeout: Duration,
+    pending: Vec<Vec<u8>>,
 ) -> Result<Vec<Vec<u8>>, String> {
     let iterations = timeout.as_millis().div_ceil(10) as usize;
     let mut backlog = Vec::new();
+    for dgram in pending {
+        if hs.is_established() {
+            backlog.push(dgram);
+        } else {
+            let _ = hs.feed(&dgram);
+        }
+    }
     for _ in 0..iterations {
         if hs.is_established() {
             return Ok(backlog);
@@ -457,8 +524,9 @@ mod tests {
                 let HandshakeEvent::Sent(d) = ev;
                 carrier.send(&d).unwrap();
             }
-            let backlog = handshake_over(&mut hs, &mut carrier, Duration::from_secs(10))
-                .expect("viewer handshake");
+            let backlog =
+                handshake_over(&mut hs, &mut carrier, Duration::from_secs(10), Vec::new())
+                    .expect("viewer handshake");
             assert!(backlog.is_empty());
             // Raw datagrams flow both ways on the established carrier.
             carrier.send(b"ping").unwrap();
@@ -473,7 +541,8 @@ mod tests {
         });
 
         let relay = RelayAddr::parse("127.0.0.1:1").unwrap();
-        let inbound = acquire(&relay, (dev & 0xFFFF_FFFF) as u32, Some(&mut lan)).expect("acquire");
+        let inbound =
+            acquire(&relay, (dev & 0xFFFF_FFFF) as u32, Some(&mut lan), None).expect("acquire");
         let Inbound::Lan(p) = inbound else {
             panic!("expected a LAN viewer")
         };
@@ -483,8 +552,8 @@ mod tests {
         let mut carrier = UdpP2pCarrier::from_socket(p.socket, p.peer);
         carrier.enable_reliable();
         // The viewer's first record may ride in the handshake's last batch.
-        let mut got =
-            handshake_over(&mut hs, &mut carrier, Duration::from_secs(10)).expect("host handshake");
+        let mut got = handshake_over(&mut hs, &mut carrier, Duration::from_secs(10), Vec::new())
+            .expect("host handshake");
         assert_eq!(hs.peer().map(|p| p.device_id), Some(77));
         let deadline = Instant::now() + Duration::from_secs(5);
         while got.is_empty() && Instant::now() < deadline {

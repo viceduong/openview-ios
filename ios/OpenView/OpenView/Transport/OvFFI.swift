@@ -168,6 +168,16 @@ final class OvSessionBox {
         }
     }
 
+    /// Goodbye before teardown (`ov_session_goodbye`): BYE on the current
+    /// path and DISCONNECT on the relay tunnel, so the host frees its
+    /// session at once instead of after its liveness timeout. Outbound
+    /// bytes leave through the installed sinks during this call. Best
+    /// effort: the result is ignored (-2 = not established, nothing to say).
+    /// Keep the sockets open a moment afterwards so the bytes leave.
+    func goodbye() {
+        _ = ov_session_goodbye(ptr)
+    }
+
     /// After `.rateLimited`: seconds until the host accepts another PIN
     /// attempt (nil when not rate limited).
     var retryAfterSecs: Int? {

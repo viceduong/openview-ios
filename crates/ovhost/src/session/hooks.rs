@@ -322,6 +322,9 @@ impl HostHooks {
                 }
                 // MONITORS_INFO is host->viewer only; the host never receives it.
                 Command::MonitorsInfo { .. } => {}
+                // BYE: the session state sees it (the pump then reports the
+                // session closed); nothing to do here.
+                Command::Bye => {}
                 // SESSION_OPTION: the viewer toggles a desktop effect.
                 Command::SessionOption { key, value } => {
                     if let Some(fx) = &fx {

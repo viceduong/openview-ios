@@ -10,7 +10,10 @@ use tracing::debug;
 use super::direct::log_direct;
 use super::files::drain_received_files;
 use super::hooks::HostHooks;
-use super::liveness::{absorb_pongs, check_peer, session_over, PeerState};
+use super::liveness::{
+    absorb_pongs, check_peer, makes_way, pump_end_reason, session_over, PeerState,
+};
+use super::standby::{Standby, Takeover};
 use super::{clipboard_poll, CLIPBOARD_POLL, UNWATCHED_WAIT};
 use crate::clipboard_os;
 
@@ -26,6 +29,7 @@ pub(super) fn serve_terminal(
     clipboard: bool,
     audio_playback: bool,
     data_dir: &Path,
+    standby: Option<&Standby>,
 ) -> Result<(), String> {
     let mut hooks = HostHooks::new();
     if audio_playback {
@@ -42,16 +46,23 @@ pub(super) fn serve_terminal(
     let mut peer = PeerState::Alive;
     let mut clip_seq = clipboard_os::clip_sequence();
     let mut next_clip = Instant::now();
+    let mut takeover = Takeover::default();
     loop {
         if let Err(e) = term.pump() {
             log_direct(&mut term);
-            session_over(&e.to_string());
+            session_over(&pump_end_reason(&term, &e));
             return Ok(());
         }
         log_direct(&mut term);
         peer = check_peer(&hooks, peer);
         if peer == PeerState::Gone {
             let _ = term.close();
+            return Ok(());
+        }
+        if makes_way(standby, &mut takeover, &hooks, |n| {
+            let _ = term.send(&Command::Ping(n));
+        }) {
+            let _ = term.goodbye();
             return Ok(());
         }
         if let Some(seq) = keepalive.tick(Instant::now()) {

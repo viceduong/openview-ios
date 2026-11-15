@@ -371,6 +371,59 @@ pub unsafe extern "C" fn ov_session_send_record(
     })
 }
 
+/// Say goodbye before tearing a session down: send BYE (the terminal
+/// command `0x64`, encrypted on channel 0; only when the host's CAPS have
+/// `CAP_BYE`, an older host would just count a decode error) on the
+/// session's current path —
+/// twice, the direct path being datagrams; the duplicate is dropped as a
+/// replay — then close the relay tunnel (a DISCONNECT frame; over the
+/// byte-stream bridge it goes out through the stream sink right here).
+/// The host ends the session at once instead of after its liveness timeout
+/// and is free for the next connection. Best effort and non-blocking: keep
+/// the shell's sockets open a moment afterwards (a few hundred ms) so the
+/// bytes leave the device. Call it once, then stop pumping and free.
+///
+/// Returns 0, -1 (null session) or -2 (not established: there was no one
+/// to greet; a relay tunnel is closed all the same).
+///
+/// # Safety
+/// `s` must be null or a live session.
+#[no_mangle]
+pub unsafe extern "C" fn ov_session_goodbye(s: *mut OvSession) -> i32 {
+    ffi_guard!(OV_ERR_PANIC, {
+        // SAFETY: `s` is null or a live session (caller contract).
+        let Some(s) = (unsafe { s.as_ref() }) else {
+            return -1;
+        };
+        lock(s).map(|mut g| goodbye(&mut g)).unwrap_or_else(|e| e)
+    })
+}
+
+/// Body of [`ov_session_goodbye`].
+fn goodbye(g: &mut Inner) -> i32 {
+    let mut rc = -2;
+    let host_acts_on_bye = g
+        .peer_caps
+        .is_some_and(|c| c & ovapp::terminal::CAP_BYE != 0);
+    if g.session.is_some() {
+        rc = 0;
+    }
+    if host_acts_on_bye && !matches!(g.transport, Transport::None) {
+        let bye = ovapp::terminal::encode(&ovapp::terminal::Command::Bye);
+        for _ in 0..2 {
+            let Some(session) = g.session.as_mut() else {
+                break;
+            };
+            let record = session.encrypt_record(ovapp::terminal::CHANNEL, &bye);
+            let _ = send_record_bytes(g, &record);
+        }
+    }
+    if let Transport::Relay(c) = &mut g.transport {
+        let _ = ovtransport::Carrier::close(c.as_mut());
+    }
+    rc
+}
+
 /// Register the record sink (decrypted inbound payloads).
 ///
 /// # Safety

@@ -27,6 +27,12 @@ final class RelayWebSocket {
     private var pingTimer: DispatchSourceTimer?
     private var awaitingPong = false
     static let pingEvery: DispatchTimeInterval = .seconds(5)
+    /// Sends handed to URLSession and not completed yet, and whether the
+    /// socket closes once they are (`closeAfterSends`). Guarded by
+    /// `sendLock`: `send` / `close` are callable from any thread.
+    private let sendLock = NSLock()
+    private var inFlight = 0
+    private var closeWhenSent = false
 
     /// Inbound message bytes (on `queue`). Setting it flushes the buffer.
     var onMessage: ((Data) -> Void)? {
@@ -95,9 +101,15 @@ final class RelayWebSocket {
     /// Send one chunk as a binary message. URLSession queues it until the
     /// handshake completes. Safe from any thread.
     func send(_ data: Data) {
+        sendLock.lock()
+        inFlight += 1
+        sendLock.unlock()
         task.send(.data(data)) { [weak self] error in
-            guard let error, let self else { return }
-            self.queue.async { self.finish(error) }
+            guard let self else { return }
+            self.sendCompleted()
+            if let error {
+                self.queue.async { self.finish(error) }
+            }
         }
     }
 
@@ -105,6 +117,36 @@ final class RelayWebSocket {
     func close() {
         pingTimer?.cancel()
         task.cancel(with: .normalClosure, reason: nil)
+    }
+
+    /// Close once every message already handed to `send` has gone out (at
+    /// the latest after `timeout`), so a goodbye sent right before is not
+    /// cut off by the cancel. Safe from any thread. The pending timeout
+    /// holds the socket strongly, so the caller may drop it right away.
+    func closeAfterSends(timeout: DispatchTimeInterval = .milliseconds(300)) {
+        pingTimer?.cancel()
+        sendLock.lock()
+        closeWhenSent = true
+        let idle = inFlight == 0
+        sendLock.unlock()
+        if idle {
+            close()
+            return
+        }
+        queue.asyncAfter(deadline: .now() + timeout) {
+            self.close()
+        }
+    }
+
+    /// A `send` completed (URLSession's delegate queue).
+    private func sendCompleted() {
+        sendLock.lock()
+        inFlight -= 1
+        let closeNow = closeWhenSent && inFlight == 0
+        sendLock.unlock()
+        if closeNow {
+            close()
+        }
     }
 
     private func receive() {

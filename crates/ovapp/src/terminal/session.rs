@@ -85,6 +85,8 @@ pub struct TerminalSession {
     pub(super) xfer: crate::file_transfer::FileTransfer,
     /// Last PONG seen (for the ping liveness helper).
     pub(super) last_pong: Option<u64>,
+    /// The peer sent BYE: it ended the session on purpose.
+    pub(super) peer_bye: bool,
     /// In-progress inbound update (None when no FRAME_BEGIN / TILES_BEGIN
     /// is open).
     pub(super) rx_frame: Option<UpdateMeta>,
@@ -217,6 +219,7 @@ impl TerminalSession {
             finished_files: std::collections::VecDeque::new(),
             xfer: crate::file_transfer::FileTransfer::new(),
             last_pong: None,
+            peer_bye: false,
             rx_frame: None,
             rx_frame_data: Vec::new(),
             finished_frames: std::collections::VecDeque::new(),
@@ -345,6 +348,25 @@ impl TerminalSession {
     /// Take the most recent PONG nonce (clearing it).
     pub fn take_pong(&mut self) -> Option<u64> {
         self.last_pong.take()
+    }
+
+    /// The peer sent [`Command::Bye`]: it ended the session on purpose
+    /// (from then on [`pump`](Self::pump) reports
+    /// [`TransportError::Closed`]).
+    pub fn peer_said_goodbye(&self) -> bool {
+        self.peer_bye
+    }
+
+    /// Say goodbye ([`Command::Bye`], best effort, only to a peer that
+    /// advertised [`CAP_BYE`](super::CAP_BYE)) and close the carrier (a relay
+    /// tunnel sends DISCONNECT), so the peer ends its side at once instead
+    /// of waiting for its liveness timeout — which matters most on a direct
+    /// path, where nothing else tells it.
+    pub fn goodbye(&mut self) -> Result<(), TransportError> {
+        if self.peer_caps.is_some_and(|c| c & super::CAP_BYE != 0) {
+            let _ = self.send(&Command::Bye);
+        }
+        self.close()
     }
 
     /// Mutable access to the underlying session (record counters, etc.).

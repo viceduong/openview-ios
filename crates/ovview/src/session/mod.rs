@@ -583,7 +583,10 @@ fn finish(mut term: TerminalSession) -> Result<(), String> {
             Err(_) => break, // peer already closed the tunnel
         }
     }
-    term.close().map_err(|e| format!("close failed: {e}"))
+    // BYE (an old host ignores it) + DISCONNECT: the host frees its single
+    // session slot now instead of after its liveness timeout — the direct
+    // path, if one carried the session, has no close of its own.
+    term.goodbye().map_err(|e| format!("close failed: {e}"))
 }
 
 /// Save a file the host sent to `Downloads\OpenView` (never overwriting an

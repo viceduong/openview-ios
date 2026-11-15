@@ -264,3 +264,141 @@ fn configured_websocket_paths_replace_the_default() {
     s.read_exact(&mut b).unwrap();
     assert_eq!(&b, b"HTTP/1.1 101");
 }
+
+/// Whether `s` gets any byte within `wait` (a read timeout = nothing).
+fn hears_within(s: &mut TcpStream, wait: Duration) -> bool {
+    s.set_read_timeout(Some(wait)).unwrap();
+    let mut b = [0u8; 1];
+    let heard = matches!(s.read(&mut b), Ok(n) if n > 0);
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    heard
+}
+
+/// A viewer dialing while the host is busy in another session (its slot
+/// paired, nothing parked) parks — it is not refused — and pairs the
+/// moment the host parks again.
+#[test]
+fn viewer_parks_while_the_host_is_busy_and_pairs_on_its_next_park() {
+    let addr = start_relay(Duration::from_secs(5));
+    let sid = 0x0EEF_0010;
+    let mut h1 = raw_connect(addr, sid, false);
+    let mut v1 = raw_connect(addr, sid, true);
+    read_attach(&mut h1, sid);
+    read_attach(&mut v1, sid);
+    // Session 1 is live; viewer 2 arrives and waits.
+    let mut v2 = raw_connect(addr, sid, true);
+    assert!(
+        !hears_within(&mut v2, Duration::from_millis(300)),
+        "v2 must stay parked"
+    );
+    // The host ends session 1 and parks again: v2 pairs at once.
+    let t = Instant::now();
+    drop(v1);
+    let _ = read_to_eof(&mut h1);
+    let mut h2 = raw_connect(addr, sid, false);
+    read_attach(&mut h2, sid);
+    read_attach(&mut v2, sid);
+    assert!(t.elapsed() < Duration::from_secs(2));
+    v2.write_all(&encode_frame(DATA, b"hello").unwrap())
+        .unwrap();
+    let mut got = [0u8; 8];
+    h2.read_exact(&mut got).unwrap();
+    assert_eq!(&got[3..], b"hello");
+}
+
+/// A newer viewer replaces a parked one (the older attempt was most likely
+/// abandoned by its app): the old one gets `XT` and is closed, the new one
+/// pairs with the host.
+#[test]
+fn a_newer_viewer_replaces_a_parked_one() {
+    let addr = start_relay(Duration::from_secs(5));
+    let sid = 0x0EEF_0011;
+    let mut old = raw_connect(addr, sid, true);
+    let mut new = raw_connect(addr, sid, true);
+    let rest = read_to_eof(&mut old);
+    let mut want = b"XT".to_vec();
+    want.extend_from_slice(&sid.to_be_bytes());
+    assert_eq!(rest, want, "the displaced viewer is told and closed");
+    let mut host = raw_connect(addr, sid, false);
+    read_attach(&mut host, sid);
+    read_attach(&mut new, sid);
+}
+
+/// A parked viewer that goes away (socket closed, no DISCONNECT) leaves
+/// the session table at once: the host parking later is not paired with
+/// the dead socket, and the next viewer pairs normally.
+#[test]
+fn a_parked_viewer_that_leaves_is_never_paired() {
+    let addr = start_relay(Duration::from_secs(5));
+    let sid = 0x0EEF_0012;
+    let gone = raw_connect(addr, sid, true);
+    drop(gone);
+    thread::sleep(Duration::from_millis(200));
+    let mut host = raw_connect(addr, sid, false);
+    assert!(
+        !hears_within(&mut host, Duration::from_millis(300)),
+        "the host must not be attached to a viewer that left"
+    );
+    let mut v = raw_connect(addr, sid, true);
+    read_attach(&mut host, sid);
+    read_attach(&mut v, sid);
+}
+
+/// A second responder for a parked session is still refused (the host
+/// side keeps its single-park rule), and the first stays parked.
+#[test]
+fn a_second_parked_responder_is_refused() {
+    let addr = start_relay(Duration::from_secs(5));
+    let sid = 0x0EEF_0013;
+    let mut h1 = raw_connect(addr, sid, false);
+    let mut h2 = raw_connect(addr, sid, false);
+    assert!(read_to_eof(&mut h2).is_empty(), "refused and closed");
+    let mut v = raw_connect(addr, sid, true);
+    read_attach(&mut h1, sid);
+    read_attach(&mut v, sid);
+}
+
+/// A parked WebSocket viewer is serviced while it waits: its PINGs are
+/// answered (an app that declares a silent socket dead would otherwise
+/// give up after a few seconds), and bytes it sends early reach the host
+/// right behind the attach line.
+#[test]
+fn a_parked_websocket_viewer_gets_pongs_and_its_early_bytes_arrive() {
+    let addr = start_relay(Duration::from_secs(5));
+    let sid: u32 = 0x0EEF_0014;
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(UPGRADE.as_bytes()).unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        s.read_exact(&mut b).unwrap();
+        head.push(b[0]);
+    }
+    // Masked client frames (mask 0: payload unchanged).
+    let frame = |op: u8, payload: &[u8]| {
+        let mut f = vec![0x80 | op, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+        f.extend_from_slice(payload);
+        f
+    };
+    let mut connect = vec![b'C'];
+    connect.extend_from_slice(&sid.to_be_bytes());
+    connect.push(0);
+    s.write_all(&frame(0x2, &connect)).unwrap();
+    // `O`, as one binary message.
+    let mut o = [0u8; 3];
+    s.read_exact(&mut o).unwrap();
+    assert_eq!(o, [0x82, 1, b'O']);
+    s.write_all(&frame(0x9, b"hb")).unwrap();
+    let mut pong = [0u8; 4];
+    s.read_exact(&mut pong).unwrap();
+    assert_eq!(pong, [0x8A, 2, b'h', b'b'], "PONG while parked");
+    let early = encode_frame(DATA, b"early").unwrap();
+    s.write_all(&frame(0x2, &early)).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let mut host = raw_connect(addr, sid, false);
+    read_attach(&mut host, sid);
+    let mut got = vec![0u8; early.len()];
+    host.read_exact(&mut got).unwrap();
+    assert_eq!(got, early);
+}

@@ -17,7 +17,10 @@ use super::capture_loop::{capture_loop, CaptureCtl, METRICS_EVERY};
 use super::direct::log_direct;
 use super::files::drain_received_files;
 use super::hooks::{input_backend, HostHooks, SharedInput};
-use super::liveness::{absorb_pongs_with, check_peer, session_over, PeerState};
+use super::liveness::{
+    absorb_pongs_with, check_peer, makes_way, pump_end_reason, session_over, PeerState,
+};
+use super::standby::{Standby, Takeover};
 use super::{clipboard_poll, CLIPBOARD_POLL, UNWATCHED_WAIT};
 use crate::input::{self, Region, VirtualScreen};
 use crate::mic::{spawn_mic, MicKind};
@@ -68,6 +71,7 @@ pub(super) fn serve_screen(
     mut term: TerminalSession,
     opts: ScreenOpts,
     data_dir: &Path,
+    standby: Option<&Standby>,
 ) -> Result<(), String> {
     let ScreenOpts {
         region,
@@ -184,7 +188,7 @@ pub(super) fn serve_screen(
         &mailbox,
         &wake,
         mic_rx.as_ref(),
-        data_dir,
+        Surroundings { data_dir, standby },
     );
     if term.media_stats().is_some() {
         debug!("{}", term.media_summary());
@@ -202,6 +206,13 @@ pub(super) fn serve_screen(
     result
 }
 
+/// What the screen loop needs from outside the session: where received
+/// files go, and the standby park it may have to make way for.
+struct Surroundings<'a> {
+    data_dir: &'a Path,
+    standby: Option<&'a Standby>,
+}
+
 /// The screen session thread's loop (see [`serve_screen`]).
 fn screen_session_loop(
     term: &mut TerminalSession,
@@ -210,8 +221,9 @@ fn screen_session_loop(
     mailbox: &ovapp::sendq::FrameMailbox,
     wake: &ovapp::netwait::Wakeup,
     mic_rx: Option<&Receiver<Vec<i16>>>,
-    data_dir: &Path,
+    around: Surroundings<'_>,
 ) -> Result<(), String> {
+    let Surroundings { data_dir, standby } = around;
     let mut sender = ovapp::sendq::PrioritySender::new(FRAME_CHUNK);
     // Tell the viewer which monitors it can pick from before the first
     // frame flies.
@@ -232,6 +244,7 @@ fn screen_session_loop(
     let mut next_audio_log: u64 = 250; // first line after ~5 s
     let mut pacing_log = Instant::now();
     let mut media_logged = false;
+    let mut takeover = Takeover::default();
     if NO_MEDIA.load(Ordering::Relaxed) {
         // A/B switch for benches: no media channel / v2 congestion control.
         term.set_local_caps(term.local_caps() & !ovapp::terminal::CAP_MEDIA);
@@ -248,7 +261,7 @@ fn screen_session_loop(
         if let Err(e) = term.pump() {
             // The path events of this last pump say why (demotion reason).
             log_direct(term);
-            session_over(&e.to_string());
+            session_over(&pump_end_reason(term, &e));
             return Ok(());
         }
         log_direct(term);
@@ -260,6 +273,12 @@ fn screen_session_loop(
             }
             PeerState::Dead => ctl.paused.store(true, Ordering::Relaxed),
             PeerState::Alive => ctl.paused.store(false, Ordering::Relaxed),
+        }
+        if makes_way(standby, &mut takeover, hooks, |n| {
+            sender.push_control(Command::Ping(n))
+        }) {
+            let _ = term.goodbye();
+            return Ok(());
         }
         let now = Instant::now();
         if let Some(seq) = keepalive.tick(now) {

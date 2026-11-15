@@ -251,15 +251,20 @@ extension SessionController {
             }
             // Liveness: send a keepalive PING when the Rust
             // keepalive says one is due, answer the peer's PINGs, and run
-            // the liveness verdict (fires the sink -> LivenessModel).
+            // the liveness verdict (fires the sink -> LivenessModel). Only
+            // once the secure session is up: there is no record to send
+            // before (a viewer parked on the relay while the host is busy
+            // waits for seconds — sending then failed with wrongState).
             let nowMs = Int64((DispatchTime.now().uptimeNanoseconds &- pumpEpochNs) / 1_000_000)
-            let seq = screen.keepaliveTick(nowMs: nowMs)
-            if seq > 0 {
-                var ping = Data([0x10])
-                ping.append(contentsOf: withUnsafeBytes(of: seq.bigEndian) { Data($0) })
-                try session.sendRecord(channel: 0, payload: ping)
+            if established {
+                let seq = screen.keepaliveTick(nowMs: nowMs)
+                if seq > 0 {
+                    var ping = Data([0x10])
+                    ping.append(contentsOf: withUnsafeBytes(of: seq.bigEndian) { Data($0) })
+                    try session.sendRecord(channel: 0, payload: ping)
+                }
+                try sendPongIfOwed()
             }
-            try sendPongIfOwed()
             screen.livenessTick(nowMs: nowMs)
             // Watchdog: the host sends at least a keepalive every 5 s. A
             // session that heard nothing for longer is dead even if no
@@ -488,15 +493,18 @@ extension SessionController {
     /// Answer an inbound PING right after the inbound pump that fed it (not
     /// only on the next tick), so the peer's RTT is not inflated by 50 ms.
     func sendPongIfOwed() throws {
-        guard let session else { return }
+        guard established, let session else { return }
         if let pong = screen.takePongReply() {
             try session.sendRecord(channel: 0, payload: pong)
         }
     }
 
     /// Route an FFI error: handshake failure / closed relay / transport
-    /// failure end the attempt once (pump stopped, one clear phase);
-    /// anything else is logged, deduplicated against the previous error.
+    /// failure end the attempt once (pump stopped, one clear phase); a
+    /// usage error (bad argument / wrong state: a call the app should not
+    /// have made in this state) is a developer detail, never a session-log
+    /// line; anything else is logged, deduplicated against the previous
+    /// error.
     func handle(_ error: Error, context: String = "error") {
         if let ffi = error as? OvSessionBox.FfiError {
             switch ffi {
@@ -524,7 +532,8 @@ extension SessionController {
                 failOnQueue(.disconnected("internal error"))
                 return
             case .badArg, .wrongState:
-                break
+                debug("\(context): \(ffi) (ignored)")
+                return
             }
         }
         let line = "\(context): \(error)"
@@ -545,24 +554,50 @@ extension SessionController {
 
     /// Stop the pump and close the transports (the session object stays
     /// until the next attempt / teardown). Idempotent.
+    ///
+    /// A running attempt says goodbye first (`OvSessionBox.goodbye`: BYE on
+    /// the current path + DISCONNECT on the relay tunnel), while every
+    /// transport is still open, so the host frees its single session slot
+    /// at once instead of after its liveness timeout — a reconnect, or the
+    /// next viewer, is then served immediately. The sockets stay open for
+    /// `goodbyeLinger` so those bytes leave the device.
     func haltOnQueue() {
+        let running = !halted
         halted = true
         pumpTimer?.cancel()
         pumpTimer = nil
+        let linger = running && session != nil
+        if linger {
+            session?.goodbye()
+        }
         if let ws = relaySocket {
             ws.onMessage = nil
             ws.onClose = nil
-            ws.close()
+            if linger {
+                ws.closeAfterSends(timeout: Self.goodbyeLinger)
+            } else {
+                ws.close()
+            }
         }
         relaySocket = nil
-        udpBridge?.close()
+        let udp = udpBridge
         udpBridge = nil
         p2pTimer?.cancel()
         p2pTimer = nil
         p2pTimerDue = nil
-        p2pPaths?.closeAll()
+        let paths = p2pPaths
         p2pPaths = nil
         p2pEnabled = false
+        if linger, udp != nil || paths != nil {
+            // Strong captures: the sockets live until the goodbye is out.
+            queue.asyncAfter(deadline: .now() + Self.goodbyeLinger) {
+                udp?.close()
+                paths?.closeAll()
+            }
+        } else {
+            udp?.close()
+            paths?.closeAll()
+        }
         audioPlayer.stop()
     }
 

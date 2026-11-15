@@ -8,6 +8,7 @@ use ovcommon::status::{self, StatusEvent};
 use tracing::info;
 
 use super::hooks::HostHooks;
+use super::standby::{Standby, Takeover, TakeoverStep, TAKEOVER_GRACE};
 
 /// Feed the PONG echoes the hook collected into our keepalive; a matched
 /// echo updates the smoothed RTT.
@@ -61,14 +62,18 @@ fn peer_state(since_inbound: Duration) -> PeerState {
     }
 }
 
-/// Track liveness transitions and log them once. Returns the new state.
-pub(super) fn check_peer(hooks: &HostHooks, was: PeerState) -> PeerState {
-    let since = hooks
+/// Time since the peer was last heard from (any inbound record).
+pub(super) fn since_inbound(hooks: &HostHooks) -> Duration {
+    hooks
         .liveness
         .lock()
         .map(|l| l.since_inbound(Instant::now()))
-        .unwrap_or_default();
-    let now = peer_state(since);
+        .unwrap_or_default()
+}
+
+/// Track liveness transitions and log them once. Returns the new state.
+pub(super) fn check_peer(hooks: &HostHooks, was: PeerState) -> PeerState {
+    let now = peer_state(since_inbound(hooks));
     match (was, now) {
         (PeerState::Alive, PeerState::Dead) => {
             info!("peer silent for {DEAD_AFTER:?}; pausing the stream")
@@ -80,6 +85,50 @@ pub(super) fn check_peer(hooks: &HostHooks, was: PeerState) -> PeerState {
         _ => {}
     }
     now
+}
+
+/// Why the session pump ended: a goodbye from the viewer, else the
+/// transport error.
+pub(super) fn pump_end_reason(
+    term: &ovapp::terminal::TerminalSession,
+    e: &ovtransport::TransportError,
+) -> String {
+    if term.peer_said_goodbye() {
+        "the viewer said goodbye".to_owned()
+    } else {
+        e.to_string()
+    }
+}
+
+/// Another viewer waits on the standby park: probe the current one, and
+/// `true` when it has gone silent and the session must make way (the
+/// caller says goodbye and returns). `probe` sends a PING.
+pub(super) fn makes_way(
+    standby: Option<&Standby>,
+    takeover: &mut Takeover,
+    hooks: &HostHooks,
+    mut probe: impl FnMut(u64),
+) -> bool {
+    let Some(standby) = standby else {
+        return false;
+    };
+    match takeover.step(
+        standby.viewer_waiting(),
+        since_inbound(hooks),
+        Instant::now(),
+    ) {
+        TakeoverStep::Idle => false,
+        TakeoverStep::Probe(nonce) => {
+            probe(nonce);
+            false
+        }
+        TakeoverStep::End => {
+            session_over(&format!(
+                "another viewer is waiting and this one has been silent for over {TAKEOVER_GRACE:?}"
+            ));
+            true
+        }
+    }
 }
 
 /// The session is over: log it and tell the GUI (status channel).

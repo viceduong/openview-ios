@@ -314,6 +314,24 @@ int32_t ov_session_send_record(OvSession *s, uint8_t channel, const uint8_t *dat
 - A channel-0 `CAPS` record (`0x60`) is peeked to remember the local caps,
   which drives media-channel negotiation (§7.3).
 
+**Goodbye.**
+
+```c
+int32_t ov_session_goodbye(OvSession *s);
+```
+
+Call it once before tearing a session down (the app does so whenever it
+halts an attempt: user disconnect, background pause, app termination,
+reconnect). It sends BYE (`0x64`, channel 0) on the current path — twice,
+since the direct path is datagrams (the duplicate is dropped as a replay) —
+when the host's CAPS have `CAP_BYE`, then closes a relay tunnel (DISCONNECT;
+over the byte-stream bridge it leaves through the stream sink inside this
+call). The host ends the session at once instead of after its liveness
+timeout and is free for the next connection. Non-blocking and best effort:
+keep the sockets open a few hundred ms afterwards so the bytes leave the
+device, then stop pumping and free. Returns `0`, `-1` (null session) or `-2`
+(not established; a relay tunnel is closed all the same).
+
 ### 5.6 Peer fingerprint
 
 ```c

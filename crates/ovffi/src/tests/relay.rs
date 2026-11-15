@@ -16,10 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    ov_session_begin, ov_session_create, ov_session_free, ov_session_pump_relay,
-    ov_session_relay_connect, ov_session_relay_connect_stream, ov_session_relay_eof,
-    ov_session_relay_feed, ov_session_send_record, ov_session_set_record_sink,
-    ov_session_set_state_sink, OvSession,
+    ov_session_begin, ov_session_create, ov_session_free, ov_session_goodbye,
+    ov_session_pump_relay, ov_session_relay_connect, ov_session_relay_connect_stream,
+    ov_session_relay_eof, ov_session_relay_feed, ov_session_send_record,
+    ov_session_set_record_sink, ov_session_set_state_sink, OvSession,
 };
 
 #[derive(Default)]
@@ -491,6 +491,67 @@ fn relay_wake_sink_is_inert_without_a_tcp_relay() {
             crate::ov_session_set_wake_sink(std::ptr::null_mut(), fu, Some(wake_sink)),
             -1
         );
+        ov_session_free(s);
+    }
+}
+
+#[test]
+fn ffi_goodbye_sends_bye_then_closes_the_relay_tunnel() {
+    let addr = start_relay();
+    let host = CString::new("127.0.0.1").unwrap();
+    let sid = crate::relay_session_id("975310");
+    let server = new_session(true, "975310");
+    let client = new_session(false, "975310");
+    let mut ws = WsBridge::open(addr);
+    unsafe {
+        assert_eq!(
+            ov_session_relay_connect(server.0, host.as_ptr(), addr.port(), sid),
+            0
+        );
+        assert_eq!(
+            ov_session_relay_connect_stream(client.0, client.1, stream_sink, sid),
+            0
+        );
+    }
+    handshake_and_exchange(client, server, Some(&mut ws));
+    // The host announces CAP_BYE (BYE goes only to a host that acts on it).
+    let mut caps = vec![0x60];
+    caps.extend_from_slice(&ovapp::terminal::CAP_BYE.to_be_bytes());
+    caps.extend_from_slice(&[0; 4]);
+    assert_eq!(
+        unsafe { ov_session_send_record(server.0, 0, caps.as_ptr(), caps.len()) },
+        0
+    );
+    pump_until(client, server, Some(&mut ws), || {
+        col(client.1).lock().unwrap().records.len() >= 2
+    });
+    col(server.1).lock().unwrap().records.clear();
+
+    // The phone leaves: BYE + DISCONNECT go out through the stream sink at
+    // once (no pump needed), the host sees the BYE record, then the closed
+    // tunnel.
+    assert_eq!(unsafe { ov_session_goodbye(client.0) }, 0);
+    ws.shuttle(client.0, client.1);
+    assert_eq!(pump_until_closed(server.0, None), -5);
+    let records = col(server.1).lock().unwrap().records.clone();
+    assert!(
+        records.contains(&(0u8, vec![0x64])),
+        "the host must receive BYE before the close, got {records:?}"
+    );
+    unsafe {
+        ov_session_free(server.0);
+        ov_session_free(client.0);
+    }
+
+    // Before the handshake there is no one to greet: -2, tunnel closed.
+    let (s, user) = new_session(false, "975310");
+    unsafe {
+        assert_eq!(
+            ov_session_relay_connect_stream(s, user, stream_sink, sid),
+            0
+        );
+        assert_eq!(ov_session_goodbye(s), -2);
+        assert_eq!(ov_session_goodbye(std::ptr::null_mut()), -1);
         ov_session_free(s);
     }
 }

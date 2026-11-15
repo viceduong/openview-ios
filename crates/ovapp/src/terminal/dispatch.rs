@@ -19,7 +19,14 @@ impl TerminalSession {
     /// - ECHO -> ECHO (same payload).
     ///
     /// Returns the number of datagrams consumed. Non-blocking (carrier contract).
+    /// Once the peer sent BYE ([`Command::Bye`]) the batch carrying it is
+    /// still dispatched, then this (and every later call) returns
+    /// [`TransportError::Closed`] ([`peer_said_goodbye`](Self::peer_said_goodbye)
+    /// tells it apart from a lost carrier).
     pub fn pump(&mut self) -> Result<usize, TransportError> {
+        if self.peer_bye {
+            return Err(TransportError::Closed);
+        }
         let mut n = 0usize;
         // The hook is driven through a scratch buffer so `self` stays free for
         // the auto-replies the hook may trigger.
@@ -129,6 +136,7 @@ impl TerminalSession {
                     }
                 }
                 Command::SessionOption { .. } => {}
+                Command::Bye => self.peer_bye = true,
                 // Local media commands (produced from the media channel; a
                 // peer never sends them, but one that does is handled the
                 // same way).
@@ -306,6 +314,9 @@ impl TerminalSession {
             }
         }
         self.pump_media();
+        if self.peer_bye {
+            return Err(TransportError::Closed);
+        }
         Ok(n)
     }
 

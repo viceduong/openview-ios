@@ -264,6 +264,7 @@ pub fn encode(cmd: &Command) -> Vec<u8> {
             b.extend_from_slice(&samples.to_be_bytes());
             (OpCode::MediaGap, b)
         }
+        Command::Bye => (OpCode::Bye, Vec::new()),
     };
     let mut out = Vec::with_capacity(payload.len() + 1);
     out.push(op as u8);
@@ -642,6 +643,7 @@ fn decode_command(wire: &[u8]) -> Result<Command, String> {
                 samples: u32::from_be_bytes(payload[3..7].try_into().unwrap()),
             }
         }
+        OpCode::Bye => Command::Bye,
     })
 }
 

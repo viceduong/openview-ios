@@ -19,7 +19,7 @@ The client side is `ovtransport::RelayTunnelCarrier` ([ovtransport.md §6](ovtra
 
 | File | Contents |
 |---|---|
-| `src/lib.rs` | `Relay` (bind, serve, timeout), `RelayError`, `Slot` (per-client state), `Shared` (session table and pairing logic), `handle_client` state machine, control-line encoders, `FrameCursor` (frame-boundary tracker), pipe threads, WebSocket keepalive pinger, session-end log |
+| `src/lib.rs` | `Relay` (bind, serve, timeout), `RelayError`, `Slot` (per-client state) with its `Route` (parked / paired / closed), `Shared` (session table, pairing, park reaper), `handle_client` state machine, control-line encoders, `FrameCursor` (frame-boundary tracker), `pump_side` (one client's direction), WebSocket keepalive pinger, `Link` (session-end log) |
 | `src/ws.rs` | RFC 6455 server side: HTTP head parsing and the upgrade (`handshake`), health-check responses, unmasked outbound framing, `WsReader` (deframer: unmasking, PING→PONG, CLOSE→EOF). The codec primitives (`accept_key` with its SHA-1 and base64, `unmask`, opcodes) come from `ovtransport::ws` ([ovtransport.md §6.5](ovtransport.md)) |
 | `src/main.rs` | CLI binary |
 
@@ -38,7 +38,7 @@ pub struct RelayLimits { max_connections, max_per_ip, max_pending, handshake_dea
 pub enum RelayError { Bind(io::Error), Io(io::Error), Protocol(String) }
 ```
 
-- `serve` runs the accept loop. A failed `accept` is logged and the loop retries after 50 ms. A failed thread spawn drops that one connection.
+- `serve` runs the accept loop and starts one park reaper thread (`ovrelay-reaper`, every 20 ms: times out unclaimed parks). A failed `accept` is logged and the loop retries after 50 ms. A failed thread spawn drops that one connection.
 - `max_sessions` caps the number of **pending** (parked) sessions; `None` uses `RelayLimits::max_pending` (default 512).
 - Connections over `max_connections` total or `max_per_ip` from one address (loopback exempt) are closed at accept, before a thread is spawned.
 - The pre-session phase (HTTP upgrade head + CONNECT line) has a 15 s per-read timeout and a 20 s overall deadline.
@@ -62,9 +62,9 @@ pub enum RelayError { Bind(io::Error), Io(io::Error), Protocol(String) }
 | client → relay | `'C'` ‖ session_id u32 BE ‖ role | 6 | first bytes on the stream. Role `0x00` = initiator; **any other value** = responder |
 | relay → client | `'O'` | 1 | after a valid CONNECT that passed the pending-session cap (the same-role check comes after it) |
 | relay → client | `'A'` ‖ session_id u32 BE ‖ peer IPv4 (4 bytes) ‖ peer port u16 BE | 11 | to both sides when the pair completes. Each side gets the **other** side's address. An IPv6 peer or a WebSocket peer (whose socket address belongs to the proxy) is sent as `0.0.0.0:0` |
-| relay → client | `'X' 'T'` ‖ session_id u32 BE | 6 | park timeout, or (instead of `'O'`) rejected by the pending-session cap. The connection is then closed |
+| relay → client | `'X' 'T'` ‖ session_id u32 BE | 6 | park timeout; a parked initiator replaced by a newer one; or (instead of `'O'`) rejected by the pending-session cap. The connection is then closed |
 
-A first byte other than `'C'` is a `Protocol` error, and the connection is closed. A **second client with the same role** for a session that is still pending is a `Protocol` error too. That client has already received `'O'` and then sees EOF.
+A first byte other than `'C'` is a `Protocol` error, and the connection is closed. A **second responder** for a session that is still pending is a `Protocol` error too: it has already received `'O'` and then sees EOF (the parked host keeps its slot). A **second initiator** replaces the parked one instead (newest viewer wins, see §4.3).
 
 Encoders: `attach_line`, `reject_line`. Parser: `read_connect`. All three are in `lib.rs`.
 
@@ -72,12 +72,17 @@ Encoders: `attach_line`, `reject_line`. Parser: `read_connect`. All three are in
 
 `Shared.sessions: HashMap<u32, (Option<initiator slot>, Option<responder slot>)>` holds **pending sessions only**.
 
-1. **First side** registers its slot and *parks*. Its thread polls every 10 ms (`wait_until_claimed`) until either:
-   - a peer claims the slot: the thread exits and the session belongs to the peer's thread, or
-   - the timeout expires. `unpark` is an atomic check-and-remove under the lock, so a peer that pairs at the last instant still wins. The relay then writes `XT ‖ sid` and closes.
-2. **Second side** finds the opposite slot, removes the whole entry **under the lock**, writes `A` lines to both sides, and runs the pipe.
+Every client's own thread reads its socket from the CONNECT on (`pump_side`), parked or paired; where the bytes go is the slot's `Route` (`Parked { early, since }`, `Paired { dst, link }`, `Closed`), changed only under the slot's lock.
 
-Because pairing removes the entry, the same ID is immediately free again. An active session never blocks a new park and pair with the same ID (`tests/relay_robustness.rs::repark_during_active_session_pairs_with_the_next_dialer`).
+1. **First side** registers its slot and *parks*. While parked:
+   - its reader keeps running, so a client that goes away (EOF, error, DISCONNECT, WebSocket CLOSE) is removed from the table **at once** (`unpark`, pointer-checked) — a later peer is never paired with a dead socket;
+   - a WebSocket client's PINGs are answered (the iOS app declares a socket dead when its 5 s heartbeat PING goes unanswered; before, a parked app gave up after ~10 s);
+   - bytes it sends are buffered (`early`, at most `EARLY_CAP` = 64 KiB; more closes it) and forwarded right behind the `A` line;
+   - the reaper times the park out after `timeout`: it removes the slot under the table lock (a peer that paired at the last instant already removed it and wins), marks it closed, writes `XT ‖ sid` and closes.
+2. **Second side** finds the opposite slot and removes the whole entry **under the lock**, then *claims* it under the parked slot's route lock: `A` lines to both sides, the early bytes, `Route::Paired`. If the parked side left in that instant (its route is already `Closed`), the claim fails and the second side registers again (parks, or pairs with the next one).
+3. **A second initiator** for a parked session replaces the parked one (`Registered::Parked { displaced }`): the old one gets `XT ‖ sid` and is closed. A viewer that re-dials usually abandoned its earlier attempt (a reconnect, an app relaunch); refusing the new one would leave the stale one to be paired with the host. A second responder is still refused (above).
+
+Because pairing removes the entry, the same ID is immediately free again. An active session never blocks a new park and pair with the same ID (`tests/relay_robustness.rs::repark_during_active_session_pairs_with_the_next_dialer`). In particular, a viewer that dials a host which is busy with another session (its slot is paired, nothing is parked) **parks** — it is not refused — and pairs the moment the host parks again; an unattended `ovhost` keeps a standby park for exactly that ([ovhost.md §1](ovhost.md)).
 
 **Where session IDs come from.** The relay never derives them; that is client-side.
 
@@ -86,11 +91,11 @@ Because pairing removes the entry, the same ID is immediately free again. An act
 
 The relay has **no authentication**. Anyone who knows or guesses a session ID can park on it. The end-to-end handshake ([ovcore.md](ovcore.md)) is what authenticates the peers.
 
-Bytes a parked client sends before pairing stay in its socket buffer. They are forwarded once the pipe starts.
+Bytes a parked client sends before pairing are read and held (see above); they are forwarded once a peer claims it.
 
 ### 4.4 Pipe
 
-`pipe_pair` spawns one thread per direction (`ovrelay-pipe-<sid>`). Each thread does the following:
+Each client's own thread (`pump_side`) is the pipe for its direction, from its park on. It does the following:
 
 1. Read up to `PIPE_BUF` = 64 KiB from the source's reader: a socket clone, or the `WsReader` deframer.
 2. Run `FrameCursor::scan` over the buffer. It walks frame headers (kind ≤ `0x05`, len ≤ 65 532) without decoding payloads.
@@ -103,12 +108,13 @@ Bytes a parked client sends before pairing stay in its socket buffer. They are f
    |---|---|
    | DISCONNECT frame, or clean EOF / WebSocket CLOSE | forward the bytes before it, write a DISCONNECT frame to the destination, then close both sides |
    | Unknown kind, oversize length, or read error | close both sides **without** a DISCONNECT |
+   | Any of the above while still parked | leave the session table and close (no peer to tell) |
 
 Closing a slot means: a WebSocket CLOSE (status 1000) if it is a WebSocket client, then `shutdown(Both)` (which wakes the other direction's blocked read), then dropping the stream. Every write to a slot is serialized by `write_lock`, so a relayed frame and a PONG can never interleave.
 
 **WebSocket keepalive.** If either side is a WebSocket client, a pinger thread sends a WebSocket `PING` with payload `"ov"` every `WS_PING_EVERY` = 15 s to the WebSocket sides. This stops proxies such as Cloudflare or VPN apps from timing out an idle-looking socket once the session's traffic has moved to the direct path.
 
-**Session log.** `info`: one line when a session pairs (`initiator/viewer (ws|tcp) <-> responder/host (…)`) and one when it closes (lifetime, which side ended it). `debug`: per direction, bytes, reads, the end reason (`EOF`, `read error`, `DISCONNECT frame`, `framing error`), and idle time before the end; `WsReader` CLOSE codes, TCP FIN without a CLOSE, and the time since the last PONG.
+**Session log.** `info`: one line when a session pairs (`initiator/viewer (ws|tcp) <-> responder/host (…)`) and one when it closes (lifetime, which side ended it; written by whichever direction finishes last, `Link::finish`). `debug`: a parked client that left, a parked initiator replaced by a newer one. `debug`: per direction, bytes, reads, the end reason (`EOF`, `read error`, `DISCONNECT frame`, `framing error`), and idle time before the end; `WsReader` CLOSE codes, TCP FIN without a CLOSE, and the time since the last PONG.
 
 ### 4.5 WebSocket details (`ws.rs`)
 
@@ -180,11 +186,11 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 
 | File | Tests and coverage |
 |---|---|
-| `src/lib.rs` (unit) | `connect_line_roundtrip`; `reject_line_layout`; `frame_cursor_*` (every split point; DISCONNECT and bad frames); `connection_caps_total_and_per_ip_with_loopback_exempt`; `deadline_reader_stops_dribbling_clients`; `parser_entry_points_survive_noise` (3000 random inputs through the WebSocket deframer, frame cursor and CONNECT parser) |
+| `src/lib.rs` (unit) | `connect_line_roundtrip`; `reject_line_layout`; `frame_cursor_*` (every split point; DISCONNECT and bad frames); `connection_caps_total_and_per_ip_with_loopback_exempt`; `deadline_reader_stops_dribbling_clients`; `a_viewer_parks_while_the_host_is_busy_and_pairs_on_the_next_park`; `a_newer_viewer_displaces_the_parked_one_but_a_second_host_is_refused`; `the_reaper_times_out_old_parks_only`; `parser_entry_points_survive_noise` (3000 random inputs through the WebSocket deframer, frame cursor and CONNECT parser) |
 | `src/ws.rs` (unit) | deframing of masked messages incl. PING and CLOSE; unmasked / oversized frames rejected; the HTTP head deadline. The codec's own tests (accept key, SHA-1, length encodings, unmasking) live in `crates/ovtransport/src/ws.rs` |
 | `src/main.rs` (unit) | clap defaults and flags; `Command::debug_assert`; `--healthcheck` target (unspecified bind → loopback) and probe against a live relay, a closed port and a non-200 server |
 | `tests/relay_handshake.rs` | full `ovcore` pairing-code handshake plus AEAD records both ways through a live relay; an unmatched CONNECT times out; PING/PONG round trip |
-| `tests/relay_robustness.rs` | DISCONNECT relaying, abrupt close, re-park during an active session, park timeout never kills an active session, unmatched park gets `XT`, oversized WebSocket frame |
+| `tests/relay_robustness.rs` | DISCONNECT relaying, abrupt close, re-park during an active session, park timeout never kills an active session, unmatched park gets `XT`, oversized WebSocket frame; a viewer dialing a busy host parks and pairs on the host's next park; a newer viewer replaces a parked one (`XT` to the old); a parked viewer that left is never paired; a second parked responder is refused; a parked WebSocket viewer gets PONGs and its early bytes arrive behind `A` |
 | `crates/ovtransport/tests/ws_relay.rs` | WebSocket viewer ↔ TCP host pairing and data both ways, health check, raw TCP pairing with address learning, `#[ignore]` keepalive soak |
 | `crates/ovtransport/tests/ws_client_relay.rs` | feature `ws-client`: host and viewer both through `RelayTunnelCarrier::connect_ws`, handshake and records; a hostname TCP relay (`connect_host`) pairs with a WebSocket viewer |
 | `fuzz/fuzz_targets/ws_frames.rs` | cargo-fuzz target over `ovrelay::fuzzing` (feature `fuzzing`; path relative to the repository root) |
@@ -192,4 +198,4 @@ Logging uses `tracing` with the shared `ovcommon::logging` subscriber (stderr; f
 ## 10. Known limitations
 
 1. **CONNECT is unauthenticated** and session IDs are low-entropy rendezvous names (a pairing code's four public digits, or the low 32 bits of the device ID). Someone who guesses an ID can park on it first (denial of service only; the handshake protects the session). Widening the ID to 64 bits was deferred — it changes every client and adds no secrecy (see WIRE_PROTOCOL §2.1).
-2. **A same-role duplicate CONNECT** is rejected after `'O'` (the capacity check now runs before `'O'`, the role check cannot without racing the pairing peer's `A` line).
+2. **A duplicate responder CONNECT** is rejected after `'O'` (the capacity check now runs before `'O'`, the role check cannot without racing the pairing peer's `A` line). A duplicate initiator replaces the parked one, so anyone who knows a session ID can also bump a waiting viewer (denial of service only, like parking on the ID).

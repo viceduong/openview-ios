@@ -95,6 +95,12 @@ pub enum OpCode {
     /// good (`1B kind` ([`GAP_VIDEO`] / [`GAP_AUDIO`]) + `2B packets` +
     /// `4B samples`, BE). Never sent on the wire.
     MediaGap = 0x63,
+    /// Goodbye (either direction, no payload; sent only to a peer with
+    /// [`CAP_BYE`](super::CAP_BYE)): the sender is ending the session on
+    /// purpose (app closed, sent to the background, user disconnect). The
+    /// receiver ends the session at once instead of waiting for its
+    /// liveness timeout.
+    Bye = 0x64,
 }
 
 impl OpCode {
@@ -137,6 +143,7 @@ impl OpCode {
             0x62 => Self::SessionOption,
             0x27 => Self::VideoUnit,
             0x63 => Self::MediaGap,
+            0x64 => Self::Bye,
             _ => return None,
         })
     }
@@ -578,6 +585,10 @@ pub enum Command {
         /// PCM samples to conceal (audio).
         samples: u32,
     },
+    /// BYE: the peer is ending the session on purpose (no payload). The
+    /// receiving [`TerminalSession`](super::TerminalSession) reports its
+    /// pump as closed once the batch carrying it was dispatched.
+    Bye,
 }
 
 /// One entry of a [`Command::MonitorsInfo`] payload.

@@ -78,7 +78,10 @@ relay  → client: 'X' 'T' | session_id u32 BE                (park timeout / re
 - The park timeout is 30 s by default (`--timeout`).
 - When the relay already holds its maximum of parked sessions (`--max-pending`, default 512), a CONNECT gets `XT` **instead of** `O`.
 - Connections beyond `--max-connections` (default 1024) or `--max-per-ip` (default 32; loopback exempt, for a local reverse proxy) are closed right after accept, before any byte is exchanged.
-- A second client with the same role on a pending ID is dropped after receiving `O`.
+- A second **responder** on a pending ID is dropped after receiving `O`. A second **initiator** replaces the parked one, which gets `XT` and is closed (a viewer that dials again has almost always abandoned its earlier attempt).
+- A parked client's stream is read while it waits: a client that goes away leaves the table at once (it is never paired), WebSocket PINGs are answered, and bytes it sends early (at most 64 KiB) are delivered to the peer right behind the `A` line.
+- Pairing removes the pending entry, so a viewer that dials while the host is busy in another session parks until the host parks again. An unattended host keeps such a park open while it serves a session (a client convention, no protocol change: [ovhost.md §1](crates/ovhost.md)).
+- There are no relay control bytes beyond these; ending a session on purpose is the tunnel's DISCONNECT (§2.4) plus, inside the sealed records, the application's BYE command ([ovapp.md](crates/ovapp.md), `0x64`, CAPS-gated by `CAP_BYE`).
 
 ### 2.4 Tunnel frames (after `O`, both directions, relayed opaquely)
 

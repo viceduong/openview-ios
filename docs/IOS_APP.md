@@ -179,7 +179,7 @@ dialing(transport) ─► authenticating ─► waitingForFirstFrame ─► live
 | `-5` (closed) | `.disconnected` | `.disconnected` |
 | `-4` (transport) | `.transport` | `.disconnected("network error")` |
 | `-6` (internal error: Rust caught a panic) | `.disconnected("internal error")` | `.disconnected("internal error")` |
-| `-1` / `-2` | logged only (deduplicated) | logged only (deduplicated) |
+| `-1` / `-2` | developer detail only (diagnostics log, never a session-log line) | same |
 
 Only `.authFailed` counts as a credential failure; network, protocol and
 rate-limit errors never touch the saved PIN. `.authFailed`, `.rateLimited`
@@ -206,10 +206,34 @@ and `.incompatibleVersion` are not auto-reconnected.
 - **Watchdog** (`tick`): once established, more than 8 s without inbound
   records (`ov_screen_inbound_age_ms`) ends the attempt. This catches dead
   paths that no transport reported, such as a VPN drop.
+- **Keepalive** (`tick`): PINGs and PONG replies only once the secure session
+  is up (`established`). Before that there is no record to send — a viewer
+  parked on the relay while the host is busy waits for seconds, and the
+  keepalive used to fail there with `wrongState` (shown as "error:
+  wrongState"). Input and chat are likewise not sent before establishment.
+- **Goodbye** (`haltOnQueue`): whenever a running attempt is halted — user
+  disconnect (`stop`), a failure before a reconnect, the background pause,
+  app termination — it first calls `OvSessionBox.goodbye()`
+  (`ov_session_goodbye`: BYE on the current path + DISCONNECT on the relay
+  tunnel), while every transport is still open, and keeps the sockets open
+  for `goodbyeLinger` = 300 ms (`RelayWebSocket.closeAfterSends`, delayed UDP
+  close) so the bytes leave. The host frees its single session slot at once;
+  without it, a killed or suspended app held the host until its liveness
+  timeout and the app's own reconnect was not served meanwhile.
 - **Background.**
   - Entering the background releases all held input and starts a
-    `beginBackgroundTask`.
-  - Returning to the foreground retries a failed session that had been live.
+    `beginBackgroundTask`, so a quick app switch keeps the session.
+  - After `backgroundGrace` = 10 s in the background (or when iOS expires
+    the background task first) the session says goodbye and disconnects
+    (`pauseForBackground`, phase `.failed(.disconnected("paused in the
+    background"))`); the background task ends after the goodbye's linger.
+    A suspended app cannot answer the host anyway; ending cleanly frees the
+    host instead of leaving a stale session behind.
+  - Returning to the foreground reconnects a paused session, and retries a
+    failed session that had been live.
+  - **Termination** (`willTerminate`, e.g. swiped away while still running):
+    goodbye, waiting at most 300 ms for the session queue, then 250 ms for
+    the bytes to leave.
   - The app lock re-engages on background only when no session is active
     (`RootView`).
 - **Generations**: every attempt has a generation number, and late events

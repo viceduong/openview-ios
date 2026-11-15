@@ -36,7 +36,7 @@ extension SessionController {
         appendChat(text, fromMe: true)
         queue.async { [weak self] in
             guard let self else { return }
-            guard !self.halted, let session = self.session else {
+            guard !self.halted, self.established, let session = self.session else {
                 self.log("Chat message not sent: not connected")
                 return
             }
@@ -48,11 +48,12 @@ extension SessionController {
         }
     }
 
-    /// Shared command-channel send: errors (e.g. not yet established) are
-    /// surfaced in the session log.
+    /// Shared command-channel send. Before the secure session is up there
+    /// is nothing to send on (input during the handshake is dropped, not an
+    /// error); transport errors are routed through `handle`.
     func sendCommand(_ payload: Data) {
         queue.async { [weak self] in
-            guard let self, !self.halted, let session = self.session else { return }
+            guard let self, !self.halted, self.established, let session = self.session else { return }
             do {
                 try session.sendRecord(channel: 0, payload: payload)
             } catch {

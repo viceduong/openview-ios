@@ -169,10 +169,33 @@ kbps, media summary) are `debug` (`-v`); per-input-event lines are `trace`
    less than `MIN_PARK` = 2 s, the relay refused it (for example, it still
    holds the old slot), so the host sleeps 1 s before parking again. Only a
    failure to reach the relay at all is an error.
+
+   **Standby park (unattended `--service`).** The PIN host's relay session
+   ID is stable, so while a session runs a background thread
+   (`session/standby.rs`, `ovhost-standby`) keeps a second responder park on
+   the relay under the same ID (re-parking after `XT`, backing off while the
+   relay is unreachable). Without it the host parked again only after its
+   session ended — a viewer that vanished without a goodbye (app killed, a
+   VPN dropping the relay socket while the direct path carried the session)
+   held the host for up to the liveness timeout, and the viewer's own
+   reconnect waited on the relay meanwhile. When a viewer attaches to the
+   standby park, the session loop probes its current viewer (`Takeover`:
+   a PING every `PROBE_EVERY` = 500 ms) and ends the session if that viewer
+   has sent nothing for `TAKEOVER_GRACE` = 2.5 s (at once when it was already
+   silent that long). A live viewer answers within a round trip and keeps
+   its session; the newcomer waits (its handshake timer runs). The waiting
+   viewer's carrier and what it already sent (its HELLO) pass to the next
+   `listen_once` (`Handoff::Attached`), which runs the handshake on it
+   straight away; a standby park nobody claimed is kept as the next session's
+   park (`Handoff::Parked`), so the relay never sees a gap. A waiting viewer
+   that gives up is noticed (its carrier closes) and the park is renewed.
+   Attended hosts have no standby: the pairing code (and its session ID) is
+   burned by the session that used it.
 4. **Handshake** (`handshake_over`). The host runs as `Role::Server` and has
    `HANDSHAKE_AFTER_ATTACH` = 10 s to finish, polling every 10 ms. Datagrams
-   that arrive in the same batch as the final handshake message are handed to
-   the session as a backlog, so they are not lost.
+   a viewer sent while it waited on the standby park are fed first.
+   Datagrams that arrive in the same batch as the final handshake message
+   are handed to the session as a backlog, so they are not lost.
 5. It logs `peer connected, fingerprint <hex>` and emits a `peer_connected`
    status event, which `ovgui` parses (see `ovgui.md`).
 6. It builds a `TerminalSession` and, if the direct path is up, calls
@@ -653,6 +676,19 @@ These constants come from `ovapp::liveness` (`crates/ovapp/src/liveness.rs`):
 
 Every decoded inbound record, of any kind, refreshes liveness.
 
+A session ends sooner when:
+
+* the viewer says goodbye: `BYE` (`0x64`, sent only to a host that
+  advertised `CAP_BYE`, which `ovhost` does) ends it at once (`peer
+  disconnected (the viewer said goodbye)`). The iOS app sends it when it is
+  closed, disconnected, sent to the background for longer than its grace,
+  or reconnects; `ovview` when it exits. On the relay the tunnel's
+  DISCONNECT does the same, but a session on the direct path has no other
+  close;
+* another viewer waits on the standby park (§1) and this one has been
+  silent for `TAKEOVER_GRACE` = 2.5 s despite the probe PINGs. The host
+  says goodbye to it (BYE where advertised, DISCONNECT on the relay).
+
 ---
 
 ## 13. Other constants
@@ -711,6 +747,11 @@ Session unit tests (`src/session/`) cover:
 * the peer-state classification (`liveness.rs`);
 * re-parking after a relay `XT` against a real in-process `ovrelay::Relay`
   (`mod.rs`);
+* the standby park end to end against a real relay with unattended
+  terminal sessions (`takeover_tests.rs`): after a goodbye the next viewer
+  is served at once; a viewer that went silent without one makes way for
+  the next within the takeover grace (and is told); a live viewer keeps its
+  session while another waits. The takeover rule itself (`standby.rs`);
 * the LAN path end to end: mDNS advertise of a scratch device ID → resolve →
   PIN handshake and datagram exchange over the LAN carrier, with an
   unreachable relay (`mod.rs`); the LAN listener's HELLO filter, hand-over
