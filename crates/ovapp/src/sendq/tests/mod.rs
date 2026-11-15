@@ -24,6 +24,7 @@ fn frame(seq: u64, bytes: usize) -> EncodedFrame {
         delta: None,
         video: None,
         barrier: 0,
+        stamps: None,
     }
 }
 

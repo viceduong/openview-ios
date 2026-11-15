@@ -189,6 +189,11 @@ int32_t ov_screen_set_audio_sink(OvScreen *screen, void *user, ov_audio_sink sin
 // advertise CAP_OPUS; the host then sends Opus packets here instead of raw
 // PCM to the audio sink.
 int32_t ov_screen_set_opus_sink(OvScreen *screen, void *user, ov_opus_sink sink);
+// With an Opus sink: also advertise CAP_STEREO (call before the first
+// ov_screen_feed, only when the shell decodes 2-channel Opus). A host with
+// stereo system audio then sends stereo packets (TOC s bit set; `samples`
+// stays per channel) to the same Opus sink.
+int32_t ov_screen_set_opus_stereo(OvScreen *screen, int32_t on);
 // Installing a video sink (before the first ov_screen_feed, and only when
 // VideoToolbox can decode H.264) makes our CAPS advertise CAP_H264; the host
 // then streams high-motion regions as H.264 packets.
@@ -228,5 +233,38 @@ int32_t ov_screen_liveness_tick(OvScreen *screen, int64_t now_ms);
 // Watchdog: ms since the last inbound record (same clock as liveness_tick).
 int64_t ov_screen_inbound_age_ms(OvScreen *screen, int64_t now_ms);
 int32_t ov_screen_take_pong_reply(OvScreen *screen, uint8_t *out, size_t cap);
+
+// Latency telemetry (CAP_TIMING hosts): rolling p50/p95 per stage of the
+// last ~120 updates, in microseconds. Stages: host capture -> grab, grab ->
+// encode, encode -> first byte sent, network one way (needs the clock
+// offset), reassembled -> handed to the shell, handed -> presented, and the
+// total capture -> presented (needs the clock offset). samples 0 = no data.
+// Layout = ovffi `OvLatencyStage` / `OvLatencyStats` (#[repr(C)]).
+typedef struct ov_latency_stage {
+    uint32_t p50_us;
+    uint32_t p95_us;
+    uint32_t samples;
+} ov_latency_stage;
+typedef struct ov_latency_stats {
+    ov_latency_stage capture;
+    ov_latency_stage encode;
+    ov_latency_stage send;
+    ov_latency_stage network;
+    ov_latency_stage decode;
+    ov_latency_stage present;
+    ov_latency_stage total;
+    uint32_t clock_valid;
+    uint64_t frames;
+    int64_t clock_offset_us;
+    uint64_t clock_rtt_us;
+} ov_latency_stats;
+// Fill `out` (session queue). 0, or -1 on a null argument.
+int32_t ov_screen_latency_stats(OvScreen *screen, ov_latency_stats *out);
+// A picture reached the screen: every update handed to the shell at least
+// drawn_age_us ago (when the picture was drawn) was presented
+// presented_age_us ago, both relative to this call (Metal:
+// CACurrentMediaTime() - drawable.presentedTime; AVSampleBufferDisplayLayer:
+// 0 / 0 right after enqueue). Session queue. Returns the updates measured.
+int32_t ov_screen_latency_presented(OvScreen *screen, int64_t drawn_age_us, int64_t presented_age_us);
 
 #endif

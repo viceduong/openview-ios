@@ -217,6 +217,7 @@ extension SessionController {
         directQueued = 0
         lastErrorLine = nil
         lastLiveness = (alive: true, rtt: -1, fpsTenths: 0)
+        lastLatency = nil
         videoActive = false
         pendingHideGen = nil
         lastPeerCaps = 0
@@ -266,6 +267,7 @@ extension SessionController {
                 try sendPongIfOwed()
             }
             screen.livenessTick(nowMs: nowMs)
+            publishLatency(nowMs: nowMs)
             // Watchdog: the host sends at least a keepalive every 5 s. A
             // session that heard nothing for longer is dead even if no
             // transport said so (e.g. a VPN dropped the relay and the UDP

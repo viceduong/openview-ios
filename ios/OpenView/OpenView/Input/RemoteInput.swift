@@ -498,7 +498,9 @@ final class RemoteInputController: ObservableObject {
     private var pendingRaw = CGPoint.zero
     private var relRemainder = CGPoint.zero
     private var rawRemainder = CGPoint.zero
-    private var wheelAcc = CGPoint.zero
+    /// Wheel units not sent yet (fractions carry; whole units go out at
+    /// most ~120 times a second, see `WheelAccumulator`).
+    private var wheelAcc = WheelAccumulator()
     private var idleTicks = 0
     /// Pointer / wheel output already went out since the last display
     /// tick (later motion in the same frame is coalesced into the tick).
@@ -728,15 +730,15 @@ final class RemoteInputController: ObservableObject {
         if !sentSinceTick {
             sentSinceTick = true
             flushPointer()
-            flushWheel()
+            flushWheel(force: false)
         }
         if !ticker.isRunning { ticker.start() }
     }
 
     private func tick() {
-        let busy = hasPendingPointer || abs(wheelAcc.x) >= 1 || abs(wheelAcc.y) >= 1
+        let busy = hasPendingPointer || wheelAcc.hasWholeUnits
         flushPointer()
-        flushWheel()
+        flushWheel(force: false)
         sentSinceTick = false
         if busy {
             idleTicks = 0
@@ -873,32 +875,29 @@ final class RemoteInputController: ObservableObject {
     // MARK: Wheel
 
     /// Scroll by (dx, dy) in 1/120-notch units (dy > 0 = up, dx > 0 =
-    /// right). Accumulated; whole units go out once per display frame.
+    /// right) — any fraction of a notch: Windows passes sub-notch deltas
+    /// on, so scrolling is smooth. Accumulated; whole units go out at most
+    /// once per display frame (~120 Hz).
     /// Dropped without CAP_INPUT2 (the legacy protocol has no wheel).
     func wheel(dx: Double, dy: Double) {
         guard input2, dx.isFinite, dy.isFinite else { return }
-        wheelAcc.x += CGFloat(dx)
-        wheelAcc.y += CGFloat(dy)
+        wheelAcc.add(dx: dx, dy: dy)
         noteLocalInput()
         ensureTicking()
     }
 
-    /// Send whole accumulated wheel units now (also used before releasing
-    /// the Ctrl of a pinch-to-Ctrl+wheel gesture, so ordering holds).
-    func flushWheel() {
+    /// Send whole accumulated wheel units now. `force` (the default)
+    /// ignores the ~120 Hz pacing — used before releasing the Ctrl of a
+    /// pinch-to-Ctrl+wheel gesture, so ordering holds; the display ticker
+    /// flushes paced.
+    func flushWheel(force: Bool = true) {
         guard input2 else {
-            wheelAcc = .zero
+            wheelAcc.reset()
             return
         }
-        let wx = Double(wheelAcc.x).rounded(.towardZero)
-        let wy = Double(wheelAcc.y).rounded(.towardZero)
-        guard wx != 0 || wy != 0 else { return }
-        let sx = Int16(min(max(wx, Double(Int16.min)), Double(Int16.max)))
-        let sy = Int16(min(max(wy, Double(Int16.min)), Double(Int16.max)))
-        wheelAcc.x -= CGFloat(sx)
-        wheelAcc.y -= CGFloat(sy)
+        guard let w = wheelAcc.take(now: CACurrentMediaTime(), force: force) else { return }
         flushPointer()
-        emit(InputWire.wheel(dy: sy, dx: sx))
+        emit(InputWire.wheel(dy: w.dy, dx: w.dx))
     }
 
     // MARK: Keys
@@ -1024,7 +1023,7 @@ final class RemoteInputController: ObservableObject {
     /// modifiers (backgrounding, disconnect).
     func releaseAll() {
         flushPointer()
-        wheelAcc = .zero
+        wheelAcc.reset()
         if input2 {
             emit(InputWire.releaseAll())
         } else {

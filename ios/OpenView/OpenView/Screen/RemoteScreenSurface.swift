@@ -206,9 +206,9 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     var tapTimer: DispatchWorkItem?
     /// Long-press (right click) / double-tap-and-hold (drag) timer.
     var tpTimer: DispatchWorkItem?
-    /// Two-finger wheel scrolling: finger travel (points)
-    /// not yet emitted as whole 10 pt wheel steps.
-    var scrollStepAcc: CGPoint = .zero
+    /// Wheel units per point of the running scroll fling (touch or
+    /// trackpad, whichever started it).
+    var scrollFlingUnitsPerPoint: CGFloat = WheelScroll.trackpadUnitsPerPoint
     /// Indirect pointer touch -> the button it pressed.
     var pointerButtons: [ObjectIdentifier: MouseButton] = [:]
     /// Multi-finger lift debounce: a multi-finger touch sequence is in
@@ -219,7 +219,8 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     var pinchCtrlHeld = false
 
     // ---- animation ----
-    /// iPad trackpad (continuous pointer scroll) inertia.
+    /// Scroll inertia after the lift: two-finger touch pans and iPad
+    /// trackpad (continuous pointer) scrolls glide on, any touch-down stops.
     var scrollFling = FlingTracker(timeConstant: 250)
     /// Zoomed in: the cursor-centred offset the viewport is
     /// easing towards (nil = not animating).
@@ -237,9 +238,6 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     // ---- constants ----
     static let cursorMinPoints: CGFloat = 20
     static let cursorMaxPoints: CGFloat = 64
-    /// iPad pointer scrolling: wheel units (1/120 notch) per point, one
-    /// notch per 36 pt.
-    static let wheelUnitsPerPoint: CGFloat = 120.0 / 36.0
     /// Smooth centring (viewport catching up after a jump: resync, zoom,
     /// preset), exponential time constant in seconds.
     static let followTimeConstant: Double = 0.08
@@ -576,22 +574,37 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     func renderNow() {
         guard let metal, window != nil, scale > 0, bounds.width > 0, bounds.height > 0,
               UIApplication.shared.applicationState != .background else { return }
-        var presented: (() -> Void)?
+        let hide: (() -> Void)?
         let hideGen = hideVideoAfterPresent
         if let gen = hideGen, let overlay = video {
             hideVideoAfterPresent = nil
-            presented = { [weak overlay] in
+            hide = { [weak overlay] in
                 DispatchQueue.main.async {
                     overlay?.hide(generation: gen)
                 }
             }
+        } else {
+            hide = nil
+        }
+        // Latency telemetry: report when this drawable reached the screen
+        // (a presented time of 0 = it never was).
+        let report = uploads?.onPresented
+        let drawnAt = CACurrentMediaTime()
+        let presented: ((CFTimeInterval) -> Void)?
+        if hide != nil || report != nil {
+            presented = { presentedAt in
+                hide?()
+                if presentedAt > 0 { report?(drawnAt, presentedAt) }
+            }
+        } else {
+            presented = nil
         }
         let done = metal.render(scale: scale, offset: offset, sharpenOn: AppSettings.sharpen,
                                 uploads: uploads, onPresented: presented)
         if !done {
             // The GPU still has the previous frame: retry at the next
             // refresh (keeps the display link running), nothing lost.
-            if presented != nil {
+            if hide != nil {
                 hideVideoAfterPresent = hideGen
             }
             needsRender = true
@@ -732,7 +745,7 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
         CATransaction.commit()
     }
 
-    // MARK: Animation (iPad trackpad scroll inertia, viewport easing)
+    // MARK: Animation (scroll inertia, viewport easing)
 
     func stopFlings() {
         scrollFling.stop()
@@ -742,7 +755,7 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
         var running = false
         if let d = scrollFling.step(now: now) {
             running = true
-            sendWheel(byViewPoints: d, factor: Self.wheelUnitsPerPoint)
+            sendWheel(byViewPoints: d, factor: scrollFlingUnitsPerPoint)
         }
         if stepFollow(now) {
             running = true

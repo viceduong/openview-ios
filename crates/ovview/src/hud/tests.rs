@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn hud_lines_format_all_fields() {
-    let lines = hud_lines(Some(42.4), 9.96, 1.2345, 1920, 1080, None, None, None);
+    let lines = hud_lines(Some(42.4), 9.96, 1.2345, 1920, 1080, None, None, None, None);
     assert_eq!(lines[0], "RTT 42 ms");
     assert_eq!(lines[1], "FPS 10.0");
     assert_eq!(lines[2], "RES 1920x1080");
@@ -24,6 +24,7 @@ fn hud_lines_shows_the_capture_target() {
         None,
         Some("2/3 2560x1440".to_owned()),
         None,
+        None,
     );
     assert_eq!(lines[5], "MON 2/3 2560x1440");
 }
@@ -31,7 +32,7 @@ fn hud_lines_shows_the_capture_target() {
 #[test]
 fn hud_lines_shows_a_dash_before_the_first_pong() {
     assert_eq!(
-        hud_lines(None, 0.0, 0.0, 0, 0, Some(30), None, None)[0],
+        hud_lines(None, 0.0, 0.0, 0, 0, Some(30), None, None, None)[0],
         "RTT —"
     );
 }
@@ -39,11 +40,11 @@ fn hud_lines_shows_a_dash_before_the_first_pong() {
 #[test]
 fn hud_lines_shows_the_manual_quality_mode() {
     assert_eq!(
-        hud_lines(Some(1.0), 0.0, 0.0, 0, 0, Some(30), None, None)[4],
+        hud_lines(Some(1.0), 0.0, 0.0, 0, 0, Some(30), None, None, None)[4],
         "Q 30 fps"
     );
     assert_eq!(
-        hud_lines(Some(1.0), 0.0, 0.0, 0, 0, Some(60), None, None)[4],
+        hud_lines(Some(1.0), 0.0, 0.0, 0, 0, Some(60), None, None, None)[4],
         "Q 60 fps"
     );
 }
@@ -59,10 +60,40 @@ fn hud_lines_shows_the_recording_indicator() {
         None,
         None,
         Some((65_000, 1_572_864, 42)),
+        None,
     );
     assert_eq!(lines[5], "REC ● 65s 1.50M 42f");
     assert_eq!(
-        hud_lines(None, 0.0, 0.0, 0, 0, None, Some("1/1".to_owned()), None)[5],
+        hud_lines(
+            None,
+            0.0,
+            0.0,
+            0,
+            0,
+            None,
+            Some("1/1".to_owned()),
+            None,
+            None
+        )[5],
         "MON 1/1"
+    );
+}
+
+#[test]
+fn hud_lines_append_the_latency_line() {
+    let lines = hud_lines(
+        Some(12.0),
+        60.0,
+        1.0,
+        1920,
+        1080,
+        None,
+        None,
+        None,
+        Some("cap 3.0 · enc 4.0 · send 0.2 · net 12 · dec 2.0 · pres 8.0 = 29 ms".into()),
+    );
+    assert_eq!(
+        lines[0],
+        "RTT 12 ms  ·  cap 3.0 · enc 4.0 · send 0.2 · net 12 · dec 2.0 · pres 8.0 = 29 ms"
     );
 }

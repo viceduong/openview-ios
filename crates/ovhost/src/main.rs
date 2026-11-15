@@ -60,6 +60,7 @@ mod dxgi;
 mod input;
 mod lan;
 mod mic;
+mod probe;
 mod session;
 mod settings;
 mod speaker;

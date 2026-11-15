@@ -22,6 +22,163 @@ pub(crate) fn vbv_bits(bitrate: u32, fps: u32) -> u32 {
     (bitrate / fps.max(1)).max(64_000)
 }
 
+/// The H.264 profile requested on the encoder's output type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264Profile {
+    /// Main (`profile_idc` 77): CABAC, no 8x8 transform.
+    Main,
+    /// High (`profile_idc` 100): Main plus the 8x8 transform and scaling
+    /// matrices. Decoded by every H.264 decoder we target (MF,
+    /// VideoToolbox).
+    High,
+}
+
+impl H264Profile {
+    /// The `eAVEncH264VProfile` value for `MF_MT_MPEG2_PROFILE`.
+    fn mf(self) -> u32 {
+        match self {
+            Self::Main => eAVEncH264VProfile_Main.0 as u32,
+            Self::High => eAVEncH264VProfile_High.0 as u32,
+        }
+    }
+
+    /// The SPS `profile_idc` this profile signals.
+    pub fn profile_idc(self) -> u8 {
+        match self {
+            Self::Main => 77,
+            Self::High => 100,
+        }
+    }
+}
+
+/// What the encoder is asked for: picture size, rate, profile and (bench
+/// only) a constant QP instead of CBR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EncodeParams {
+    pub w: u32,
+    pub h: u32,
+    pub fps: u32,
+    pub bitrate: u32,
+    /// Preferred profile; Main is used if the MFT refuses it.
+    pub profile: H264Profile,
+    /// Constant-QP rate control (quality mode) instead of CBR, for
+    /// equal-quality size comparisons in benchmarks.
+    pub qp: Option<u32>,
+}
+
+impl EncodeParams {
+    /// The production setup: CBR at `bitrate`, High profile.
+    pub fn new(w: u32, h: u32, fps: u32, bitrate: u32) -> Self {
+        Self {
+            w,
+            h,
+            fps,
+            bitrate,
+            profile: H264Profile::High,
+            qp: None,
+        }
+    }
+}
+
+/// Optional encoder features the active MFT reports through
+/// `ICodecAPI::IsSupported` (probed once at creation, logged at debug).
+/// Decides whether loss recovery can use long-term references (LTR) or
+/// gradual intra refresh instead of a full IDR.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncoderCaps {
+    /// `CODECAPI_AVEncVideoLTRBufferControl` (number of LTR slots).
+    pub ltr_buffer_control: bool,
+    /// The LTR slot count currently configured (low 16 bits of the
+    /// `LTRBufferControl` value; 0 = LTR off until set), when readable.
+    pub ltr_slots: Option<u32>,
+    /// `CODECAPI_AVEncVideoMarkLTRFrame` (mark the next frame as an LTR).
+    pub mark_ltr: bool,
+    /// `CODECAPI_AVEncVideoUseLTRFrame` (predict the next frame from LTRs).
+    pub use_ltr: bool,
+    /// `CODECAPI_AVEncVideoGradualIntraRefresh`.
+    pub gradual_intra_refresh: bool,
+    /// `CODECAPI_AVEncVideoTemporalLayerCount`.
+    pub temporal_layers: bool,
+    /// `CODECAPI_AVEncVideoMaxNumRefFrame`.
+    pub max_ref_frames: bool,
+    /// `CODECAPI_AVEncVideoForceKeyFrame`.
+    pub force_keyframe: bool,
+}
+
+impl EncoderCaps {
+    /// Probe `api` (no codec API at all = nothing supported).
+    fn probe(api: Option<&ICodecAPI>) -> Self {
+        let Some(api) = api else {
+            return Self::default();
+        };
+        // SAFETY: `IsSupported` on a live ICodecAPI with a pointer to a
+        // 'static GUID constant, which it only reads.
+        let has = |g: &GUID| unsafe { api.IsSupported(g) }.is_ok();
+        // SAFETY: as above; the returned VARIANT is owned (and freed) here.
+        let ltr_slots = unsafe { api.GetValue(&CODECAPI_AVEncVideoLTRBufferControl) }
+            .ok()
+            .and_then(|v| u32::try_from(&v).ok())
+            .map(|v| v & 0xFFFF);
+        Self {
+            ltr_slots,
+            ltr_buffer_control: has(&CODECAPI_AVEncVideoLTRBufferControl),
+            mark_ltr: has(&CODECAPI_AVEncVideoMarkLTRFrame),
+            use_ltr: has(&CODECAPI_AVEncVideoUseLTRFrame),
+            gradual_intra_refresh: has(&CODECAPI_AVEncVideoGradualIntraRefresh),
+            temporal_layers: has(&CODECAPI_AVEncVideoTemporalLayerCount),
+            max_ref_frames: has(&CODECAPI_AVEncVideoMaxNumRefFrame),
+            force_keyframe: has(&CODECAPI_AVEncVideoForceKeyFrame),
+        }
+    }
+
+    /// Full long-term-reference control (buffer, mark and use).
+    pub fn ltr(&self) -> bool {
+        self.ltr_buffer_control && self.mark_ltr && self.use_ltr
+    }
+}
+
+/// Reject odd or tiny picture sizes before touching Media Foundation.
+pub(super) fn check_size(w: u32, h: u32) -> Result<(), AppError> {
+    if w < 16 || h < 16 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+        return Err(AppError::invalid(format!(
+            "H.264 picture {w}x{h} must be even and at least 16x16"
+        )));
+    }
+    Ok(())
+}
+
+/// Set the H.264 output type at `p.profile`, falling back to Main when the
+/// MFT refuses it; returns the profile in effect.
+///
+/// # Safety
+/// `mft` must be a live encoder transform (MF started on this thread).
+unsafe fn set_output_type(mft: &IMFTransform, p: &EncodeParams) -> Result<H264Profile, AppError> {
+    let mut first = None;
+    for profile in [p.profile, H264Profile::Main] {
+        // SAFETY: MF calls on a media type created here and on the caller's
+        // live transform (see the function contract).
+        let r = unsafe {
+            video_type(&MFVideoFormat_H264, p.w, p.h, p.fps).and_then(|out| {
+                out.SetUINT32(&MF_MT_AVG_BITRATE, p.bitrate)?;
+                out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile.mf())?;
+                mft.SetOutputType(0, &out, 0)
+            })
+        };
+        match r {
+            Ok(()) => return Ok(profile),
+            Err(e) => {
+                tracing::debug!("H.264 output type at {profile:?} refused: {e}");
+                first.get_or_insert(e);
+            }
+        }
+        if p.profile == H264Profile::Main {
+            break;
+        }
+    }
+    let e = first.unwrap_or_else(windows::core::Error::empty);
+    Err(err("SetOutputType", e))
+}
+
 /// Hardware-or-software H.264 encoder MFT (see the module docs).
 pub struct H264Encoder {
     mft: IMFTransform,
@@ -30,6 +187,8 @@ pub struct H264Encoder {
     api: Option<ICodecAPI>,
     name: String,
     hardware: bool,
+    profile: H264Profile,
+    caps: EncoderCaps,
     pub(super) w: u32,
     pub(super) h: u32,
     fps: u32,
@@ -47,7 +206,8 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    /// An encoder for `w x h` (even) pictures at `fps`, `bitrate` bits/s.
+    /// An encoder for `w x h` (even) pictures at `fps`, `bitrate` bits/s
+    /// (CBR, High profile when the MFT takes it).
     pub fn new(
         w: u32,
         h: u32,
@@ -55,11 +215,12 @@ impl H264Encoder {
         bitrate: u32,
         pref: EncoderPref,
     ) -> Result<Self, AppError> {
-        if w < 16 || h < 16 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
-            return Err(AppError::invalid(format!(
-                "H.264 picture {w}x{h} must be even and at least 16x16"
-            )));
-        }
+        Self::with_params(&EncodeParams::new(w, h, fps, bitrate), pref)
+    }
+
+    /// [`new`](Self::new) with explicit [`EncodeParams`].
+    pub(super) fn with_params(p: &EncodeParams, pref: EncoderPref) -> Result<Self, AppError> {
+        check_size(p.w, p.h)?;
         startup()?;
         let mut why = Vec::new();
         // SAFETY: COM/MF calls on activation objects and transforms this
@@ -74,10 +235,7 @@ impl H264Encoder {
                             Some(a.clone()),
                             format!("{name} (hw)"),
                             true,
-                            w,
-                            h,
-                            fps,
-                            bitrate,
+                            p,
                             None,
                         ) {
                             Ok(e) => return Ok(e),
@@ -102,10 +260,7 @@ impl H264Encoder {
                     None,
                     "Microsoft H.264 Encoder MFT (sw)".into(),
                     false,
-                    w,
-                    h,
-                    fps,
-                    bitrate,
+                    p,
                     None,
                 )
                 .map_err(|e| AppError::platform(format!("{e} (hardware: {})", why.join("; "))));
@@ -114,18 +269,17 @@ impl H264Encoder {
         Err(AppError::platform(why.join("; ")))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn configure(
         mft: IMFTransform,
         activate: Option<IMFActivate>,
         name: String,
         hardware: bool,
-        w: u32,
-        h: u32,
-        fps: u32,
-        bitrate: u32,
+        p: &EncodeParams,
         d3d: Option<&IMFDXGIDeviceManager>,
     ) -> Result<Self, AppError> {
+        let &EncodeParams {
+            w, h, fps, bitrate, ..
+        } = p;
         // SAFETY: COM/MF calls on the transform passed in (owned here) and on
         // objects created from it; `d3d` is a live manager the MFT AddRefs.
         unsafe {
@@ -150,31 +304,32 @@ impl H264Encoder {
                     let _ = api.SetValue(g, &v);
                 };
                 set(&CODECAPI_AVLowLatencyMode, VARIANT::from(true));
-                set(
-                    &CODECAPI_AVEncCommonRateControlMode,
-                    VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
-                );
-                set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
-                // VBV of about one frame of bits + a peak cap, so a
-                // single frame (an IDR, a burst of motion) cannot queue several
-                // frame times of data in front of the next one.
-                set(
-                    &CODECAPI_AVEncCommonBufferSize,
-                    VARIANT::from(vbv_bits(bitrate, fps)),
-                );
-                set(&CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(bitrate));
+                if let Some(qp) = p.qp {
+                    set(
+                        &CODECAPI_AVEncCommonRateControlMode,
+                        VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32),
+                    );
+                    set(&CODECAPI_AVEncVideoEncodeQP, VARIANT::from(u64::from(qp)));
+                } else {
+                    set(
+                        &CODECAPI_AVEncCommonRateControlMode,
+                        VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
+                    );
+                    set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
+                    // VBV of about one frame of bits + a peak cap, so a
+                    // single frame (an IDR, a burst of motion) cannot queue
+                    // several frame times of data in front of the next one.
+                    set(
+                        &CODECAPI_AVEncCommonBufferSize,
+                        VARIANT::from(vbv_bits(bitrate, fps)),
+                    );
+                    set(&CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(bitrate));
+                }
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 // Long GOP (an IDR every ~60 s as a safety net); IDRs on demand.
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps.max(1) * 60));
             }
-            let out =
-                video_type(&MFVideoFormat_H264, w, h, fps).map_err(|e| err("output type", e))?;
-            out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)
-                .map_err(|e| err("bitrate", e))?;
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
-                .map_err(|e| err("profile", e))?;
-            mft.SetOutputType(0, &out, 0)
-                .map_err(|e| err("SetOutputType", e))?;
+            let profile = set_output_type(&mft, p)?;
             let inp =
                 video_type(&MFVideoFormat_NV12, w, h, fps).map_err(|e| err("input type", e))?;
             let _ = inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, w);
@@ -214,6 +369,8 @@ impl H264Encoder {
             let out_info = mft
                 .GetOutputStreamInfo(0)
                 .map_err(|e| err("output stream info", e))?;
+            let caps = EncoderCaps::probe(api.as_ref());
+            tracing::debug!(encoder = %name, ?profile, ?caps, "H.264 encoder created");
             Ok(Self {
                 mft,
                 activate,
@@ -221,6 +378,8 @@ impl H264Encoder {
                 api,
                 name,
                 hardware,
+                profile,
+                caps,
                 w,
                 h,
                 fps: fps.max(1),
@@ -239,6 +398,16 @@ impl H264Encoder {
     /// Whether this is a hardware MFT.
     pub fn is_hardware(&self) -> bool {
         self.hardware
+    }
+
+    /// The H.264 profile in effect (High unless the MFT refused it).
+    pub fn profile(&self) -> H264Profile {
+        self.profile
+    }
+
+    /// Optional features of this MFT (LTR, intra refresh, ...).
+    pub fn caps(&self) -> EncoderCaps {
+        self.caps
     }
 
     /// The picture size `(w, h)` the encoder was created for.

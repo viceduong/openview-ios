@@ -16,6 +16,7 @@ below comes from `crates/ovview/`. Paths are relative to the repository root.
 | `crates/ovview/src/session/input.rs` | Local input → remote commands (input v2 or legacy), stdin lines as `TYPE` |
 | `crates/ovview/src/session/keys.rs` | Local hotkeys (F1–F8, H, M), recording toggle |
 | `crates/ovview/src/session/stats.rs` | End-of-session summary, `wave2:` and `metrics:` lines |
+| `crates/ovview/src/session/probe.rs` | `--latency-probe N`: timed presses against `ovhost --latency-probe` |
 | `crates/ovview/src/window/mod.rs` | `RenderWindow`: a plain Win32 window through the `windows` crate, frame / cursor / HUD state |
 | `crates/ovview/src/window/wndproc.rs` | Window class and creation, message pump, the `WndProc` that paints and queues input |
 | `crates/ovview/src/window/paint.rs` | `WM_PAINT`: Direct2D, or the GDI `StretchDIBits` fallback (CPU-scaled downscale, `SRCCOPY`) |
@@ -134,7 +135,8 @@ After the handshake:
 7. Creates the render window (`open_window` → `RenderWindow::new`) unless
    `--no-window` is set (then no window exists at all). If creation fails, the
    viewer warns and continues headless. The renderer is chosen by
-   `--renderer d2d|gdi`.
+   `--renderer d2d|gdi` (`RendererPref::Direct2D { vsync }`, `vsync` from
+   `--vsync`).
 8. Starts the speaker thread. It always runs, so F2 can enable playback later.
    It also starts the mic thread if `--mic` or `--audio-synth` was given.
 9. Installs the command hook (`session/hooks.rs`). The hook handles `MONITORS_INFO`, `AUDIO` (with
@@ -152,13 +154,17 @@ Each loop turn does the following, in order:
 6. Poll the clipboard.
 7. Save received files to `Downloads\OpenView` (§6).
 8. Present the **latest** complete frame. Intermediate frames are skipped, so
-   a slow paint never falls behind.
+   a slow paint never falls behind. The next turn's message pump paints it;
+   once no vsync-refused present is pending, the loop stamps it presented for
+   the latency telemetry (`TerminalSession::note_presented`; headless runs
+   stamp at decode).
 9. Update the HUD.
 10. Check the exit conditions.
 11. Block in `Wakeup::wait_or_message`, which wakes on socket data, a window
     message, a mic tick or a deadline. The deadline is capped at
     `IDLE_WAIT` = 50 ms, or `UNWATCHED_WAIT` = 2 ms if the socket cannot be
-    watched, and at 4 ms while a vsync-refused present is pending.
+    watched, and at 4 ms while a refused (one frame in flight) present is
+    pending.
 
 **Liveness**: the peer is "dead" after `DEAD_AFTER` = 15 s with no inbound
 traffic. The frame is then no longer updated and the HUD shows a banner. After
@@ -169,6 +175,9 @@ traffic. The frame is then no longer updated and the HUD shows a banner. After
 * the window is closed;
 * Ctrl-C;
 * the hidden `--duration <secs>` elapses;
+* the hidden `--latency-probe N` finished its N presses (it logs `latency
+  probe: input-to-photon p50 … p95 … p99 …`, see `session/probe.rs` and
+  [USAGE.md](../USAGE.md#211-benchmarks-where-the-latency-goes));
 * the peer is silent for 30 s;
 * a transport error.
 
@@ -181,7 +190,9 @@ and emits a `peer_disconnected` status event:
 * a `wave2:` line (lossy tiles on screen, tile-cache slots);
 * an `H.264:` line (units, decode time, capture-to-paint latency);
 * a single `metrics:` line that benchmarks parse: video latency
-  p50/p95/p99, stalls, RTT p50/p95, audio gaps, receive Mbps, media summary;
+  p50/p95/p99, stalls, RTT p50/p95, audio gaps, receive Mbps, media summary,
+  and (last) the per-stage latency `lat_ms p50/p95 cap … enc … send … net …
+  dec … pres … total … p99 … n …` (`LatencyTracker::session_summary`);
 * audio receive and playback statistics.
 
 ---
@@ -202,7 +213,7 @@ and emits a `peer_disconnected` status event:
 
 | `RendererPref` | How |
 |---|---|
-| `Direct2D` (default) | A D3D11 device (hardware, then WARP) with a flip-model DXGI swap chain. The frame is drawn with `D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC`. The remote cursor is a separate premultiplied layer, not baked into the frame. The HUD is drawn with DirectWrite. `Present(1, DXGI_PRESENT_DO_NOT_WAIT)`: a refused present is retried on the next loop turn (`repaint_pending`). **Any failure** (no device, device removed) switches the window to GDI permanently. |
+| `Direct2D` (default) | A D3D11 device (hardware, then WARP) with a flip-model DXGI swap chain. The frame is drawn with `D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC`. The remote cursor is a separate premultiplied layer, not baked into the frame. The HUD is drawn with DirectWrite. `SetMaximumFrameLatency(1)`. Present mode (`PresentMode`): by default `Present(0, DO_NOT_WAIT \| ALLOW_TEARING)` on a swap chain created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` when `DXGI_FEATURE_PRESENT_ALLOW_TEARING` is supported (else `Present(0, DO_NOT_WAIT)`); `--vsync` uses `Present(1, DO_NOT_WAIT)`. A refused present is retried on the next loop turn (`repaint_pending`). **Any failure** (no device, device removed) switches the window to GDI permanently. |
 | `Gdi` | `StretchDIBits` with `SRCCOPY` (`window/paint.rs`; the unit test `gdi_blit_copies_pixels` checks the blit really copies pixels). A real downscale first goes through the CPU scaler `ovapp::scale` (area + sharpen 0.5) and is then blitted 1:1. Other cases use `COLORONCOLOR`, or `HALFTONE` for a strong downscale. On this path the cursor is composited into a cached copy of the frame: a cursor move restores only the old cursor rect and blends the new one (`window/cursor.rs`). The HUD is drawn with `TextOutW` (`window/overlay.rs`). |
 
 The active renderer is logged as `renderer: <name>`. `ovgui` decides that a
@@ -213,7 +224,10 @@ reports the `error` event's message when the viewer exits before that.
 
 The HUD has six lines, toggled with **H** or **F3**:
 
-* `RTT <ms>`
+* `RTT <ms>`, followed once a `CAP_TIMING` host's first update was
+  measured by the per-stage latency medians, e.g. `RTT 12 ms  ·  cap 3.0 ·
+  enc 4.0 · send 0.2 · net 12 · dec 2.0 · pres 8.0 = 29 ms` (refreshed every
+  500 ms; see [ovapp.md](ovapp.md) §6.1)
 * `FPS <n>`
 * `RES <w>x<h>`
 * `BW <MB/s>`

@@ -447,7 +447,12 @@ The "video unit" is `VideoHeader (38 B, ovapp::video) ‖ Annex-B access unit`. 
 - Shard size `S = ceil(len / k)`, rounded up to even. The last data shard is zero-padded.
 - `m = max(1, ceil(k × ratio))` Reed-Solomon recovery shards (`reed-solomon-simd`, GF(2^16)). Recovery shard *i* gets index `k + i`.
 - The unit may be at most `MAX_UNIT` = 4 MiB.
-- `fec_ratio(loss) = clamp(0.10 + 4 × loss, 0.10, 0.30)` (`FEC_MIN` / `FEC_MAX`). The loss value is the controller's measured loss rate.
+- `fec_ratio(loss) = clamp(0.10 + 4 × loss, 0.10, 0.30)` (`FEC_MIN` / `FEC_MAX`). The loss value is the controller's measured loss rate (1 s window).
+- The ratio a frame gets is `adaptive_fec_ratio`, driven per frame by the sender's `FecController` (clean-since timer, smoothed send interval):
+  - loss > `LOSS_CLEAN` (0.2 %): `fec_ratio(loss)`, at once, and the clean timer restarts;
+  - clean for `FEC_CLEAN_HOLD` (3 s) **and** srtt < frame interval (a NACK round trip fits, the receiver's own NACK rule): `FEC_FLOOR` = 2 % for delta frames — `m` is still at least 1, so this only trims large frames (a 100 KB frame: 9 -> 2 recovery shards);
+  - otherwise (keyframes, RTT unknown or too long, not yet settled): `FEC_MIN`.
+- `DirectEngine::fec_ratio()` / `MediaStats::fec_ratio` report the ratio of the last frame sent.
 
 `parse_shard` checks that k = ceil(unit_len / `MAX_SHARD`) (exactly what `fec_encode` derives), k ≤ `MAX_DATA_SHARDS` (= ceil(`MAX_UNIT` / `MAX_SHARD`) = 3693), 1 ≤ m ≤ k, idx < k + m, S is even and ≤ 1136, `(k−1)·S < unit_len ≤ k·S`, and unit_len ≤ 4 MiB. A peer therefore cannot make the receiver allocate slots for 65 535 + 65 535 shards per frame.
 
@@ -587,7 +592,7 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `KEEPALIVE`, `DEAD_AFTER`, `DEAD_AFTER_RELAYLESS`, `PRIMARY_KEEPALIVE`, `REBIND_AFTER`, `REBIND_INTERVAL` | 250 ms, 3 s, 15 s, 5 s, 1 s, 500 ms | `direct/mod.rs` |
 | `DACK_INTERVAL`, `DACK_EVERY`, `REPLAY_LIMIT`, `PENDING_LIMIT` | 50 ms, 64, 64 MiB, 65 536 | `direct/mod.rs` |
 | `MAX_PATHS` / `GOVERNED_CWND_FLOOR` | 256 / 256 | `direct/carrier.rs` / `direct/link.rs` |
-| `MAX_SHARD`, `MAX_UNIT`, `MAX_DATA_SHARDS`, `REPLAY_WINDOW`, `FEC_MIN`/`FEC_MAX`, `REORDER_GRACE`, `FRAME_TIMEOUT`, `MAX_FRAMES`, `MAX_BUFFERED` | 1136, 4 MiB, 3693, 4096, 0.10/0.30, 4 ms, 150 ms, 96, 16 MiB | `media/mod.rs` |
+| `MAX_SHARD`, `MAX_UNIT`, `MAX_DATA_SHARDS`, `REPLAY_WINDOW`, `FEC_MIN`/`FEC_MAX`, `FEC_FLOOR`, `LOSS_CLEAN`, `FEC_CLEAN_HOLD`, `REORDER_GRACE`, `FRAME_TIMEOUT`, `MAX_FRAMES`, `MAX_BUFFERED` | 1136, 4 MiB, 3693, 4096, 0.10/0.30, 0.02, 0.002, 3 s, 4 ms, 150 ms, 96, 16 MiB | `media/mod.rs` |
 | `FEEDBACK_INTERVAL`, `FEEDBACK_UNIT_US`, `FEEDBACK_MAX`, `PACING_GAIN`, `START_RATE`, `MIN_RATE`, `MAX_RATE`, `LOSS_HIGH`, `TREND_WINDOW` | 25 ms, 50 µs, 500, 1.5, 6 Mbps, 2 Mbps, 200 Mbps, 10 %, 20 | `cc/mod.rs` |
 
 ## 12. Error handling
@@ -622,8 +627,8 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `rudp/tests.rs` | lossless in-order with no retransmits; 5/10/30 % loss with reordering stays in order and exact; datagrams stay within the MTU budget; raw mode is byte-identical and switches on framed input; framed records wait for raw records sent before the switch; `WouldBlock` keeps packets queued |
 | `ws.rs` | RFC 6455 accept-key example, SHA-1 vectors, 7/16/64-bit length encodings, unmasking at any offset and split, deframer round trips for any split, bad frames rejected |
 | `relay/ws_client.rs` | upgrade-response validation, loopback pair connected, pump bridges a scripted server |
-| `direct/tests.rs` | probe round trip and tamper, marker vs record header, key asymmetry, unarmed pass-through, promote-then-demote keeps order both ways (direct socket killed mid-session), media frames survive 3 % random loss (FEC, NACK, audio gaps, feedback, records alongside), NAT rebinding moves the link (relay gone), relay-less stall survives up to 15 s, media replay and forgery rejected, media over loopback sockets, foreign probe rejected, unacked records replayed on demotion |
-| `media/tests.rs` | directional, domain-separated keys; seal/open/tamper; replay window; FEC recovery in order; NACK on short RTT vs loss on long RTT; wholly lost frame detected from the next frame; paused stream is not a loss; audio gaps and late packets; malformed shards (including inconsistent k / m); incomplete frames bounded in memory |
+| `direct/tests.rs` | probe round trip and tamper, marker vs record header, key asymmetry, unarmed pass-through, promote-then-demote keeps order both ways (direct socket killed mid-session), media frames survive 3 % and 1 % random loss (FEC, NACK, audio gaps, feedback, records alongside), adaptive FEC drops to the floor on a clean link and ramps back up when 3 % loss starts (no frame lost), NAT rebinding moves the link (relay gone), relay-less stall survives up to 15 s, media replay and forgery rejected, media over loopback sockets, foreign probe rejected, unacked records replayed on demotion |
+| `media/tests.rs` | directional, domain-separated keys; seal/open/tamper; replay window; FEC recovery in order; NACK on short RTT vs loss on long RTT; wholly lost frame detected from the next frame; paused stream is not a loss; audio gaps and late packets; malformed shards (including inconsistent k / m); incomplete frames bounded in memory; adaptive FEC decision table and controller (hold, instant ramp-up, determinism, frame interval vs RTT) |
 | `cc/tests.rs` | converges near a 20 Mbps capacity with a short queue; 1/3/5 % random loss does not collapse the rate; paced video bursts do not halve the estimate; idle Wi-Fi jitter does not collapse the estimate (a 300 KB burst after 60 s idle in < 400 ms); 25 % loss backs off; feedback round trip with holes; pacer spreading and lane priority |
 
 ### Integration tests (`tests/`)

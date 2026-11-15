@@ -654,7 +654,7 @@ fn reassembles_frames_over_inmemory() {
     }
 }
 
-fn inmem_pair() -> (TerminalSession, TerminalSession) {
+pub(super) fn inmem_pair() -> (TerminalSession, TerminalSession) {
     let (id_a, id_b) = (
         ovcore::identity::Identity::generate(),
         ovcore::identity::Identity::generate(),

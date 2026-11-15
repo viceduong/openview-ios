@@ -25,6 +25,7 @@ const SOURCE: &str = concat!(
     include_str!("../screen/mod.rs"),
     include_str!("../screen/feed.rs"),
     include_str!("../screen/framebuffer.rs"),
+    include_str!("../screen/latency.rs"),
     include_str!("../screen/liveness.rs"),
     include_str!("../screen/sinks.rs"),
     include_str!("../screen/video.rs"),
@@ -163,6 +164,37 @@ fn video_packet_layout_matches() {
         c_fields, rust_fields,
         "ov_video_packet / OvVideoPacket field order differs"
     );
+}
+
+#[test]
+fn latency_stats_layout_matches() {
+    let header = strip_comments(HEADER);
+    let c_field = |l: &str| {
+        let l = l.strip_suffix(';')?;
+        Some(ident_before(l, l.len()).to_owned())
+    };
+    let rust_field = |l: &str| {
+        let l = l.strip_prefix("pub ")?;
+        Some(l.split(':').next()?.trim().to_owned())
+    };
+    for (c, rust) in [
+        (
+            "typedef struct ov_latency_stage {",
+            "pub struct OvLatencyStage {",
+        ),
+        (
+            "typedef struct ov_latency_stats {",
+            "pub struct OvLatencyStats {",
+        ),
+    ] {
+        assert_eq!(
+            fields_after(&header, c, c_field),
+            fields_after(SOURCE, rust, rust_field),
+            "{c} field order differs from {rust}"
+        );
+    }
+    assert_eq!(std::mem::size_of::<crate::OvLatencyStage>(), 12);
+    assert_eq!(std::mem::size_of::<crate::OvLatencyStats>(), 112);
 }
 
 #[test]

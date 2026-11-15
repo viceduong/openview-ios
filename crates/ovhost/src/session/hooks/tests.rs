@@ -67,11 +67,13 @@ fn caps_and_keyframe_requests_reach_the_capture_thread() {
         view.pump().unwrap();
     }
     // Desktop builds also advertise CAP_OPUS (libopus), CAP_AUDIO10 (10 ms
-    // Opus packets decode fine) and the viewer-side lossy / tile-cache
+    // Opus packets decode fine), CAP_STEREO (libopus decodes any channel
+    // count) and the viewer-side lossy / tile-cache
     // decode bits.
     let ours = LOCAL_CAPS
         | ovapp::terminal::CAP_OPUS
         | ovapp::terminal::CAP_AUDIO10
+        | ovapp::terminal::CAP_STEREO
         | ovapp::terminal::VIEWER_W2_CAPS;
     assert_eq!(hooks.peer_caps.load(Ordering::Relaxed), ours);
     assert!(hooks.keyframe.load(Ordering::Relaxed));

@@ -40,6 +40,7 @@ use crate::{audio, clipboard_os, hud};
 mod hooks;
 mod input;
 mod keys;
+mod probe;
 mod stats;
 
 use hooks::AudioStats;
@@ -57,6 +58,10 @@ const REPAINT_RETRY_WAIT: Duration = Duration::from_millis(4);
 /// 10 ms Opus packets to us (`CAP_AUDIO10`), so a small cushion holds.
 const AUDIO_PREFILL_MS: u32 = 30;
 const AUDIO_CEILING_MS: u32 = 90;
+/// How often the HUD's per-stage latency line is recomputed.
+const HUD_LATENCY_EVERY: Duration = Duration::from_millis(500);
+/// How often the latency line is logged (debug).
+const LATENCY_LOG_EVERY: Duration = Duration::from_secs(5);
 
 /// Session settings from the command line.
 pub(crate) struct SessionOptions {
@@ -84,6 +89,9 @@ pub(crate) struct SessionOptions {
     /// `--duration`: end the session cleanly after this long — headless
     /// smoke runs get their summary lines.
     pub(crate) run_for: Option<Duration>,
+    /// `--latency-probe N`: time N key presses to the host's patch flip,
+    /// then end the session.
+    pub(crate) latency_probe: Option<u32>,
     /// `--renderer`: the window's presenter.
     pub(crate) renderer: RendererPref,
 }
@@ -105,6 +113,9 @@ pub(crate) fn viewer_loop(
     let session = hs.take_session().ok_or("no session after handshake")?;
     let mut term = TerminalSession::new(session, carrier);
     term.queue_inbound(backlog);
+    // Per-stage latency telemetry (clock probes + the host's TIMING
+    // stamps, with a CAP_TIMING host): the HUD's latency line.
+    term.set_latency_tracking(true);
     // Let the session upgrade to a direct UDP path when the host offers
     // candidates (the relay stays the fallback).
     if options.direct {
@@ -158,7 +169,8 @@ pub(crate) fn viewer_loop(
     // Speaker playback: the AUDIO hook is installed unconditionally —
     // headless sessions still need the ticks flowing into the jitter buffer
     // so enabling audio later (F2) works without the host re-sending.
-    let audio_bus = AudioBus::with_ms(AUDIO_PREFILL_MS, AUDIO_CEILING_MS);
+    // Stereo: a CAP_STEREO host sends stereo system audio; mono plays as L = R.
+    let audio_bus = AudioBus::with_ms_channels(AUDIO_PREFILL_MS, AUDIO_CEILING_MS, 2);
     let audio_stop = Arc::new(AtomicBool::new(false));
     let audio_thread = audio::spawn(audio_bus.clone(), Arc::clone(&audio_stop));
     let hotkeys = Hotkeys::new(options.audio_at_start);
@@ -209,6 +221,10 @@ pub(crate) fn viewer_loop(
         clip_sync,
         mic_rx,
         mic_enc: AudioEncoder::new(),
+        handed_over: None,
+        probe: options.latency_probe.map(probe::LatencyProbe::new),
+        hud_latency: (None, None),
+        latency_logged: None,
     };
     viewer.install_cmd_hook();
 
@@ -218,6 +234,7 @@ pub(crate) fn viewer_loop(
         if let Some(w) = &viewer.win {
             w.pump_messages();
         }
+        viewer.note_presented();
         if viewer.handle_local_input(&stdin_rx)? == input::Flow::Exit {
             return finish(viewer.term);
         }
@@ -226,6 +243,7 @@ pub(crate) fn viewer_loop(
             break reason;
         }
         viewer.send_mic_ticks()?;
+        viewer.drive_probe()?;
         viewer.sync_clipboard()?;
         while let Some(f) = viewer.term.take_xfer_file() {
             save_received_file(&f.name, &f.data);
@@ -295,6 +313,15 @@ struct Viewer {
     /// Mic ticks from the capture thread.
     mic_rx: Option<mpsc::Receiver<Vec<i16>>>,
     mic_enc: AudioEncoder,
+    /// When the last frame was handed to the window (its present is
+    /// stamped once the window painted it).
+    handed_over: Option<Instant>,
+    /// `--latency-probe`.
+    probe: Option<probe::LatencyProbe>,
+    /// The HUD's latency line and when it is next refreshed.
+    hud_latency: (Option<Instant>, Option<String>),
+    /// When the latency line is next logged (debug).
+    latency_logged: Option<Instant>,
 }
 
 impl Viewer {
@@ -412,11 +439,21 @@ impl Viewer {
             return;
         };
         if f.is_complete() {
-            self.link_stats
-                .frame_rx(Instant::now(), f.pixels.len() as u64);
+            let now = Instant::now();
+            self.link_stats.frame_rx(now, f.pixels.len() as u64);
             self.frames_presented += 1;
             self.last_dims = (f.width, f.height);
             self.recorder.append(&f);
+            if let Some(p) = &mut self.probe {
+                p.observe(&f, now);
+            }
+            if !self.peer_dead {
+                // Headless: decoded is as presented as it gets.
+                self.handed_over = Some(now);
+                if self.win.is_none() {
+                    self.note_presented();
+                }
+            }
         }
         // Hand the frame to the window by value (no pixel copy) and recycle
         // whichever buffer comes back for the next decode.
@@ -429,9 +466,81 @@ impl Viewer {
         }
     }
 
-    /// The HUD text: RTT, FPS/bandwidth, resolution, the requested quality
-    /// mode, and the monitor (or the recording indicator).
+    /// The frame handed to the window last has been painted (the window
+    /// pumped its messages and no vsync-refused present is pending): stamp
+    /// its present for the latency telemetry and the probe.
+    fn note_presented(&mut self) {
+        let Some(handed) = self.handed_over else {
+            return;
+        };
+        if self.win.as_ref().is_some_and(|w| w.repaint_pending()) {
+            return;
+        }
+        self.handed_over = None;
+        let now = Instant::now();
+        self.term.note_presented(handed, now);
+        if let Some(p) = &mut self.probe {
+            p.presented(now);
+        }
+    }
+
+    /// `--latency-probe`: press the probe key when the next press is due.
+    fn drive_probe(&mut self) -> Result<(), String> {
+        let Some(p) = &mut self.probe else {
+            return Ok(());
+        };
+        if !p.due(Instant::now()) {
+            return Ok(());
+        }
+        let vk = probe::PROBE_VK;
+        let presses: [Command; 2] = if peer_input2(&self.term) {
+            [
+                Command::KeyEx {
+                    vk,
+                    scan: 0,
+                    flags: 1,
+                },
+                Command::KeyEx {
+                    vk,
+                    scan: 0,
+                    flags: 0,
+                },
+            ]
+        } else {
+            [
+                Command::Key { vk, down: true },
+                Command::Key { vk, down: false },
+            ]
+        };
+        let sent = Instant::now();
+        for c in &presses {
+            self.term
+                .send(c)
+                .map_err(|e| format!("latency probe send failed: {e}"))?;
+        }
+        p.sent(sent);
+        Ok(())
+    }
+
+    /// The HUD text: RTT (with the per-stage latency line), FPS/bandwidth,
+    /// resolution, the requested quality mode, and the monitor (or the
+    /// recording indicator).
     fn update_hud(&mut self) {
+        // The latency line moves with every update: refresh it twice a
+        // second (each HUD change repaints the window), and log it every
+        // few seconds at debug (headless benchmarks read it there).
+        let now = Instant::now();
+        if self.hud_latency.0.is_none_or(|t| now >= t) {
+            let line = self.term.latency_snapshot().hud_line();
+            if let Some(l) = &line {
+                if self.latency_logged.is_none_or(|t| now >= t) {
+                    self.latency_logged = Some(now + LATENCY_LOG_EVERY);
+                    debug!("latency p50 ms: {l}");
+                }
+            }
+            self.hud_latency = (Some(now + HUD_LATENCY_EVERY), line);
+        }
+        let latency = self.hud_latency.1.clone();
         let Some(w) = &self.win else {
             return;
         };
@@ -445,6 +554,7 @@ impl Viewer {
             self.hotkeys.quality(),
             self.monitor_label(),
             self.recorder.hud_status(),
+            latency,
         );
         w.set_hud(lines, self.peer_dead, self.hotkeys.hud_visible);
     }
@@ -463,7 +573,10 @@ impl Viewer {
         if self.win.as_ref().is_some_and(|w| w.should_quit()) {
             return Some("window closed".into());
         }
-        let reason = if self
+        let reason = if let Some(p) = self.probe.as_ref().filter(|p| p.done()) {
+            info!("{}", p.report());
+            "latency probe finished"
+        } else if self
             .run_for
             .is_some_and(|d| self.session_start.elapsed() >= d)
         {

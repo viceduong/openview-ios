@@ -76,8 +76,10 @@ pub type FileSink =
 pub type AudioSink = extern "C" fn(user: *mut c_void, samples: *const u8, len: usize);
 
 /// Opus audio sink, fired on Opus AUDIO commands: `packet` points
-/// to `len` bytes of ONE Opus packet (48 kHz mono, normally 20 ms) that
-/// decodes to `samples` samples; valid only for the duration of the
+/// to `len` bytes of ONE Opus packet (48 kHz, 10 or 20 ms; mono, or stereo
+/// after [`ov_screen_set_opus_stereo`](crate::ov_screen_set_opus_stereo) —
+/// the TOC byte's `s` bit says which) that decodes to `samples` samples per
+/// channel; valid only for the duration of the
 /// callback (copy it out). Rust does not decode Opus (the staticlib stays
 /// pure Rust) — the shell feeds the packet to its native decoder.
 ///

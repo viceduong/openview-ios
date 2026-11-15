@@ -60,6 +60,10 @@ pub(crate) struct Grab<'a> {
     /// verifies). `None` from GDI / the test pattern.
     pub(crate) moves: Option<&'a [ovapp::bands::MoveRect]>,
     pub(crate) backend: Backend,
+    /// How long before the grab the image was presented (DXGI
+    /// `LastPresentTime`; `None` when unknown) — the capture timestamp of
+    /// the latency telemetry.
+    pub(crate) present_age: Option<Duration>,
 }
 
 pub(crate) struct ScreenSource {
@@ -118,7 +122,11 @@ pub(crate) struct TestPattern {
     rect: TileRect,
     start: Instant,
     t: u32,
-    hint: [TileRect; 1],
+    /// Dirty-rect hints: `[0]` the pattern's own change, `[1]` the
+    /// latency-probe patch.
+    hint: [TileRect; 2],
+    /// Probe flips the patch last showed (`None`: not drawn yet).
+    probe_drawn: Option<u64>,
     /// Photo pattern: the screens it cycles through, and which one
     /// is shown.
     screens: Vec<Vec<u8>>,
@@ -167,7 +175,8 @@ impl TestPattern {
             rect,
             start: Instant::now(),
             t: 0,
-            hint: [rect],
+            hint: [rect, TileRect::default()],
+            probe_drawn: None,
             screens,
             shown: 0,
         }
@@ -189,13 +198,15 @@ impl TestPattern {
                 w: self.w as u16,
                 h: self.h as u16,
             };
+            let patched = self.patch();
             return Grab {
                 px: &self.px,
                 w: self.w,
                 h: self.h,
-                hints: Some(if switched { &self.hint[..] } else { &[] }),
+                hints: Some(Self::hints(&self.hint, switched, patched)),
                 moves: None,
                 backend: Backend::Pattern,
+                present_age: None,
             };
         }
         let cycle = Self::MOVE + Self::REST;
@@ -214,13 +225,42 @@ impl TestPattern {
                 PatternKind::Photo => {}
             }
         }
+        let patched = self.patch();
         Grab {
             px: &self.px,
             w: self.w,
             h: self.h,
-            hints: Some(if moving { &self.hint[..] } else { &[] }),
+            hints: Some(Self::hints(&self.hint, moving, patched)),
             moves: None,
             backend: Backend::Pattern,
+            present_age: None,
+        }
+    }
+
+    /// `--latency-probe`: draw the patch over the image (the pattern may
+    /// have painted over it); `true` when its colour changed.
+    fn patch(&mut self) -> bool {
+        if !crate::probe::enabled() {
+            return false;
+        }
+        let flips = crate::probe::flips();
+        let (pw, ph) = crate::probe::draw(&mut self.px, self.w, self.h);
+        self.hint[1] = TileRect {
+            x: 0,
+            y: 0,
+            w: pw as u16,
+            h: ph as u16,
+        };
+        self.probe_drawn.replace(flips) != Some(flips)
+    }
+
+    /// The hints for a grab: the pattern's change and/or the patch.
+    fn hints(hint: &[TileRect; 2], changed: bool, patched: bool) -> &[TileRect] {
+        match (changed, patched) {
+            (true, true) => &hint[..],
+            (true, false) => &hint[..1],
+            (false, true) => &hint[1..],
+            (false, false) => &[],
         }
     }
 }
@@ -474,6 +514,7 @@ impl ScreenSource {
                     hints,
                     moves: d.moves(),
                     backend: Backend::Dxgi,
+                    present_age: self.latency,
                 });
             }
         }
@@ -486,6 +527,7 @@ impl ScreenSource {
             hints: None,
             moves: None,
             backend: Backend::Gdi,
+            present_age: None,
         })
     }
 

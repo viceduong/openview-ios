@@ -101,6 +101,10 @@ pub enum OpCode {
     /// receiver ends the session at once instead of waiting for its
     /// liveness timeout.
     Bye = 0x64,
+    /// Per-update host timestamps ([`CAP_TIMING`](super::CAP_TIMING),
+    /// host->viewer): a 29-byte [`crate::latency::FrameTiming`], sent right
+    /// before the update it describes.
+    Timing = 0x65,
 }
 
 impl OpCode {
@@ -144,6 +148,7 @@ impl OpCode {
             0x27 => Self::VideoUnit,
             0x63 => Self::MediaGap,
             0x64 => Self::Bye,
+            0x65 => Self::Timing,
             _ => return None,
         })
     }
@@ -347,6 +352,18 @@ pub enum Command {
     Ping(u64),
     /// PONG nonce.
     Pong(u64),
+    /// Timed PONG ([`CAP_TIMING`](super::CAP_TIMING)): opcode PONG with a
+    /// 24-byte payload — the echoed nonce plus when the PING arrived
+    /// (`rx_us`) and the PONG left (`tx_us`) on the replier's monotonic µs
+    /// clock, for the NTP-style clock offset ([`crate::latency::ClockProbe`]).
+    PongTimed {
+        /// The echoed PING nonce.
+        nonce: u64,
+        /// PING receive time, replier clock (µs).
+        rx_us: u64,
+        /// PONG send time, replier clock (µs).
+        tx_us: u64,
+    },
     /// FRAME_BEGIN: frame geometry + sequence + declared pixel-byte total.
     FrameBegin {
         /// Frame sequence number.
@@ -589,6 +606,9 @@ pub enum Command {
     /// receiving [`TerminalSession`](super::TerminalSession) reports its
     /// pump as closed once the batch carrying it was dispatched.
     Bye,
+    /// TIMING ([`CAP_TIMING`](super::CAP_TIMING), host->viewer): the host
+    /// stamps of the update that follows.
+    Timing(crate::latency::FrameTiming),
 }
 
 /// One entry of a [`Command::MonitorsInfo`] payload.

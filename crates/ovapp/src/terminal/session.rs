@@ -145,6 +145,14 @@ pub struct TerminalSession {
     /// Media channel receive counters (video units, video frames
     /// lost, audio packets, audio packets lost).
     pub(super) media_rx: (u64, u64, u64, u64),
+    /// Clock-offset measurement over PING / timed PONG
+    /// ([`CAP_TIMING`](super::CAP_TIMING)).
+    pub(super) clock: crate::latency::ClockProbe,
+    /// Per-update latency join (viewer side).
+    pub(super) latency: crate::latency::LatencyTracker,
+    /// Send clock-probe PINGs and track update latency (the viewer turns
+    /// it on, see [`set_latency_tracking`](Self::set_latency_tracking)).
+    pub(super) latency_on: bool,
 }
 
 /// Viewer-side H.264 counters.
@@ -243,6 +251,9 @@ impl TerminalSession {
             video_latencies: Vec::new(),
             last_paint: None,
             media_rx: (0, 0, 0, 0),
+            clock: crate::latency::ClockProbe::new(),
+            latency: crate::latency::LatencyTracker::new(),
+            latency_on: false,
         }
     }
 
@@ -307,9 +318,63 @@ impl TerminalSession {
             return Err(TransportError::FrameTooLarge(wire.len() + RECORD_OVERHEAD));
         }
         let record = self.session.encrypt_record(CHANNEL, &wire);
+        if let Command::Ping(nonce) = cmd {
+            // t1 of a possible clock sample (any PING the peer answers
+            // with a timed PONG).
+            self.clock.note_ping(*nonce, ovcore::clocksync::mono_us());
+        }
         self.carrier.send(&record)?;
         self.stats.cmds_tx += 1;
         Ok(())
+    }
+
+    /// Both peers advertised [`CAP_TIMING`](super::CAP_TIMING): PINGs get
+    /// timed PONGs and a host stamps its updates with TIMING records.
+    pub fn timing_enabled(&self) -> bool {
+        self.local_caps & super::CAP_TIMING != 0
+            && self.peer_caps.is_some_and(|c| c & super::CAP_TIMING != 0)
+    }
+
+    /// Viewer side: send clock-probe PINGs (with [`timing_enabled`](Self::timing_enabled))
+    /// and join the host's TIMING stamps with reassembly / decode / present
+    /// times ([`latency_snapshot`](Self::latency_snapshot)). Off by default
+    /// (a host leaves it off).
+    pub fn set_latency_tracking(&mut self, on: bool) {
+        self.latency_on = on;
+    }
+
+    /// The clock-offset estimate (peer clock − local clock).
+    pub fn clock(&self) -> &ovcore::clocksync::ClockSync {
+        self.clock.sync()
+    }
+
+    /// The per-update latency tracker (session-long percentiles).
+    pub fn latency(&self) -> &crate::latency::LatencyTracker {
+        &self.latency
+    }
+
+    /// Rolling per-stage latency percentiles.
+    pub fn latency_snapshot(&mut self) -> crate::latency::LatencySnapshot {
+        self.latency.snapshot(Some(self.clock.sync()))
+    }
+
+    /// The shell presented a picture that drew everything decoded up to
+    /// `drawn_before`; it reached the screen at `presented_at`. Returns the
+    /// updates measured.
+    pub fn note_presented(&mut self, drawn_before: Instant, presented_at: Instant) -> usize {
+        self.latency
+            .on_presented(drawn_before, presented_at, Some(self.clock.sync()))
+    }
+
+    /// Send a clock-probe PING when one is due (latency tracking on, both
+    /// peers timing-capable).
+    pub(super) fn clock_probe_tick(&mut self, now: Instant) {
+        if !self.latency_on || !self.timing_enabled() {
+            return;
+        }
+        if let Some(nonce) = self.clock.due(now) {
+            let _ = self.send(&Command::Ping(nonce));
+        }
     }
 
     /// Block up to `timeout`, pumping until `f` returns a value (pump-driven

@@ -80,14 +80,12 @@ impl DirectEngine {
             .flatten()
     }
 
-    /// The FEC ratio the next video frame gets.
+    /// The FEC ratio the last video frame got (see
+    /// [`media::adaptive_fec_ratio`]; [`media::FEC_MIN`] before any).
     pub fn fec_ratio(&self) -> f64 {
-        media::fec_ratio(
-            self.link
-                .as_ref()
-                .and_then(|l| l.cc.as_ref())
-                .map_or(0.0, |c| c.gcc.loss()),
-        )
+        self.media
+            .as_ref()
+            .map_or(media::FEC_MIN, |m| m.fec.ratio())
     }
 
     /// Media counters (`None` = media not enabled).
@@ -127,13 +125,15 @@ impl DirectEngine {
         if !self.media_ready() {
             return false;
         }
-        let ratio = self.fec_ratio();
         let (Some(link), Some(ms)) = (self.link.as_mut(), self.media.as_mut()) else {
             return false;
         };
         let Some(cc) = link.cc.as_mut() else {
             return false;
         };
+        let ratio = ms
+            .fec
+            .next_ratio(now, cc.gcc.loss(), link.rudp.srtt(), keyframe);
         let id = ms.next_frame;
         let Ok(msgs) = media::fec_encode(unit, id, keyframe, ratio) else {
             return false;

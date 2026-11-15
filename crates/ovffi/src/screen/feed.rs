@@ -147,6 +147,7 @@ pub unsafe extern "C" fn ov_screen_feed(s: *mut OvScreen, data: *const u8, len: 
                     screen.desync();
                     return -1;
                 }
+                screen.latency_delivered(ovapp::latency::KIND_SCREEN, seq, now);
                 if let (Some(f), Some(fb)) = (screen.sink.f, screen.dec.frame()) {
                     f(
                         screen.sink.user,
@@ -170,16 +171,28 @@ pub unsafe extern "C" fn ov_screen_feed(s: *mut OvScreen, data: *const u8, len: 
             // PONG closes the in-flight PING and measures the RTT; a PING is
             // answered by the shell via [`ov_screen_take_pong_reply`]. Frames
             // feed the FPS/bandwidth stats.
+            ovapp::terminal::Command::PongTimed {
+                nonce,
+                rx_us,
+                tx_us,
+            } => {
+                screen.live.record_inbound(now);
+                screen.clock_pong(nonce, rx_us, tx_us);
+                if !OvScreen::is_probe_echo(nonce) {
+                    screen.keepalive_pong(nonce);
+                }
+            }
+            // The host's stamps of the update that follows (CAP_TIMING).
+            ovapp::terminal::Command::Timing(t) => {
+                screen.live.record_inbound(now);
+                screen.latency.on_timing(t);
+            }
+            ovapp::terminal::Command::Pong(seq) if OvScreen::is_probe_echo(seq) => {
+                screen.live.record_inbound(now);
+            }
             ovapp::terminal::Command::Pong(seq) => {
                 screen.live.record_inbound(now);
-                // RTT is measured against the real send instant (feed has no
-                // shell clock); the shell ms only paces the keepalive.
-                if let Some(sent_at) = screen.ping_sent_real.take() {
-                    let rtt = std::time::Instant::now().saturating_duration_since(sent_at);
-                    if screen.keepalive.on_pong(seq, sent_at + rtt).is_some() {
-                        screen.last_rtt_ms = rtt.as_millis().min(i32::MAX as u128) as i32;
-                    }
-                }
+                screen.keepalive_pong(seq);
             }
             ovapp::terminal::Command::Ping(nonce) => {
                 screen.live.record_inbound(now);

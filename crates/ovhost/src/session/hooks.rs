@@ -201,6 +201,7 @@ impl HostHooks {
                 | Command::ReleaseAll
                 | Command::Sas => {
                     log_input(cmd);
+                    crate::probe::on_input(cmd);
                     if let Some(slot) = &input {
                         if let Ok(mut ctl) = slot.lock() {
                             if ctl.handle(cmd, Instant::now()) == Some(false) {
@@ -218,6 +219,9 @@ impl HostHooks {
                 }
                 Command::Echo(p) => trace!("echo {} bytes", p.len()),
                 Command::Ping(_) => {} // auto-replied by the pump
+                // The pump hands timed PONGs on as plain PONGs and keeps
+                // TIMING (viewer-bound anyway) to itself.
+                Command::PongTimed { .. } | Command::Timing(_) => {}
                 Command::Pong(n) => {
                     // Hand the echo to the session loop's keepalive so it can
                     // measure RTT.

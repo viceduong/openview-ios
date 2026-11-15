@@ -2,9 +2,11 @@
 //! (loopback) or a synthetic tone.
 //!
 //! The host reads the source in 20 ms ticks ([`ovapp::audio::
-//! TICK_SAMPLES`] at 48 kHz mono s16le) on its own thread
+//! TICK_SAMPLES`] at 48 kHz mono s16le; the system-audio loopback in 10 ms
+//! interleaved stereo ticks) on its own thread
 //! ([`ovapp::audio::run_mic_loop`]) and hands each tick to the session
-//! thread, which encodes it (Opus for a viewer with `CAP_OPUS`, raw PCM
+//! thread, which encodes it (Opus for a viewer with `CAP_OPUS` — stereo
+//! for a `CAP_STEREO` one when the source is stereo — raw mono PCM
 //! otherwise) into an `AUDIO` command.
 //!
 //! The capture code is shared with `ovview` in [`ovapp::winaudio`] /
@@ -36,6 +38,17 @@ pub(crate) enum MicKind {
     /// What the host's speakers play (WASAPI loopback of the default render
     /// device, 10 ms ticks).
     System,
+}
+
+impl MicKind {
+    /// Interleaved channels the source delivers: the loopback is stereo
+    /// (sent as stereo Opus to a `CAP_STEREO` viewer), the mics are mono.
+    pub(crate) fn channels(self) -> usize {
+        match self {
+            Self::System => 2,
+            Self::Real | Self::Synth => 1,
+        }
+    }
 }
 
 /// Open the source on its own thread and stream its PCM ticks (one per
@@ -123,5 +136,13 @@ mod tests {
         assert!(buf.iter().all(|&s| s.abs() <= 8_000));
         assert!(buf.iter().any(|&s| s != 0));
         assert!(!mic.self_paced(), "the synthetic mic is clock-paced");
+    }
+
+    #[test]
+    fn only_system_audio_is_stereo() {
+        assert_eq!(MicKind::System.channels(), 2);
+        assert_eq!(MicKind::Real.channels(), 1);
+        assert_eq!(MicKind::Synth.channels(), 1);
+        assert_eq!(SynthMic::new().channels(), 1);
     }
 }

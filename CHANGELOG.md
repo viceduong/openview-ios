@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Stereo system audio. With `--system-audio` the host captures the
+  loopback in stereo (surround folded down) and sends 2-channel Opus
+  (128 kbit/s, 10 ms frames, in-band FEC) to viewers that advertise the new
+  `CAP_STEREO` (bit 18): the Windows viewer (stereo `waveOut`) and the iOS
+  app (when AVAudioConverter decodes stereo Opus). Older viewers and the mic
+  paths keep the mono stream. Below a 1 Mbit/s link rate the stream drops to
+  mono at 64 kbit/s, and stereo returns after 5 s at 1.5 Mbit/s or more.
+- Per-stage latency telemetry (`CAP_TIMING`, bit 17). The host stamps every
+  screen update and H.264 unit (capture, encode, first byte sent) in a small
+  TIMING record and answers PINGs with timed PONGs; the viewer measures the
+  clock offset NTP-style (minimum-RTT probe) and its own reassembly, decode
+  and present, and keeps rolling p50/p95 per stage. The Windows HUD shows
+  `cap · enc · send · net · dec · pres = total` on its first line, the
+  `metrics:` line adds session percentiles, and the iOS stats chip shows the
+  end-to-end latency with the breakdown in the session sheet
+  (`ov_screen_latency_stats`). Older peers are unaffected.
+- Input-to-photon probe: `ovhost --latency-probe` flips a 64x64 patch on
+  every input press and `ovview --latency-probe N` times N presses to the
+  presented flip (p50/p95/p99). See the benchmarks section of
+  `docs/USAGE.md`.
+
+### Changed
+- iOS: smooth two-finger scrolling. The pan streams high-resolution wheel
+  deltas (12 units per point instead of a whole 120-unit notch per 10 pt),
+  at most about 120 per second, and glides on after the lift with
+  exponential-decay inertia that stops when a finger lands. The natural
+  direction is unchanged. iPad trackpad scrolling uses the same paced
+  sender.
+
 ## [0.1.0] - 2026-11-14
 
 First public release (0.1.0).
@@ -43,6 +73,15 @@ First public release (0.1.0).
   regions; RTT-aware automatic quality.
 - Opus audio (system sound and microphone, full duplex), bidirectional
   clipboard, chat, file transfer, session recording and playback.
+- H.264 is encoded in High profile (Main when the encoder refuses it); the
+  encoder's long-term-reference and intra-refresh support is probed and
+  logged at start-up.
+- Lower display latency on Windows: the viewer presents immediately, with
+  tearing allowed where supported; `ovview --vsync` restores
+  vsync-locked presentation.
+- Adaptive video FEC on the direct path: parity drops from 10 % to 2 % on
+  a loss-free link whose round trip lets a NACK repair a frame in time, and
+  returns to 10-30 % as soon as loss is measured.
 
 #### Packaging
 - Per-user Windows installer (no administrator rights), portable zip,

@@ -78,6 +78,11 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, default_value_t = Renderer::D2d)]
     renderer: Renderer,
 
+    /// Direct2D: present on the vertical blank (smooth, up to one refresh
+    /// of extra latency). Default: present immediately, tearing allowed.
+    #[arg(long)]
+    vsync: bool,
+
     /// Stream this PC's microphone to the host.
     #[arg(long)]
     mic: bool,
@@ -143,6 +148,11 @@ pub(crate) struct Cli {
     /// Send this file to the host right after the handshake.
     #[arg(long, hide = true, value_name = "PATH")]
     send_file: Option<PathBuf>,
+    /// Input-to-photon probe against `ovhost --latency-probe`: press a key N
+    /// times and time each press until the host's patch flips on screen;
+    /// prints p50/p95/p99, then ends the session.
+    #[arg(long, hide = true, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    latency_probe: Option<u32>,
 }
 
 /// `--renderer`.
@@ -251,8 +261,9 @@ impl Cli {
             rtt_log: self.rtt_log,
             ping_every: self.ping_ms.map(Duration::from_millis),
             run_for: self.duration.map(Duration::from_secs),
+            latency_probe: self.latency_probe,
             renderer: match self.renderer {
-                Renderer::D2d => crate::window::RendererPref::Direct2D,
+                Renderer::D2d => crate::window::RendererPref::Direct2D { vsync: self.vsync },
                 Renderer::Gdi => crate::window::RendererPref::Gdi,
             },
         };

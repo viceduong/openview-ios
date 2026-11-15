@@ -180,6 +180,10 @@ pub(crate) struct Cli {
     /// Send this file to the viewer right after the handshake.
     #[arg(long, hide = true, value_name = "PATH")]
     pub(crate) send_file: Option<PathBuf>,
+    /// Input-to-photon target: every press from the viewer flips a 64x64
+    /// patch at the top-left (`ovview --latency-probe N` measures it).
+    #[arg(long, hide = true)]
+    pub(crate) latency_probe: bool,
 }
 
 /// `--screen [WxH]`.

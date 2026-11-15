@@ -49,7 +49,9 @@ impl TickClock {
 /// blocks until the tick has been captured; a synthetic source returns
 /// immediately and is paced by a [`TickClock`].
 pub trait MicSource: Send {
-    /// Read the next tick into `out` (always exactly [`TICK_SAMPLES`]).
+    /// Read the next tick into `out` (always exactly
+    /// [`tick_samples`](Self::tick_samples) x [`channels`](Self::channels)
+    /// samples, interleaved when stereo).
     fn read_tick(&mut self, out: &mut [i16]) -> Result<(), String>;
     /// `true` when `read_tick` paces itself (a capture device).
     fn self_paced(&self) -> bool {
@@ -59,6 +61,11 @@ pub trait MicSource: Send {
     /// 20 ms by default; the system-audio loopback uses 10 ms).
     fn tick_samples(&self) -> usize {
         TICK_SAMPLES as usize
+    }
+    /// Interleaved channels per tick (1 = mono by default; the
+    /// system-audio loopback delivers stereo).
+    fn channels(&self) -> usize {
+        1
     }
 }
 
@@ -116,7 +123,7 @@ pub fn run_mic_loop(
                 continue;
             }
         }
-        let mut buf = vec![0i16; src.tick_samples()];
+        let mut buf = vec![0i16; src.tick_samples() * src.channels()];
         match src.read_tick(&mut buf) {
             Ok(()) => {
                 if !deliver(buf) {

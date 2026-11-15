@@ -32,6 +32,7 @@ relative to the repository root.
 | `crates/ovhost/src/input/geometry.rs`, `input/controller.rs`, `input/backend.rs`, `input/win32.rs`, `input/tests.rs` | Pure coordinate mapping; `InputController`; the backends and `sas_capability`; Win32 calls; tests |
 | `crates/ovhost/src/unattended.rs` | The persisted unattended identity and the device ID |
 | `crates/ovhost/src/mic.rs` | Microphone capture (re-exports the shared `ovapp` sources) |
+| `crates/ovhost/src/probe.rs` | `--latency-probe`: the input-to-photon patch (test pattern or topmost window) |
 | `crates/ovhost/src/sysaudio.rs` | `--system-audio`: WASAPI loopback capture (Windows only) |
 | `crates/ovhost/src/speaker.rs` | `--audio`: plays the viewer's microphone |
 | `crates/ovhost/src/clipboard_os.rs` | Win32 clipboard read/write and sequence number |
@@ -248,6 +249,19 @@ frame. The capture thread times its next grab with `capture_hold()` so the new
 frame is ready just as the link finishes draining the current one (sleeps are
 capped at 20 ms). If a frame is already waiting in the mailbox, it holds off
 1 ms instead of compressing a frame that would be thrown away.
+
+Every capture is stamped for the latency telemetry: right after the grab
+the capture thread calls `FrameMailbox::set_capture_stamp` with the present
+time (DXGI `LastPresentTime` via `Grab::present_age` when under 1 s, else
+the grab start) and the grab-done time, and clears it after that capture's
+updates are queued; the sender then puts a TIMING record ahead of each
+stamped update for a `CAP_TIMING` viewer ([ovapp.md](ovapp.md) §6.1).
+
+The hidden `--latency-probe` (`probe.rs`) is the input-to-photon target:
+every press (button or key down) the viewer sends flips a 64x64 patch at the
+top-left between magenta and green — drawn by `--test-pattern`, otherwise
+painted by a small topmost window (`WS_EX_TOPMOST | WS_EX_NOACTIVATE`) at
+the primary monitor's origin, so the flip goes through DWM and DXGI capture.
 
 Two hidden A/B switches exist for benchmarks only:
 
@@ -493,7 +507,7 @@ Winlogon ignores them. Note that the `--service` flag only loops; it does
 |---|---|---|
 | Host microphone → viewer | `--mic` | WinMM `waveIn`, default input device, 48 kHz mono s16le, ring of `ovapp::winaudio::MIC_BUFFERS` × 20 ms buffers drained on the driver's completion event (`src/mic.rs`, shared `ovapp::winaudio`) |
 | Synthetic tone → viewer | `--mic-synth` | 440 Hz sine, paced by a drift-free `TickClock` |
-| Host speakers (loopback) → viewer | `--system-audio` | WASAPI loopback of the default **render** endpoint, event-driven shared mode, 10 ms period (`PERIOD_HNS` = 100 000). Down-mixed to mono, converted to s16, linearly resampled to 48 kHz if needed. Emits silent ticks at real-time pace while nothing plays (`src/sysaudio.rs`). |
+| Host speakers (loopback) → viewer | `--system-audio` | WASAPI loopback of the default **render** endpoint, event-driven shared mode, 10 ms period (`PERIOD_HNS` = 100 000). Mapped to **stereo** (mono duplicated, 5.1/7.1 folded down: centre -3 dB, LFE dropped), converted to s16, linearly resampled to 48 kHz if needed. Emits silent ticks at real-time pace while nothing plays (`src/sysaudio.rs`). |
 | Viewer microphone → host speakers | `--audio` | `speaker::AudioBus` = `ovapp::audio::JitterBuffer` (60 ms prefill, 120 ms ceiling) drained into `ovapp::winaudio::WinmmSpeaker` (three rotating 20 ms `waveOut` headers) on a dedicated thread (`src/speaker.rs`) |
 
 * `--mic`, `--mic-synth` and `--system-audio` are mutually exclusive. The last
@@ -503,6 +517,12 @@ Winlogon ignores them. Note that the `--service` flag only loops; it does
   * A `CAP_AUDIO10` viewer gets 10 ms Opus packets with in-band FEC
     (`audio streaming on (10 ms Opus packets to a CAP_AUDIO10 viewer, 20 ms
     otherwise)`).
+  * System audio is stereo Opus (128 kbit/s) to a `CAP_STEREO` viewer, and
+    the mono down-mix for any other. The link rate the screen loop computes
+    (congestion-controller target on the direct path, pacer rate on the
+    relay) feeds `AudioEncoder::set_link_rate`. Below 1 Mbit/s the stream is
+    squeezed to mono / 64 kbit/s, and stereo returns after 5 s at 1.5 Mbit/s
+    or more (`audio: link … stereo squeezed / restored` at debug).
   * Once the media channel is open (`term.media_ready()`), audio travels as
     unreliable datagrams (`send_audio`), so a lost packet is concealed instead
     of stalling.

@@ -150,6 +150,7 @@ former `OV_*` / `OVHOST_*` environment variables, which are no longer read)
 | `--no-media` | A/B: disable the unreliable media channel |
 | `--no-pacing` | A/B: disable link pacing |
 | `--send-file <path>` | Send this file to the viewer straight after the handshake |
+| `--latency-probe` | Input-to-photon target: every press from the viewer flips a 64x64 magenta/green patch at the screen's top-left (drawn into `--test-pattern`, otherwise a small topmost window at the primary monitor's origin). See [§2.11](#211-benchmarks-where-the-latency-goes) |
 
 ### `ovview`
 
@@ -182,6 +183,7 @@ ovview --play <file.ovrec> [--loop]
 | `--no-h264` | H.264 on | Never accept H.264, so the host sends lossless tiles only. Without Media Foundation (Windows N/KN lacking the Media Feature Pack) H.264 is off automatically. |
 | `--no-direct` | direct on | Stay on the relay |
 | `--renderer d2d\|gdi` | `d2d` | Direct2D high-quality cubic, or GDI with the CPU area/sharpen scaler |
+| `--vsync` | off | Direct2D: present on the vertical blank (no tearing, up to one display refresh of extra latency). Off: present immediately, tearing allowed where the system supports it (lowest latency; variable-refresh displays follow the stream) |
 | `--mic` | off | Stream our microphone to the host (full duplex) |
 | `--audio` | off | Start with speaker playback on (F2 toggles it) |
 | `--no-clipboard` | sync on | Disable clipboard sync |
@@ -201,6 +203,7 @@ existing file). Apart from recordings, the viewer stores nothing on disk.
 | `--ping-ms N` | Keepalive PING interval in ms (>= 10; default 5000) |
 | `--duration <secs>` | End the session cleanly after this long (headless runs) |
 | `--send-file <path>` | Send this file to the host after the handshake |
+| `--latency-probe N` | Press F24 N times against an `ovhost --latency-probe` and time each press to the presented frame whose patch flipped; logs p50/p95/p99 and ends the session. See [§2.11](#211-benchmarks-where-the-latency-goes) |
 
 **Offline recording tools** (no network; `--info` / `--export` print plain-text reports on stdout):
 
@@ -431,6 +434,66 @@ The `input_smoke` example sends a scripted input-v2 sequence. Run the host
 with `--dry-input -vv` (per-input-event lines are trace level) to watch it without anything being injected. For
 an end-to-end test across three processes, see `scripts/e2e_relay.sh`
 ([BUILDING.md](BUILDING.md#tests)).
+
+### 2.11 Benchmarks: where the latency goes
+
+Every optimisation is measured with the same two instruments, on the same
+setup, before and after.
+
+**1. Per-stage telemetry (always on).** Host and viewer that both advertise
+`CAP_TIMING` (0.1.x builds from this change on) measure every screen update
+and H.264 unit: the host stamps capture, encode and send on its clock, the
+viewer stamps reassembly, decode and present on its own, and an NTP-style
+offset over the PING/PONG pair (minimum-RTT sample of the last 16 clock
+probes) puts both on one timeline ([`crates/ovapp.md`](crates/ovapp.md) §6.1).
+
+| Stage | From → to |
+|---|---|
+| `cap` | host present (DXGI `LastPresentTime`; grab start for GDI / the test pattern) → grab done |
+| `enc` | grab done → update encoded and queued |
+| `send` | queued → first byte handed to the transport (pacing, a frame still draining) |
+| `net` | first byte sent → update reassembled on the viewer (one way; includes serialisation of large updates) |
+| `dec` | reassembled → decoded into the framebuffer |
+| `pres` | decoded → presented (desktop: the window painted it after `Present`; iOS: Metal `presentedHandler`, or the `AVSampleBufferDisplayLayer` enqueue for H.264) |
+| `total` | host present → viewer present |
+
+Where to read it:
+
+* the desktop HUD (H / F3) appends the rolling medians (last 120 updates) to
+  its first line, e.g. `RTT 1 ms  ·  cap 0.1 · enc 3.2 · send 0.1 · net 0.9 ·
+  dec 1.6 · pres 2.1 = 8.1 ms`;
+* the end-of-session `metrics:` line (`ovview -v`) ends with session-long
+  `lat_ms p50/p95` per stage plus the total's p99;
+* the iOS stats chip shows the end-to-end median ("e2e"), the session sheet
+  each stage's median and p95.
+
+A stage the peer cannot measure shows `?` (an older host sends no stamps:
+only `dec` and `pres` are measured).
+
+**2. Input-to-photon probe (objective).** A key press on the viewer until
+the presented frame shows the host's reaction:
+
+```powershell
+# scratch ports only — never 4569-4571 of a running OpenView
+ovrelay --bind 127.0.0.1:14569
+ovhost --relay 127.0.0.1:14569 --direct-port 14570 --lan-port 14571 --screen --test-pattern video --latency-probe --dry-input
+ovview --relay 127.0.0.1:14569 --code NNNNNNNNNN --latency-probe 50
+# -> latency probe: input-to-photon p50 .. ms p95 .. ms p99 .. ms (n 50 of 50, 0 timeout(s))
+```
+
+Without `--test-pattern` the host paints the patch in a small topmost window
+at the primary monitor's origin, so the flip travels the real compositor →
+DXGI capture path (capture the primary monitor). The viewer presses F24
+(bound to nothing) as KEY_EX down/up — the host also injects it unless
+`--dry-input` — waits for the patch colour at (32, 32) to flip, then pauses
+300 ms; a flip not seen within 3 s counts as a timeout.
+
+**Measurement plan.** For each change: release builds, the same two machines
+(or loopback for the pipeline alone), 60 s of `--test-pattern video` plus a
+200-press probe, recorded on the relay path and on the direct path, with
+`--duration 60 -v` for the `metrics:` line. Compare `total` p50/p95 and the
+stage the change targets; the probe's p50/p95/p99 is the user-visible
+number. Keep the HUD line in screenshots of before/after runs.
 
 ---
 

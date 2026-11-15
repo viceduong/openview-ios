@@ -13,7 +13,8 @@
 - an IPsec-style **anti-replay window** for records (and the media channel) (`replay.rs`);
 - typed errors: `HandshakeError` (with wire-stable `RejectCode`s) and `CoreError` (`error.rs`);
 - an HKDF-SHA256 **key schedule** and a ChaCha20-Poly1305 **record layer** that is strictly in-order (`session.rs`, `framing.rs`, `record.rs`, `crypto.rs`);
-- legacy helpers that nothing else in the workspace uses: an in-record message envelope (`commands.rs`) and NTP-style clock sync (`clocksync.rs`).
+- legacy helpers that nothing else in the workspace uses: an in-record message envelope (`commands.rs`);
+- NTP-style clock sync (`clocksync.rs`): the monotonic µs clock and min-RTT offset estimator behind `ovapp`'s latency telemetry.
 
 The transport (`ovtransport`) moves the handshake datagrams and the sealed records as opaque bytes. A record never says which path it took, so a session can switch between relay, UDP, and the direct path without a re-handshake.
 
@@ -33,7 +34,7 @@ The transport (`ovtransport`) moves the handshake datagrams and the sealed recor
 | `framing` | `src/framing.rs` | record-header helpers (`header_bytes`, `parse_header`, `seq_matches`), `Recorder` wrapper, little-endian writers (readers are crate-private and return `Option`) | no external use found |
 | `record` | `src/record.rs` | re-export of `framing` under its older name | no external use found |
 | `commands` | `src/commands.rs` | `Message` envelope `[1B type][u32 LE len][payload]` and typed constructors | no external use found (the application layer uses its own opcodes, see [ovapp.md](ovapp.md)) |
-| `clocksync` | `src/clocksync.rs` | `ClockSync` (4-timestamp offset and RTT) | no external use found |
+| `clocksync` | `src/clocksync.rs` | `mono_us` / `instant_us` / `us_instant`, `ClockSample` (4-timestamp offset and RTT), `ClockSync` (min-RTT window) | `ovapp::latency`, `ovhost` capture stamps |
 
 ## 3. Key types and API
 
@@ -270,9 +271,9 @@ Both ephemeral and static X25519 secrets are mixed in (resolves the old SEC-5 no
 
 `[1B type][u32 LE len][payload]`, with types `PAIRING_REQUEST 0x01`, `PAIRING_RESPONSE 0x02`, `HELLO 0x03`, `READY 0x04`, `CLOCK 0x05`, `CLOCK_REPLY 0x06`, `COMMAND 0x10`, `COMMAND_RESULT 0x11`, `MEDIA 0x20`, `PING 0x40`, `PONG 0x41`, `CLOSE 0xFF`. `decode` is bounds- and overflow-checked. The live application protocol is in `ovapp::terminal`; see [ovapp.md](ovapp.md).
 
-### 4.6 Clock sync (`clocksync.rs`, unused)
+### 4.6 Clock sync (`clocksync.rs`)
 
-`apply_reply(t0, t1, t2, t3)` sets `offset = ((t1 − t0) + (t2 − t3)) / 2` and `rtt = t3 − t0`. `peer_now_ns()` returns local time plus the offset.
+`mono_us()` is the process's monotonic clock in µs since a process-local anchor (pinned by the first call; `instant_us` reads earlier instants as 0, so the latency types call it on construction). `ClockSample::from_probe(t1, t2, t3, t4)` (`t1`/`t4` local, `t2`/`t3` peer) gives `rtt = (t4 − t1) − (t3 − t2)` and `offset = ((t2 − t1) + (t3 − t4)) / 2` (peer − local), rejecting inconsistent stamps. `ClockSync` keeps the last 16 samples (`with_window` to change) and trusts the minimum-RTT one (newest on a tie): the offset error is at most half that probe's path asymmetry. `to_local(peer_us)` converts a peer reading.
 
 ## 5. Configuration and constants
 

@@ -369,7 +369,7 @@ MEDIA encryption:
 | 3 FEEDBACK | `base u32 ‖ count u16 ‖ ref_us u32 ‖ count × u16` (arrival delta in 50 µs units, `0xFFFF` = lost); sent every 25 ms, ≤ 500 entries per message |
 | 4 NACK | `frame_id u32 ‖ n u16 ‖ n × idx u16`; n = 0 means the whole frame |
 
-The FEC ratio is `clamp(0.10 + 4·loss, 0.10, 0.30)`. Feedback drives a GCC-like delay-based controller (start rate 6 Mbps, range 2–200 Mbps). That controller sets the pacer (1.5 × target, reliable lane first) and the rudp window. Details: [ovtransport.md §9–10](crates/ovtransport.md).
+The FEC ratio is `clamp(0.10 + 4·loss, 0.10, 0.30)` while there is loss, and 0.02 for delta frames after 3 s without loss while the RTT is below the frame interval (sender-side only: the shard format does not change, `m` stays ≥ 1). Feedback drives a GCC-like delay-based controller (start rate 6 Mbps, range 2–200 Mbps). That controller sets the pacer (1.5 × target, reliable lane first) and the rudp window. Details: [ovtransport.md §9–10](crates/ovtransport.md).
 
 ---
 

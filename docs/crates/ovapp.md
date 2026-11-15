@@ -42,7 +42,7 @@ Always-on pure-Rust dependencies: `flate2` (miniz_oxide backend, DEFLATE),
 
 | Module | File | Platform | Role |
 |---|---|---|---|
-| `terminal` | `src/terminal/mod.rs` | all | Module doc (opcode table), re-exports. Submodules: `command.rs` (`OpCode`, `Command`, `OPT_*` / `CAND_*` constants), `wire.rs` (encode/decode), `caps.rs` (`CAP_*`), `limits.rs` (record-size limits), `frame_codec.rs` (`FrameCodec`, DEFLATE helpers), `session.rs` (`TerminalSession` state, CAPS bookkeeping, send path), `dispatch.rs` (the receive `pump`), `frames.rs` (frame reassembly, video receive path), `files.rs` (file transfers), `direct.rs` (direct-path and media-channel glue); tests in `wire_session_tests.rs` and `tiles_media_wire_tests.rs` |
+| `terminal` | `src/terminal/mod.rs` | all | Module doc (opcode table), re-exports. Submodules: `command.rs` (`OpCode`, `Command`, `OPT_*` / `CAND_*` constants), `wire.rs` (encode/decode), `caps.rs` (`CAP_*`), `limits.rs` (record-size limits), `frame_codec.rs` (`FrameCodec`, DEFLATE helpers), `session.rs` (`TerminalSession` state, CAPS bookkeeping, send path), `dispatch.rs` (the receive `pump`), `frames.rs` (frame reassembly, video receive path), `files.rs` (file transfers), `direct.rs` (direct-path and media-channel glue); tests in `wire_session_tests.rs`, `tiles_media_wire_tests.rs` and `timing_tests.rs` |
 | `screen` | `src/screen.rs` | all | `Frame`, `PixelFormat` (BGRA=0, RGB=1), `synthetic_frame` |
 | `codec` | `src/codec.rs` | all | `Compressor` (zstd L1 / DEFLATE / LZ4 / Packed) and `Decompressor` for every `FrameCodec` |
 | `tiles` | `src/tiles/mod.rs` (+ `tests.rs`) | all | 64x64 tile maps, `diff_tiles`, `rects_from_map`, `gather`/`scatter`, `ScreenDecoder` (the viewer framebuffer) |
@@ -58,6 +58,7 @@ Always-on pure-Rust dependencies: `flate2` (miniz_oxide backend, DEFLATE),
 | `audio` | `src/audio/mod.rs` | all | AUDIO payload format, `AudioEncoder`/`AudioDecoder` (Opus via feature); `JitterBuffer`, `AudioBus`, `AudioRingBuffer` (`buffer.rs`); `TickClock`, `MicSource`, `SynthMic`, `run_mic_loop`, `SineGen` (`source.rs`); `tests.rs` |
 | `winaudio` | `src/winaudio.rs` | Windows | Event-driven WinMM `WinmmMic` / `WinmmSpeaker` / `spawn_playback` |
 | `liveness` | `src/liveness.rs` | all | `Keepalive` (PING pacing and RTT), `Liveness` (dead-peer), `LinkStats` (fps/Bps HUD) |
+| `latency` | `src/latency.rs` (+ `latency/tests.rs`) | all | Per-stage latency telemetry (`CAP_TIMING`): `FrameTiming` (the TIMING record), `HostStamps`, `ClockProbe` (clock-probe PINGs, timed PONGs, min-RTT offset), `LatencyTracker` (host stamps joined with reassembly / decode / present, rolling and session percentiles), see section 6.1 |
 | `netwait` | `src/netwait.rs` | all (socket watch is Windows-only) | `Wakeup`/`Waker`: block until socket readable, cross-thread signal, window message, or timeout; `high_res_timers` |
 | `clipboard` | `src/clipboard.rs` | all | `ClipboardSync` echo-loop guard, `clipboard_command` |
 | `chat` | `src/chat.rs` | all | `ChatSession`: one line = one TYPE record |
@@ -115,7 +116,7 @@ the pump from the media channel).
 | `0x04` | FILE_DATA | both | raw chunk | |
 | `0x05` | FILE_END | both | empty | |
 | `0x10` | PING | both | `u64 nonce` | exactly 8 B. Pump auto-replies PONG |
-| `0x11` | PONG | both | `u64 nonce` (echoed) | exactly 8 B |
+| `0x11` | PONG | both | `u64 nonce` (echoed); with `CAP_TIMING` also `u64 rx_us`, `u64 tx_us` (the replier's monotonic µs clock: PING received, PONG sent) | exactly 8 B (`Pong`) or 24 B (`PongTimed`) |
 | `0x14` | FILE_XFER_DATA | both | `u32 file_id`, `u64 offset`, chunk | >= 12 B |
 | `0x18` | FILE_XFER_COMPLETE | both | `u32 file_id`, `u64 total`, `u8 ok`, optional UTF-8 name | >= 13 B |
 | `0x20` | FRAME_BEGIN | H->V | 30 B, see 3.3 | >= 30 B, known fmt/codec |
@@ -146,6 +147,7 @@ the pump from the media channel).
 | `0x62` | SESSION_OPTION | V->H (needs `CAP_DESKTOP_FX`) | `u8 key`, `u8 value` | >= 2 B |
 | `0x63` | MEDIA_GAP | local | `u8 kind` (0 video, 1 audio), `u16 packets`, `u32 samples` | >= 7 B |
 | `0x64` | BYE | both (only to a peer with `CAP_BYE`) | empty: the sender ends the session on purpose | extra bytes ignored |
+| `0x65` | TIMING | H->V (only to a peer with `CAP_TIMING`) | `u8 kind` (0 screen update, 1 H.264 unit), `u64 seq`, `u64 capture_us` (host monotonic µs), `u32 grab_us`, `u32 encode_us`, `u32 queue_us`: the stamps of the update that follows | exactly 29 B |
 
 Any other opcode fails `decode` (`"unknown opcode"`). The pump counts it as a
 `decode_errors` increment and keeps going, so new opcodes are always gated
@@ -273,10 +275,13 @@ largest DEFLATE expansion), so a small payload cannot claim a huge allocation.
 | 14 | `CAP_CACHE` | keeps host-assigned tile-cache slots (needs `CAP_BANDS`) |
 | 15 | `CAP_MEDIA` | v2 direct framing: delay-based CC, pacing, unreliable media channel with RS-FEC (set by `enable_direct`) |
 | 16 | `CAP_BYE` | acts on BYE (every `TerminalSession`; part of `LOCAL_CAPS`) |
+| 17 | `CAP_TIMING` | latency telemetry: timed PONGs, TIMING records, clock-probe PINGs (every `TerminalSession` and the iOS assembler; part of `LOCAL_CAPS`; used when both set it) |
+| 18 | `CAP_STEREO` | decodes stereo Opus AUDIO (needs `CAP_OPUS`; builds with `opus`, the iOS shell when AVAudioConverter decodes 2-channel Opus); a stereo source is sent stereo only to such a peer |
 
 The caps sets are built up as follows:
 
-- `LOCAL_CAPS = TILES | ZSTD | KEYFRAME | RUDP | INPUT2 | LZ4 | BANDS | MOVE`.
+- `LOCAL_CAPS = TILES | ZSTD | KEYFRAME | RUDP | INPUT2 | LZ4 | BANDS | MOVE |
+  BYE | TIMING`.
 - `VIEWER_W2_CAPS = LOSSY | CACHE`.
 - `audio::audio_caps()` returns `OPUS | AUDIO10` with the `opus` feature, and
   `0` otherwise.
@@ -316,8 +321,11 @@ KEYFRAME_REQUEST.
 
 Built-in behaviour per command:
 
-- **PING** -> sends PONG. **ECHO** -> sends ECHO. **PONG** -> stored in
-  `last_pong`.
+- **PING** -> sends PONG (a timed PONG when both sides set `CAP_TIMING`).
+  **ECHO** -> sends ECHO. **PONG** -> stored in `last_pong`; a timed PONG
+  also feeds the clock offset and reaches the hook as a plain PONG.
+  Clock-probe echoes (`latency::PROBE_TAG`) and **TIMING** records stay
+  inside the session (never stored, never forwarded to the hook).
 - **FILE_BEGIN/DATA/END** -> legacy single-transfer reassembly
   (`take_file()`).
 - **FILE_XFER_DATA/COMPLETE** -> `file_transfer::FileTransfer::poll`
@@ -706,8 +714,14 @@ These are the decision rules in `submit_ex` (the full narrative is in
   - VBV of `vbv_bits = max(bitrate/fps, 64 000)`
   - 0 B-frames
   - GOP of `fps * 60`
-  - Main profile
+  - High profile (`H264Profile::High`; Main when the MFT refuses it,
+    `H264Encoder::profile()` reports which)
   - IDR on demand (`CODECAPI_AVEncVideoForceKeyFrame`)
+- `H264Encoder::caps()` returns the `EncoderCaps` probed once at creation
+  through `ICodecAPI::IsSupported` (logged at debug): LTR buffer control,
+  mark / use LTR frame (`ltr()` = all three), `ltr_slots`, gradual intra
+  refresh, temporal layers, max reference frames, force keyframe. NVENC
+  (RTX 4090) and the Microsoft software MFT report all of them.
 - The input media type is NV12 BT.709 with 16-235 nominal range.
   - On the CPU path the conversion is `video::bgra_to_nv12`.
   - On the GPU path (`new_gpu` / `encode_texture`) it is a D3D11 video
@@ -873,6 +887,41 @@ How `ovhost` wires it (outside this crate, `ovhost/src/session/capture_loop.rs`)
 - `LinkStats` reports rolling frames/s and bytes/s for the HUD, with a 50 ms
   minimum span.
 
+### 6.1 Per-stage latency (`src/latency.rs`, `CAP_TIMING`)
+
+Measures where an update's latency goes, so optimisations can be proven.
+
+- **Clocks.** Each side stamps on its own monotonic clock
+  (`ovcore::clocksync::mono_us`, µs since a process-local anchor). The
+  viewer (`TerminalSession::set_latency_tracking(true)`; the iOS assembler
+  always) sends clock-probe PINGs tagged `PROBE_TAG` (`"OVT"` + counter):
+  8 at 100 ms, then one per second. A `CAP_TIMING` host answers every PING
+  with a timed PONG (its receive and send times), so `t1..t4` give
+  `rtt = (t4 − t1) − (t3 − t2)` and `offset = ((t2 − t1) + (t3 − t4)) / 2`.
+  `ClockSync` trusts the **minimum-RTT** sample of the last 16 (≈ 16 s:
+  path asymmetry error ≤ RTT/2, crystal drift well under 1 ms).
+- **Host stamps.** The capture thread calls
+  `FrameMailbox::set_capture_stamp` right after each grab (present time =
+  DXGI `LastPresentTime` when it is under a second old, else the grab
+  start; grab-done time) and clears it after that capture's updates are
+  queued. `put` / `push_video` copy the stamps into the `EncodedFrame` and
+  add "encoded now". `PrioritySender` sends a 29-byte TIMING record right
+  before the update's first record (before `VIDEO_BEGIN` / FRAME_BEGIN /
+  TILES_BEGIN on the reliable channel, and on the reliable channel ahead of
+  a media-channel H.264 unit), with the queue time up to that moment.
+  Refinement updates carry no stamps (no TIMING).
+- **Viewer join.** `LatencyTracker` keys entries by `(kind, seq)`:
+  TIMING, reassembly complete (FRAME_END / media unit), decoded
+  (`take_latest_frame` marks everything it consumed), presented
+  (`TerminalSession::note_presented(drawn_before, presented_at)`). Stages:
+  `cap` (present → grab), `enc` (grab → encoded), `send` (encoded → first
+  byte), `net` (first byte → reassembled, one way, offset-corrected), `dec`
+  (reassembled → decoded), `pres` (decoded → presented), and `total`
+  (capture → presented, offset-corrected). Rolling p50/p95 over the last
+  120 updates per stage (`latency_snapshot`, HUD) and session percentiles
+  (up to 100 000 samples per stage, `session_summary`, the `metrics:` line).
+  Updates without TIMING (an old host) still measure `dec` and `pres`.
+
 ---
 
 ## 7. Audio (`src/audio/`, `src/winaudio.rs`)
@@ -882,7 +931,9 @@ How `ovhost` wires it (outside this crate, `ovhost/src/session/capture_loop.rs`)
 ```
 u8 codec | u8 flags | u32 samples (BE) | body
 codec 0 (CODEC_RAW_S16LE): body = samples x i16 little-endian, 48 kHz mono
-codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decoded count
+codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decoded
+                           count per channel (mono, or stereo to a CAP_STEREO
+                           peer: the TOC byte's s bit says which)
 ```
 
 | Constant | Value |
@@ -890,7 +941,10 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 | `SAMPLE_RATE` | 48 000 Hz, mono |
 | `TICK_SAMPLES` / `TICK_MS` | 960 / 20 ms |
 | `OPUS10_SAMPLES` | 480 (10 ms; only to a `CAP_AUDIO10` peer) |
-| `OPUS_BITRATE` | 48 kbit/s VBR (`Application::Audio`) |
+| `OPUS_BITRATE` | 48 kbit/s VBR (`Application::Audio`), mono |
+| `OPUS_STEREO_BITRATE` | 128 kbit/s VBR, stereo (forced 2-channel) |
+| `OPUS_SQUEEZED_BITRATE` | 64 kbit/s, a stereo stream forced to mono on a thin link |
+| `STEREO_MIN_LINK_RATE` / `STEREO_RESUME_LINK_RATE` / `STEREO_RESUME_AFTER` | 1 Mbit/s / 1.5 Mbit/s / 5 s (`StereoGate` hysteresis) |
 | `OPUS_FEC_LOSS_PERC` | 10 (in-band FEC/LBRR on) |
 | `MAX_OPUS_PACKET` | 1275 |
 | `HEADER_LEN` | 6 |
@@ -907,7 +961,13 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 - Opus requires both the `opus` feature and the peer's `CAP_OPUS`.
 - PCM is buffered into 480- or 960-sample frames: 480 for a `CAP_AUDIO10`
   peer, 960 otherwise.
-- Without Opus, each call produces one raw PCM payload.
+- Without Opus, each call produces one raw PCM payload (always mono).
+- `AudioEncoder::with_channels(2)` takes interleaved stereo (the host's
+  system-audio loopback). It encodes stereo Opus only for a peer with
+  `CAP_STEREO` + `CAP_OPUS`, and the `(L + R) / 2` down-mix for everyone else.
+  `set_link_rate(bytes_per_sec, now)` feeds the `StereoGate`. Below
+  `STEREO_MIN_LINK_RATE` the encoder is forced to mono at 64 kbit/s, but the
+  stream stays 2-channel. `mode()` reports the current layout (`AudioMode`).
 - `TerminalSession::send_audio` prefers the media channel when it is ready.
 - AUDIO is direction-agnostic. The duplex test shows viewer-to-host mic
   audio works.
@@ -915,6 +975,9 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
 **Receiving:**
 
 - `AudioDecoder::decode` handles PCM or Opus.
+  `AudioDecoder::with_channels(2)` decodes into interleaved stereo: libopus
+  mixes any packet into the decoder's layout, and raw PCM is duplicated
+  (L = R). FEC and PLC output follow the same layout.
 - `decode_fec(next, lost)` recovers a lost packet from the following packet's
   FEC data.
 - `conceal(lost)` runs Opus PLC. Without Opus, it produces silence.
@@ -928,12 +991,15 @@ codec 1 (CODEC_OPUS):      body = one Opus packet (1..=1275 B); samples = decode
   - Past the ceiling it trims back to the target.
   - On underrun it zero-fills and re-enters prefill.
   - `AudioBus` wraps it as a shared, enable-able bus; it is disabled by
-    default. `ovview` uses `AudioBus::with_ms(30, 90)`.
+    default. `ovview` uses `AudioBus::with_ms_channels(30, 90, 2)` (stereo:
+    times stay in audio time, trims drop whole frames).
+  - `spawn_playback` opens `WinmmSpeaker::open_channels(bus.channels())`.
 - `AudioRingBuffer` is a simpler FIFO that zero-fills on underrun.
 - `TickClock` paces synthetic sources without drift, resyncing after falling
   more than 10 intervals behind.
 - `run_mic_loop` drives a `MicSource`. The trait's `tick_samples()` defaults
-  to 960 (`ovhost`'s WASAPI loopback overrides it with 10 ms ticks).
+  to 960 and `channels()` to 1 (`ovhost`'s WASAPI loopback overrides them
+  with 10 ms interleaved stereo ticks).
 - `winaudio` (Windows WinMM):
   - `WinmmMic` uses `CALLBACK_EVENT` with `MIC_BUFFERS = 10` buffers of 20 ms
     each (200 ms of slack).

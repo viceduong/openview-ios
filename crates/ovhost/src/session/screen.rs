@@ -188,7 +188,11 @@ pub(super) fn serve_screen(
         &mailbox,
         &wake,
         mic_rx.as_ref(),
-        Surroundings { data_dir, standby },
+        Surroundings {
+            data_dir,
+            standby,
+            audio_channels: mic.map_or(1, MicKind::channels),
+        },
     );
     if term.media_stats().is_some() {
         debug!("{}", term.media_summary());
@@ -211,6 +215,8 @@ pub(super) fn serve_screen(
 struct Surroundings<'a> {
     data_dir: &'a Path,
     standby: Option<&'a Standby>,
+    /// Channels of the audio source's PCM (2 = system-audio loopback).
+    audio_channels: usize,
 }
 
 /// The screen session thread's loop (see [`serve_screen`]).
@@ -223,7 +229,11 @@ fn screen_session_loop(
     mic_rx: Option<&Receiver<Vec<i16>>>,
     around: Surroundings<'_>,
 ) -> Result<(), String> {
-    let Surroundings { data_dir, standby } = around;
+    let Surroundings {
+        data_dir,
+        standby,
+        audio_channels,
+    } = around;
     let mut sender = ovapp::sendq::PrioritySender::new(FRAME_CHUNK);
     // Tell the viewer which monitors it can pick from before the first
     // frame flies.
@@ -240,7 +250,7 @@ fn screen_session_loop(
     let mut next_clip = Instant::now();
     let mut next_cursor = Instant::now();
     let mut cursor_moved_at: Option<Instant> = None;
-    let mut audio_enc = ovapp::audio::AudioEncoder::new();
+    let mut audio_enc = ovapp::audio::AudioEncoder::with_channels(audio_channels);
     let mut next_audio_log: u64 = 250; // first line after ~5 s
     let mut pacing_log = Instant::now();
     let mut media_logged = false;
@@ -350,7 +360,8 @@ fn screen_session_loop(
             while let Ok(pcm) = rx.try_recv() {
                 if peer == PeerState::Alive {
                     // Opus to a CAP_OPUS viewer (10 ms packets with FEC to a
-                    // CAP_AUDIO10 one), raw PCM to an old one.
+                    // CAP_AUDIO10 one; stereo to a CAP_STEREO one), raw PCM
+                    // to an old one.
                     let caps = ctl.peer_caps.load(Ordering::Relaxed);
                     for payload in audio_enc.encode_ticks(&pcm, caps) {
                         // On the media channel when it is open (a lost
@@ -373,11 +384,7 @@ fn screen_session_loop(
                     "audio {:.1} kbps over {} ticks ({})",
                     audio_enc.bitrate() / 1000.0,
                     audio_enc.ticks,
-                    if ctl.peer_caps.load(Ordering::Relaxed) & ovapp::terminal::CAP_OPUS != 0 {
-                        "opus"
-                    } else {
-                        "raw s16le"
-                    }
+                    audio_enc.mode()
                 );
             }
         }
@@ -401,6 +408,24 @@ fn screen_session_loop(
             None => sender.pacer().stats().rate.map_or(0, |r| r as u64),
         };
         ctl.link_rate.store(rate, Ordering::Relaxed);
+        // A thin link squeezes stereo system audio to mono / 64 kbps.
+        let was_squeezed = audio_enc.mode() == ovapp::audio::AudioMode::OpusSqueezed;
+        if audio_enc.set_link_rate(rate, now) != was_squeezed
+            && matches!(
+                audio_enc.mode(),
+                ovapp::audio::AudioMode::OpusStereo | ovapp::audio::AudioMode::OpusSqueezed
+            )
+        {
+            debug!(
+                "audio: link {:.2} Mbit/s, stereo {}",
+                rate as f64 * 8.0 / 1e6,
+                if was_squeezed {
+                    "restored"
+                } else {
+                    "squeezed to mono / 64 kbps"
+                }
+            );
+        }
         let qd = match term.transport_queue_delay() {
             Some(d) => Some(d),
             None => sender.pacer().queue_delay(Instant::now()),

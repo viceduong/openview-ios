@@ -9,6 +9,7 @@ mod direct;
 mod ffi;
 mod header;
 mod lan;
+mod latency;
 mod pin;
 mod relay;
 

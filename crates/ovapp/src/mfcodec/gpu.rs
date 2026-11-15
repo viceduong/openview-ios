@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Media::MediaFoundation::*;
 
-use super::encoder::H264Encoder;
+use super::encoder::{check_size, EncodeParams, H264Encoder};
 use super::mft::{friendly_name, hardware_encoders};
 use super::{err, startup};
 use crate::error::AppError;
@@ -313,11 +313,8 @@ impl H264Encoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<Self, AppError> {
-        if w < 16 || h < 16 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
-            return Err(AppError::invalid(format!(
-                "H.264 picture {w}x{h} must be even and at least 16x16"
-            )));
-        }
+        check_size(w, h)?;
+        let p = EncodeParams::new(w, h, fps, bitrate);
         startup()?;
         let mut why = Vec::new();
         // SAFETY: COM/MF calls on activation objects and transforms this
@@ -334,10 +331,7 @@ impl H264Encoder {
                             Some(a.clone()),
                             format!("{name} (hw, GPU input)"),
                             true,
-                            w,
-                            h,
-                            fps,
-                            bitrate,
+                            &p,
                             Some(&mgr),
                         ) {
                             Ok(mut e) => {

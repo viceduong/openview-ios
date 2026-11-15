@@ -866,3 +866,50 @@ fn encoder_failure_falls_back_to_tiles() {
     assert_eq!(vs.stats().encoder_failures, 1, "retry is rate-limited");
     assert_eq!(vs.take_error().as_deref(), Some("no encoder"));
 }
+
+/// A High-profile SPS (the encoder's default since 0.1.0) with the extra
+/// chroma / bit-depth fields and a scaling matrix parses and is rewritten
+/// to BT.709 limited with every earlier field kept.
+#[test]
+fn high_profile_sps_with_scaling_lists_is_rewritten() {
+    let mut w = sps::Writer::default();
+    w.bits(0x67, 8);
+    w.bits(100, 8); // profile_idc High
+    w.bits(0, 8);
+    w.bits(40, 8); // level 4.0
+    w.ue(0); // sps id
+    w.ue(1); // chroma_format_idc 4:2:0
+    w.ue(0); // bit_depth_luma_minus8
+    w.ue(0); // bit_depth_chroma_minus8
+    w.bit(0); // qpprime_y_zero_transform_bypass
+    w.bit(1); // seq_scaling_matrix_present
+    for i in 0..8 {
+        w.bit(u32::from(i == 0 || i == 6)); // a 4x4 and an 8x8 list
+        if i == 0 || i == 6 {
+            for _ in 0..if i < 6 { 16 } else { 64 } {
+                w.se(0); // delta 0: every coefficient 8
+            }
+        }
+    }
+    w.ue(0); // log2_max_frame_num_minus4
+    w.ue(2); // poc type 2
+    w.ue(1); // max_num_ref_frames
+    w.bit(0);
+    w.ue(119); // 120 MBs = 1920
+    w.ue(67); // 68 map units = 1088
+    w.bit(1); // frame_mbs_only
+    w.bit(1); // direct_8x8
+    w.bit(0); // no cropping
+    w.bit(0); // no VUI
+    let raw = sps::escape(&w.finish());
+    let before = sps::summary(&raw).expect("High SPS parses");
+    assert_eq!(before.profile_idc, 100);
+    assert_eq!((before.width_mbs, before.height_map_units), (120, 68));
+    let fixed = sps::force_bt709_limited(&raw).unwrap();
+    let after = sps::summary(&fixed).unwrap();
+    assert!(after.colour.is_bt709_limited(), "{:?}", after.colour);
+    assert_eq!(after.profile_idc, 100);
+    assert_eq!(after.level_idc, 40);
+    assert_eq!((after.width_mbs, after.height_map_units), (120, 68));
+    assert_eq!(after.max_num_ref_frames, 1);
+}

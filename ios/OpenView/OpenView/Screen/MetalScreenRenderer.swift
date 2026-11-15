@@ -104,6 +104,10 @@ final class FrameUploadQueue {
     /// Main thread only: re-stage the whole current frame (the controller
     /// dispatches to the session queue). Called at most once per request.
     var requestFull: (() -> Void)?
+    /// Latency telemetry (any thread): a drawable reached the screen —
+    /// encoded at `drawnAt`, presented at `presentedAt` (both
+    /// CACurrentMediaTime). Set once by the controller before rendering.
+    var onPresented: ((_ drawnAt: CFTimeInterval, _ presentedAt: CFTimeInterval) -> Void)?
 
     private let lock = NSLock()
     private var width = 0
@@ -427,14 +431,14 @@ final class MetalScreenRenderer {
     /// at device-pixel resolution.
     /// The frame's staged dirty rects (`uploads`) are blitted into
     /// the frame texture first, in the same command buffer — no CPU wait.
-    /// `onPresented` runs (any thread) once this drawable is on screen;
-    /// it is dropped when nothing could be drawn (the caller's fallback
-    /// covers that).
+    /// `onPresented` runs (any thread) once this drawable is on screen,
+    /// with its presented time (CACurrentMediaTime clock); it is dropped
+    /// when nothing could be drawn (the caller's fallback covers that).
     /// Returns false when the previous command buffer is still on the GPU:
     /// nothing was done (not even the uploads) — retry at the next refresh.
     @discardableResult
     func render(scale: CGFloat, offset: CGPoint, sharpenOn: Bool,
-                uploads: FrameUploadQueue?, onPresented: (() -> Void)? = nil) -> Bool {
+                uploads: FrameUploadQueue?, onPresented: ((CFTimeInterval) -> Void)? = nil) -> Bool {
         let ds = layer.drawableSize
         let cs = layer.contentsScale
         let dw = Int(ds.width), dh = Int(ds.height)
@@ -520,9 +524,9 @@ final class MetalScreenRenderer {
             #if targetEnvironment(simulator)
             // addPresentedHandler is unavailable in the simulator SDK; the
             // command buffer completing is the closest stand-in there.
-            cb.addCompletedHandler { _ in onPresented() }
+            cb.addCompletedHandler { _ in onPresented(CACurrentMediaTime()) }
             #else
-            drawable.addPresentedHandler { _ in onPresented() }
+            drawable.addPresentedHandler { d in onPresented(d.presentedTime) }
             #endif
         }
         cb.present(drawable)

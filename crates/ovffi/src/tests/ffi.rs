@@ -1008,6 +1008,69 @@ fn screen_passes_opus_through_and_advertises_cap_opus() {
     }
 }
 
+/// `ov_screen_set_opus_stereo` adds CAP_STEREO to the Opus caps (only with
+/// an Opus sink installed), and a stereo Opus packet (TOC `s` bit set)
+/// reaches the Opus sink untouched with its per-channel sample count.
+#[test]
+fn screen_advertises_cap_stereo_and_passes_stereo_opus() {
+    use ovapp::terminal::{encode, Command, CAP_AUDIO10, CAP_OPUS, CAP_STEREO};
+    use std::sync::Mutex;
+
+    static OPUS: Mutex<Vec<(Vec<u8>, u32)>> = Mutex::new(Vec::new());
+    extern "C" fn on_opus(_u: *mut c_void, p: *const u8, len: usize, samples: u32) {
+        if !p.is_null() {
+            let b = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
+            OPUS.lock().unwrap().push((b, samples));
+        }
+    }
+    fn feed(screen: *mut crate::OvScreen, cmd: &Command) -> i32 {
+        let wire = encode(cmd);
+        unsafe { crate::ov_screen_feed(screen, wire.as_ptr(), wire.len()) }
+    }
+    fn caps_reply(screen: *mut crate::OvScreen) -> u32 {
+        assert_eq!(feed(screen, &Command::MonitorsInfo { monitors: vec![] }), 0);
+        let mut out = [0u8; 9];
+        assert_eq!(
+            unsafe { crate::ov_screen_take_pong_reply(screen, out.as_mut_ptr(), 9) },
+            1
+        );
+        match ovapp::terminal::decode(&out).unwrap() {
+            Command::Caps { flags } => flags,
+            other => panic!("expected CAPS, got {other:?}"),
+        }
+    }
+
+    unsafe {
+        assert_eq!(
+            crate::ov_screen_set_opus_stereo(std::ptr::null_mut(), 1),
+            -1
+        );
+        // Stereo without an Opus sink advertises nothing audio.
+        let bare = crate::ov_screen_new();
+        assert_eq!(crate::ov_screen_set_opus_stereo(bare, 1), 0);
+        assert_eq!(caps_reply(bare) & (CAP_OPUS | CAP_STEREO), 0);
+        crate::ov_screen_free(bare);
+
+        let screen = crate::ov_screen_new();
+        assert_eq!(
+            crate::ov_screen_set_opus_sink(screen, std::ptr::null_mut(), Some(on_opus)),
+            0
+        );
+        assert_eq!(crate::ov_screen_set_opus_stereo(screen, 1), 0);
+        let caps = caps_reply(screen);
+        assert_eq!(
+            caps & (CAP_OPUS | CAP_AUDIO10 | CAP_STEREO),
+            CAP_OPUS | CAP_AUDIO10 | CAP_STEREO
+        );
+        // CELT FB 10 ms, stereo (s bit), one frame.
+        let packet = vec![(30u8 << 3) | 0x04, 0x11, 0x22];
+        let opus = ovapp::audio::encode_opus_frame(&packet, 480, 0);
+        assert_eq!(feed(screen, &Command::Audio(opus)), 0);
+        assert_eq!(OPUS.lock().unwrap().as_slice(), &[(packet, 480)]);
+        crate::ov_screen_free(screen);
+    }
+}
+
 /// The iOS datagram transport speaks the reliable UDP framing from the first
 /// packet. A peer sends framed, fragmented records over a lossy, reordering
 /// wire; the FFI carrier delivers every record intact and in order through

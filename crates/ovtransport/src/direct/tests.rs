@@ -208,11 +208,23 @@ fn media_pair(now: Instant) -> (DirectEngine, DirectEngine) {
     (h, v)
 }
 
-/// Video units cross a lossy path in order — FEC repairs most
-/// losses, NACKs (short RTT) the rest; audio gaps are reported; the
-/// controller gets feedback; records still flow reliably next to it.
-#[test]
-fn media_frames_survive_random_loss() {
+/// What [`run_media`] observed.
+struct MediaRun {
+    units: Vec<u32>,
+    lost: u32,
+    audio: u32,
+    audio_lost: u32,
+    recs: u32,
+    hs: MediaStats,
+    vs: MediaStats,
+    /// The FEC ratio each frame was sent with.
+    ratios: Vec<f64>,
+}
+
+/// `frames` video frames (30 fps, 2-32 KB, an IDR every 50) plus audio and
+/// a reliable record per frame across a path that drops `loss_pct(frame)`
+/// percent of datagrams both ways (1 ms ticks).
+fn run_media(frames: u32, loss_pct: &dyn Fn(u32) -> u64) -> MediaRun {
     let t0 = Instant::now();
     let (mut h, mut v) = media_pair(t0);
     assert!(h.media_ready() && v.media_ready());
@@ -220,18 +232,21 @@ fn media_frames_survive_random_loss() {
     // What promotion would have sent on the relay: records 0.. go direct.
     v.on_primary(&marker(M_SYNC_UP, 0), t0, &mut vio, &mut |_| {});
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
-    let mut drop = move || {
+    let mut drop = move |pct: u64| {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
-        rng % 100 < 3
+        rng % 100 < pct
     };
     let mut now = t0;
     let (mut units, mut lost, mut audio, mut audio_lost, mut recs) = (Vec::new(), 0u32, 0, 0u32, 0);
-    for f in 0..150u32 {
+    let mut ratios = Vec::new();
+    for f in 0..frames {
+        let pct = loss_pct(f);
         let mut unit = vec![(f % 251) as u8; 2000 + (f as usize * 997) % 30_000];
         unit[..4].copy_from_slice(&f.to_be_bytes());
         assert!(h.send_media_video(&unit, f % 50 == 0, now, &mut hio));
+        ratios.push(h.fec_ratio());
         for _ in 0..3 {
             assert!(h.send_media_audio(&[1, 0, 0, 0, 1, 224, 9], now, &mut hio));
         }
@@ -240,13 +255,13 @@ fn media_frames_survive_random_loss() {
             now += Duration::from_millis(1);
             h.poll(now, &mut hio, &mut |_| {});
             for d in std::mem::take(&mut hio.direct) {
-                if !drop() {
+                if !drop(pct) {
                     v.on_direct(0, &d, now, &mut vio, &mut |_| recs += 1);
                 }
             }
             v.poll(now, &mut vio, &mut |_| recs += 1);
             for d in std::mem::take(&mut vio.direct) {
-                if !drop() {
+                if !drop(pct) {
                     h.on_direct(0, &d, now, &mut hio, &mut |_| {});
                 }
             }
@@ -277,15 +292,67 @@ fn media_frames_survive_random_loss() {
         "in order, no duplicates"
     );
     assert!(
-        units.len() as u32 + lost >= 149,
+        units.len() as u32 + lost >= frames - 1,
         "every frame delivered or reported lost"
     );
-    assert!(lost <= 2, "{lost} frames lost at 3% loss");
-    assert!(vs.rx.fec_recovered > 10);
-    assert!(audio_lost > 0 && audio + audio_lost >= 449);
-    assert_eq!(recs, 150, "reliable records next to the media");
-    assert!(hs.cc.feedbacks > 50, "feedback reached the sender");
-    assert!(hs.parity_tx > 0);
+    assert_eq!(recs, frames, "reliable records next to the media");
+    MediaRun {
+        units,
+        lost,
+        audio,
+        audio_lost,
+        recs,
+        hs,
+        vs,
+        ratios,
+    }
+}
+
+/// Video units cross a lossy path in order — FEC repairs most
+/// losses, NACKs (short RTT) the rest; audio gaps are reported; the
+/// controller gets feedback; records still flow reliably next to it.
+#[test]
+fn media_frames_survive_random_loss() {
+    let r = run_media(150, &|_| 3);
+    assert!(r.lost <= 2, "{} frames lost at 3% loss", r.lost);
+    assert!(r.vs.rx.fec_recovered > 10);
+    assert!(r.audio_lost > 0 && r.audio + r.audio_lost >= 449);
+    assert!(r.hs.cc.feedbacks > 50, "feedback reached the sender");
+    assert!(r.hs.parity_tx > 0);
+    // Lossy link: parity never drops below the 10 % floor.
+    assert!(r.ratios.iter().all(|&x| x >= media::FEC_MIN));
+    assert!(r.recs == 150);
+}
+
+/// 1 % loss: still (almost) every frame, parity at 10 %+.
+#[test]
+fn media_frames_survive_one_percent_loss() {
+    let r = run_media(150, &|_| 1);
+    assert!(r.lost <= 1, "{} frames lost at 1% loss", r.lost);
+    assert!(r.ratios[100..].iter().all(|&x| x >= media::FEC_MIN));
+}
+
+/// Adaptive FEC: a clean, short-RTT link drops parity to the floor after
+/// the hold time (keyframes keep 10 %); loss starting later ramps it back
+/// up within a feedback round and NACK + FEC still recover the frames.
+#[test]
+fn media_fec_adapts_to_loss() {
+    let r = run_media(300, &|f| if f < 150 { 0 } else { 3 });
+    // Clean phase: 10 % until FEC_CLEAN_HOLD (3 s = 90 frames), then 2 %
+    // for delta frames.
+    assert!(r.ratios[..80].iter().all(|&x| x == media::FEC_MIN));
+    for (f, &x) in r.ratios.iter().enumerate().take(150).skip(100) {
+        let want = if f % 50 == 0 {
+            media::FEC_MIN
+        } else {
+            media::FEC_FLOOR
+        };
+        assert_eq!(x, want, "frame {f}");
+    }
+    // Loss phase: back to >= 10 % within a few frames of the first loss.
+    assert!(r.ratios[160..].iter().all(|&x| x >= media::FEC_MIN));
+    assert!(r.lost <= 3, "{} frames lost after the switch", r.lost);
+    assert!(r.units.len() >= 297);
 }
 
 /// The viewer's NAT / VPN mapping changes mid-session (live: an iPhone

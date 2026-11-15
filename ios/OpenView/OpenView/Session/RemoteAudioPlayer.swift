@@ -1,15 +1,18 @@
 import AVFoundation
 import Foundation
 
-// The remote PC's audio, streamed as 20 ms 48 kHz mono ticks (raw
-// s16le, or Opus packets decoded with AVAudioConverter) and played
-// back through AVAudioEngine + AVAudioPlayerNode. Driven from the session
-// queue; only the queued-buffer counter is shared with the audio render
-// thread (completion handlers), so it is lock-guarded.
+// The remote PC's audio, streamed as 48 kHz ticks (raw s16le mono, or
+// Opus packets — mono, or stereo system audio once we advertised
+// CAP_STEREO — decoded with AVAudioConverter) and played back through
+// AVAudioEngine + AVAudioPlayerNode in stereo (mono plays as L = R).
+// Driven from the session queue; only the queued-buffer counter is shared
+// with the audio render thread (completion handlers), so it is
+// lock-guarded.
 //
 // Jitter handling: the queue is measured in audio
 // time, not buffers, so 10 ms and 20 ms Opus packets (duration from the
-// Opus TOC byte) and PCM ticks mix freely. Playback starts once the
+// Opus TOC byte) and PCM ticks mix freely, as do mono and stereo
+// packets (a frame is a frame in either layout). Playback starts once the
 // prefill (30 ms) is queued, a starved player pauses and re-prefills, and
 // audio beyond the cap (60 ms) is dropped. Both adapt: every underrun adds
 // 10 ms of prefill (up to 50 ms, cap = prefill + 30 ms, so at most 80 ms),
@@ -17,10 +20,16 @@ import Foundation
 final class RemoteAudioPlayer {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    /// Playback format: stereo; mono sources are copied into both channels.
     private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                        sampleRate: 48_000,
-                                       channels: 1,
+                                       channels: 2,
                                        interleaved: false)
+    /// What a mono Opus packet decodes to (then upmixed to `format`).
+    private let monoFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                           sampleRate: 48_000,
+                                           channels: 1,
+                                           interleaved: false)
     private var started = false
     /// The player node is running (false while prefilling).
     private var playing = false
@@ -40,23 +49,29 @@ final class RemoteAudioPlayer {
     private var lastUnderrun: DispatchTime?
     private static let decayAfterNs: UInt64 = 10_000_000_000
     /// Opus decoder state, created on the first packet; rebuilt
-    /// when the packet duration changes (10 ms vs 20 ms frames).
+    /// when the packet duration (10 ms vs 20 ms frames) or the channel
+    /// count (TOC `s` bit: a stereo stream squeezed to mono on a thin link
+    /// switches) changes, so a converter only ever sees its own layout.
     private var opusConverter: AVAudioConverter?
     private var opusFormat: AVAudioFormat?
+    /// The PCM layout `opusConverter` decodes to (`format` or `monoFormat`).
+    private var opusDecodeFormat: AVAudioFormat?
     private var opusFramesPerPacket: UInt32 = 0
+    private var opusChannels: UInt32 = 0
     /// Largest Opus packet (RFC 6716).
     private static let maxOpusPacket = 1275
 
-    /// The Opus stream format: 48 kHz mono, `framesPerPacket` (960 = 20 ms,
-    /// 480 = 10 ms) per packet.
-    private static func makeOpusFormat(framesPerPacket: UInt32 = 960) -> AVAudioFormat? {
+    /// The Opus stream format: 48 kHz, `channels` (1 or 2),
+    /// `framesPerPacket` (960 = 20 ms, 480 = 10 ms) per packet.
+    private static func makeOpusFormat(framesPerPacket: UInt32 = 960,
+                                       channels: UInt32 = 1) -> AVAudioFormat? {
         var desc = AudioStreamBasicDescription(mSampleRate: 48_000,
                                                mFormatID: kAudioFormatOpus,
                                                mFormatFlags: 0,
                                                mBytesPerPacket: 0,
                                                mFramesPerPacket: framesPerPacket,
                                                mBytesPerFrame: 0,
-                                               mChannelsPerFrame: 1,
+                                               mChannelsPerFrame: channels,
                                                mBitsPerChannel: 0,
                                                mReserved: 0)
         return AVAudioFormat(streamDescription: &desc)
@@ -73,6 +88,25 @@ final class RemoteAudioPlayer {
         return AVAudioConverter(from: opus, to: pcm) != nil
     }()
 
+    /// Whether this device can decode 2-channel Opus (checked once). Only
+    /// then does the shell advertise CAP_STEREO (stereo system audio).
+    static let opusStereoDecodeAvailable: Bool = {
+        guard opusDecodeAvailable,
+              let opus = makeOpusFormat(framesPerPacket: 480, channels: 2),
+              let pcm = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: 48_000,
+                                      channels: 2,
+                                      interleaved: false) else { return false }
+        return AVAudioConverter(from: opus, to: pcm) != nil
+    }()
+
+    /// Whether an Opus packet codes two channels (TOC `s` bit, RFC 6716
+    /// 3.1). False for an empty packet.
+    static func opusPacketIsStereo(_ packet: Data) -> Bool {
+        guard let toc = packet.first else { return false }
+        return toc & 0x04 != 0
+    }
+
     /// Decode one audio tick (bare s16le 48 kHz mono samples — the sink
     /// delivers samples only, no header) and schedule it for playback.
     /// Starts the engine lazily on the first tick. Malformed ticks are
@@ -82,15 +116,20 @@ final class RemoteAudioPlayer {
         let n = data.count / 2 // a stray odd trailing byte is ignored
         guard let buf = AVAudioPCMBuffer(pcmFormat: format,
                                          frameCapacity: AVAudioFrameCount(n)),
-              let dst = buf.floatChannelData?[0] else { return }
+              let channels = buf.floatChannelData else { return }
         buf.frameLength = AVAudioFrameCount(n)
+        let left = channels[0]
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             // Byte-wise little-endian decode: no alignment assumptions.
             for i in 0..<n {
                 let lo = UInt16(raw[2 * i])
                 let hi = UInt16(raw[2 * i + 1])
-                dst[i] = Float(Int16(bitPattern: lo | (hi << 8))) / 32768.0
+                left[i] = Float(Int16(bitPattern: lo | (hi << 8))) / 32768.0
             }
+        }
+        // Mono PCM: the same samples on every other channel (L = R).
+        for c in 1..<Int(format.channelCount) {
+            channels[c].update(from: left, count: n)
         }
         schedule(buf)
     }
@@ -104,14 +143,19 @@ final class RemoteAudioPlayer {
         // The packet's own duration (TOC byte) is authoritative —
         // a host may send 10 ms frames; the header count is the fallback.
         let perPacket = Self.opusPacketFrames(packet) ?? (samples > 0 ? samples : 960)
-        if opusConverter == nil || perPacket != opusFramesPerPacket {
-            guard let opus = Self.makeOpusFormat(framesPerPacket: perPacket),
-                  let conv = AVAudioConverter(from: opus, to: format) else { return }
+        let channels: UInt32 = Self.opusPacketIsStereo(packet) ? 2 : 1
+        if opusConverter == nil || perPacket != opusFramesPerPacket || channels != opusChannels {
+            let target: AVAudioFormat? = channels == 2 ? format : monoFormat
+            guard let decodeFormat = target,
+                  let opus = Self.makeOpusFormat(framesPerPacket: perPacket, channels: channels),
+                  let conv = AVAudioConverter(from: opus, to: decodeFormat) else { return }
             opusFormat = opus
+            opusDecodeFormat = decodeFormat
             opusConverter = conv
             opusFramesPerPacket = perPacket
+            opusChannels = channels
         }
-        guard let conv = opusConverter, let opusFormat else { return }
+        guard let conv = opusConverter, let opusFormat, let opusDecodeFormat else { return }
         let compressed = AVAudioCompressedBuffer(format: opusFormat,
                                                  packetCapacity: 1,
                                                  maximumPacketSize: Self.maxOpusPacket)
@@ -128,7 +172,7 @@ final class RemoteAudioPlayer {
                                                     mDataByteSize: UInt32(size))
         }
         let frames = AVAudioFrameCount(max(perPacket, samples, 480))
-        guard let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        guard let pcm = AVAudioPCMBuffer(pcmFormat: opusDecodeFormat, frameCapacity: frames) else { return }
         var supplied = false
         var error: NSError?
         let status = conv.convert(to: pcm, error: &error) { _, inputStatus in
@@ -141,7 +185,24 @@ final class RemoteAudioPlayer {
             return compressed
         }
         guard status != .error, error == nil, pcm.frameLength > 0 else { return }
-        schedule(pcm)
+        if pcm.format.channelCount == format.channelCount {
+            schedule(pcm)
+        } else if let stereo = upmixed(pcm) {
+            schedule(stereo)
+        }
+    }
+
+    /// A mono buffer copied into every channel of the playback format.
+    private func upmixed(_ mono: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let format, let src = mono.floatChannelData?[0],
+              let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: mono.frameLength),
+              let dst = out.floatChannelData else { return nil }
+        let n = Int(mono.frameLength)
+        out.frameLength = mono.frameLength
+        for c in 0..<Int(format.channelCount) {
+            dst[c].update(from: src, count: n)
+        }
+        return out
     }
 
     /// Samples (48 kHz) in one Opus packet, from its TOC byte (RFC 6716

@@ -48,9 +48,10 @@ impl Viewer {
         let cur_mon = Arc::clone(&self.cur_mon);
         let clip = self.clip_sync.clone();
         let session_start = self.session_start;
-        // Raw PCM or Opus (the host encodes Opus only for our CAP_OPUS);
-        // one decoder state for the stream.
-        let mut audio_dec = AudioDecoder::new();
+        // Raw PCM or Opus (the host encodes Opus only for our CAP_OPUS,
+        // stereo only for our CAP_STEREO); one decoder state for the stream,
+        // decoding into the bus's (stereo) layout.
+        let mut audio_dec = AudioDecoder::with_channels(bus.channels());
         // (packets, samples) lost right before the next AUDIO.
         let mut audio_lost: (u16, u32) = (0, 0);
         self.term.on_cmd(Some(Box::new(move |cmd| match cmd {

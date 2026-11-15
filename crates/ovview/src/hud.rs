@@ -20,7 +20,10 @@ const STATS_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 /// written, frames captured — `None` when not recording. When active, it
 /// takes the MON line's slot (the monitor target returns once recording
 /// stops, so no information is permanently lost).
-// 8 args is the natural shape here (the caller already owns each value
+/// `latency` is the per-stage latency line
+/// ([`ovapp::latency::LatencySnapshot::hud_line`]), appended to the RTT line
+/// once the first update was measured.
+// 9 args is the natural shape here (the caller already owns each value
 // individually); grouping them into a struct would just add noise.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hud_lines(
@@ -32,14 +35,16 @@ pub(crate) fn hud_lines(
     quality: Option<u16>,
     mon: Option<String>,
     recording: Option<(u64, u64, u64)>,
+    latency: Option<String>,
 ) -> [String; 6] {
     [
         format!(
-            "RTT {}",
+            "RTT {}{}",
             match rtt_ms {
                 Some(ms) => format!("{ms:.0} ms"),
                 None => "—".to_owned(),
-            }
+            },
+            latency.map_or_else(String::new, |l| format!("  ·  {l}"))
         ),
         format!("FPS {fps:.1}"),
         format!("RES {width}x{height}"),

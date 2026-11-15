@@ -8,6 +8,8 @@ use crate::error::OV_ERR_PANIC;
 /// the shell's monotonic clock in milliseconds. Returns the PING sequence to
 /// put on the wire (> 0) when a keepalive PING is due — the shell sends a
 /// `PING` command (8-byte BE sequence) on channel 0 — or 0 when not due.
+/// With a `CAP_TIMING` host it also returns clock-probe sequences (about one
+/// per second; tagged, always positive) sent the same way.
 /// The matching `PONG` echo (fed back through [`ov_screen_feed`](crate::ov_screen_feed))
 /// measures the RTT and fires the liveness sink.
 ///
@@ -29,9 +31,25 @@ pub unsafe extern "C" fn ov_screen_keepalive_tick(s: *mut OvScreen, now_ms: i64)
                 screen.ping_sent_real = Some(std::time::Instant::now());
                 seq as i64
             }
-            None => 0,
+            // A clock probe (CAP_TIMING host): a tagged sequence the shell
+            // sends like any PING; its timed PONG measures the clock offset.
+            None => screen.clock_probe(now).map_or(0, |n| n as i64),
         }
     })
+}
+
+impl OvScreen {
+    /// A PONG for the keepalive: RTT is measured against the real send
+    /// instant (feed has no shell clock); the shell ms only paces the
+    /// keepalive.
+    pub(super) fn keepalive_pong(&mut self, seq: u64) {
+        if let Some(sent_at) = self.ping_sent_real.take() {
+            let rtt = std::time::Instant::now().saturating_duration_since(sent_at);
+            if self.keepalive.on_pong(seq, sent_at + rtt).is_some() {
+                self.last_rtt_ms = rtt.as_millis().min(i32::MAX as u128) as i32;
+            }
+        }
+    }
 }
 
 /// Watchdog: milliseconds since the last inbound record from the host (any

@@ -44,14 +44,20 @@ use cursor::CursorOverlay;
 /// Which presenter the window uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RendererPref {
-    /// Direct2D high-quality cubic + flip-model vsync; GDI on failure.
-    Direct2D,
+    /// Direct2D high-quality cubic into a flip-model swap chain; GDI on
+    /// failure. `vsync: false` (the default) presents immediately, with
+    /// tearing allowed where the system supports it; `true` waits for the
+    /// vertical blank.
+    Direct2D {
+        /// `--vsync`: present on the vertical blank (no tearing).
+        vsync: bool,
+    },
     /// GDI `StretchDIBits`, with the CPU area/sharpen scaler
     /// ([`ovapp::scale`]: area + sharpen 0.5) for downscaling.
     Gdi,
 }
 
-static RENDERER: Mutex<RendererPref> = Mutex::new(RendererPref::Direct2D);
+static RENDERER: Mutex<RendererPref> = Mutex::new(RendererPref::Direct2D { vsync: false });
 
 /// Choose the presenter for windows created afterwards.
 pub(crate) fn set_renderer(p: RendererPref) {

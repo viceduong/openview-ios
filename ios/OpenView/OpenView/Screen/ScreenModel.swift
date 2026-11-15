@@ -40,6 +40,9 @@ final class LivenessModel: ObservableObject {
     /// "Relay" / "Probing…" / "Direct (LAN)" / "Direct
     /// (Internet)" for relay sessions; nil for direct UDP sessions.
     @Published var path: String?
+    /// Per-stage latency (CAP_TIMING hosts); nil until the first update
+    /// was measured.
+    @Published var latency: LatencyBreakdown?
 }
 
 /// Screen updates accumulated on the session queue and applied to

@@ -78,7 +78,7 @@ impl Viewer {
         let audio = &self.audio_stats;
         debug!(
             "metrics: video_lat_ms p50 {:.1} p95 {:.1} p99 {:.1} n {} | stalls {} total {:.0} ms | \
-             rtt_ms p50 {:.1} p95 {:.1} n {} | audio_gaps {} total {:.0} ms concealed {} | rx {:.2} Mbps | {}",
+             rtt_ms p50 {:.1} p95 {:.1} n {} | audio_gaps {} total {:.0} ms concealed {} | rx {:.2} Mbps | {} | {}",
             lat_ms(0.5),
             lat_ms(0.95),
             lat_ms(0.99),
@@ -92,7 +92,8 @@ impl Viewer {
             audio.gap_us.load(Ordering::Relaxed) as f64 / 1000.0,
             audio.concealed.load(Ordering::Relaxed),
             term.bytes_received() as f64 * 8.0 / secs / 1e6,
-            term.media_summary()
+            term.media_summary(),
+            term.latency().session_summary()
         );
         let ticks = audio.ticks.load(Ordering::Relaxed);
         if ticks > 0 {

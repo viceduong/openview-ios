@@ -166,6 +166,8 @@ struct SessionMenuSheet: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+            // Per-stage latency (timing-capable hosts only).
+            LatencyRows(liveness: controller.livenessModel)
             Button {
                 onAction(.gestureHelp)
             } label: {

@@ -229,3 +229,94 @@ fn incomplete_frames_are_bounded_in_memory() {
     }
     assert!(rx.stats().frames_lost > 0);
 }
+
+/// The adaptive FEC decision: loss keeps the 10 % + 4 x loss clamp; a
+/// clean link drops to the floor only after the hold time and only while
+/// a NACK round trip fits in a frame interval; keyframes keep 10 %.
+#[test]
+fn adaptive_fec_decision() {
+    let ms = Duration::from_millis;
+    let iv = ms(33);
+    let hold = Some(FEC_CLEAN_HOLD);
+    // Loss: the existing clamp, whatever else holds.
+    assert_eq!(adaptive_fec_ratio(0.01, hold, Some(ms(5)), iv, false), 0.14);
+    assert_eq!(
+        adaptive_fec_ratio(0.03, hold, Some(ms(5)), iv, false),
+        fec_ratio(0.03)
+    );
+    assert_eq!(adaptive_fec_ratio(0.2, None, None, iv, false), FEC_MAX);
+    // Clean, settled, NACK in time: the floor (not for keyframes).
+    assert_eq!(
+        adaptive_fec_ratio(0.0, hold, Some(ms(5)), iv, false),
+        FEC_FLOOR
+    );
+    assert_eq!(
+        adaptive_fec_ratio(LOSS_CLEAN, hold, Some(ms(5)), iv, false),
+        FEC_FLOOR
+    );
+    assert_eq!(
+        adaptive_fec_ratio(0.0, hold, Some(ms(5)), iv, true),
+        FEC_MIN
+    );
+    // Not yet settled, RTT unknown or too long for NACK: 10 %.
+    let early = Some(FEC_CLEAN_HOLD - ms(1));
+    assert_eq!(
+        adaptive_fec_ratio(0.0, early, Some(ms(5)), iv, false),
+        FEC_MIN
+    );
+    assert_eq!(adaptive_fec_ratio(0.0, hold, None, iv, false), FEC_MIN);
+    assert_eq!(
+        adaptive_fec_ratio(0.0, hold, Some(ms(40)), iv, false),
+        FEC_MIN
+    );
+    assert_eq!(adaptive_fec_ratio(0.0, hold, Some(iv), iv, false), FEC_MIN);
+}
+
+/// The controller: the clean timer starts at the first clean frame, any
+/// loss resets it (parity back up at once), the frame interval follows
+/// the send cadence (a slow stream tolerates a longer RTT).
+#[test]
+fn fec_controller_ramps_down_slowly_and_up_at_once() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut c = FecController::new();
+    assert_eq!(c.ratio(), FEC_MIN);
+    let rtt = Some(ms(10));
+    let mut t = t0;
+    let mut step = |c: &mut FecController, loss: f64| {
+        t += ms(33);
+        c.next_ratio(t, loss, rtt, false)
+    };
+    // 3 s of clean frames: 10 % until the hold passes, then the floor.
+    let rs: Vec<f64> = (0..100).map(|_| step(&mut c, 0.0)).collect();
+    assert!(rs[..90].iter().all(|&r| r == FEC_MIN), "{rs:?}");
+    assert_eq!(rs[95], FEC_FLOOR);
+    assert_eq!(c.ratio(), FEC_FLOOR);
+    // Loss: immediately back to the clamp.
+    assert_eq!(step(&mut c, 0.02), fec_ratio(0.02));
+    // Clean again: the hold restarts.
+    assert_eq!(step(&mut c, 0.0), FEC_MIN);
+    let rs: Vec<f64> = (0..95).map(|_| step(&mut c, 0.0)).collect();
+    assert_eq!(*rs.last().unwrap(), FEC_FLOOR);
+    // Deterministic: the same inputs give the same decisions.
+    let replay = |n: usize| {
+        let mut c = FecController::new();
+        (0..n)
+            .map(|i| c.next_ratio(t0 + ms(33 * i as u64), 0.0, rtt, i % 50 == 0))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(replay(200), replay(200));
+    // A 10 fps stream (100 ms frames) takes NACK with a 60 ms RTT; 30 fps
+    // does not.
+    let run = |gap: u64| {
+        let mut c = FecController::new();
+        let mut r = 0.0;
+        for i in 0..200u64 {
+            r = c.next_ratio(t0 + ms(gap * i), 0.0, Some(ms(60)), false);
+        }
+        (r, c.frame_interval())
+    };
+    let (slow, iv) = run(100);
+    assert_eq!(slow, FEC_FLOOR, "interval {iv:?}");
+    assert_eq!(run(33).0, FEC_MIN);
+}

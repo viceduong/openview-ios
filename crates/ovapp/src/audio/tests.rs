@@ -290,3 +290,217 @@ fn encode_ticks_picks_the_negotiated_packet_size() {
         e10.bitrate()
     );
 }
+
+/// Interleaved stereo: a 440 Hz tone left, a 660 Hz tone right.
+fn stereo_tick(l: &mut SineGen, r: &mut SineGen, frames: usize) -> Vec<i16> {
+    let (mut a, mut b) = (vec![0i16; frames], vec![0i16; frames]);
+    l.tick(&mut a);
+    r.tick(&mut b);
+    a.into_iter().zip(b).flat_map(|(x, y)| [x, y]).collect()
+}
+
+/// Energy of every `step`-th sample from `start` (one channel of an
+/// interleaved buffer).
+fn energy(v: &[i16], start: usize, step: usize) -> f64 {
+    v.iter()
+        .skip(start)
+        .step_by(step)
+        .map(|&s| f64::from(s).powi(2))
+        .sum()
+}
+
+#[test]
+fn stereo_helpers_mix_and_split() {
+    assert_eq!(downmix_stereo(&[100, 300, -4, 4, 7]), vec![200, 0]);
+    assert_eq!(
+        downmix_stereo(&[i16::MAX, i16::MAX, i16::MIN, i16::MIN]),
+        vec![i16::MAX, i16::MIN]
+    );
+    assert_eq!(upmix_mono(&[1, -2]), vec![1, 1, -2, -2]);
+}
+
+/// The stereo gate drops to mono at once on a thin link, ignores unknown
+/// rates, and only returns to stereo after the link held the resume rate
+/// for the full hold time (no flapping around the threshold).
+#[test]
+fn stereo_gate_has_hysteresis() {
+    let t0 = std::time::Instant::now();
+    let s = |n: u64| t0 + std::time::Duration::from_secs(n);
+    let mut g = StereoGate::new();
+    assert!(!g.update(0, s(0)), "unknown rate: stay stereo");
+    assert!(!g.update(STEREO_MIN_LINK_RATE, s(0)));
+    assert!(g.update(STEREO_MIN_LINK_RATE - 1, s(1)), "thin: squeeze");
+    assert!(g.update(0, s(2)), "unknown rate holds the squeeze");
+    // Between the thresholds: stays squeezed.
+    assert!(g.update(STEREO_MIN_LINK_RATE + 1, s(3)));
+    // Good, but not for long enough; a dip restarts the hold.
+    assert!(g.update(STEREO_RESUME_LINK_RATE, s(4)));
+    assert!(g.update(STEREO_RESUME_LINK_RATE, s(8)));
+    assert!(g.update(STEREO_MIN_LINK_RATE, s(9)));
+    assert!(g.update(STEREO_RESUME_LINK_RATE, s(10)));
+    assert!(g.update(STEREO_RESUME_LINK_RATE * 4, s(14)));
+    assert!(
+        !g.update(STEREO_RESUME_LINK_RATE, s(15)),
+        "held 5 s: stereo"
+    );
+    assert!(!g.squeezed());
+}
+
+#[test]
+fn stereo_jitter_buffer_keeps_audio_time_and_frames() {
+    let mut jb = JitterBuffer::with_ms_channels(10, 20, 2);
+    assert_eq!(jb.channels(), 2);
+    assert_eq!(jb.target(), 960, "10 ms of stereo = 480 frames");
+    jb.push(&vec![1; 960]);
+    assert_eq!(jb.depth_ms(), 10);
+    // Past the ceiling the trim keeps whole frames: L stays on even slots.
+    let frames: Vec<i16> = (0..1500).flat_map(|_| [1i16, -1]).collect();
+    jb.push(&frames);
+    assert_eq!(jb.len() % 2, 0);
+    let mut out = vec![0i16; 4];
+    assert!(jb.pop(&mut out));
+    assert_eq!(out, [1, -1, 1, -1]);
+}
+
+/// Mono fallback: a stereo source down-mixes for a peer without
+/// CAP_STEREO (Opus) and for one without Opus (raw PCM, always mono).
+#[test]
+fn stereo_source_falls_back_to_mono() {
+    use crate::terminal::{CAP_AUDIO10, CAP_OPUS};
+    let (mut l, mut r) = (SineGen::new(440.0, 8000), SineGen::new(660.0, 8000));
+    let tick = stereo_tick(&mut l, &mut r, 480);
+    let mut raw = AudioEncoder::with_channels(2);
+    let p = raw.encode_ticks(&tick, 0);
+    assert_eq!(p.len(), 1);
+    assert_eq!(raw.mode(), AudioMode::Pcm);
+    assert_eq!(
+        decode_audio_frame(&p[0]).unwrap().1,
+        downmix_stereo(&tick),
+        "raw PCM is the mono down-mix"
+    );
+    if !cfg!(feature = "opus") {
+        return;
+    }
+    let mut enc = AudioEncoder::with_channels(2);
+    let ps = enc.encode_ticks(&tick, CAP_OPUS | CAP_AUDIO10);
+    assert_eq!(ps.len(), 1);
+    assert_eq!(enc.mode(), AudioMode::OpusMono);
+    let toc = ps[0][HEADER_LEN];
+    assert_eq!(toc & 0x04, 0, "mono packet (TOC s bit clear)");
+    assert_eq!(
+        u32::from_be_bytes([ps[0][2], ps[0][3], ps[0][4], ps[0][5]]),
+        480
+    );
+    // A mono source never goes stereo, CAP_STEREO or not.
+    let mut mono = AudioEncoder::new();
+    let ps = mono.encode_ticks(
+        &tick[..480],
+        CAP_OPUS | CAP_AUDIO10 | crate::terminal::CAP_STEREO,
+    );
+    assert_eq!(ps[0][HEADER_LEN] & 0x04, 0);
+    assert_eq!(mono.mode(), AudioMode::OpusMono);
+}
+
+/// CAP negotiation: CAP_STEREO comes with the Opus decode caps.
+#[test]
+fn audio_caps_advertise_stereo_with_opus() {
+    use crate::terminal::{CAP_AUDIO10, CAP_OPUS, CAP_STEREO};
+    if cfg!(feature = "opus") {
+        assert_eq!(audio_caps(), CAP_OPUS | CAP_AUDIO10 | CAP_STEREO);
+    } else {
+        assert_eq!(audio_caps(), 0);
+    }
+}
+
+/// Stereo Opus round trip (10 ms, FEC on): 2-channel packets at ~128 kbps
+/// whose channels stay apart after decoding; a mono decoder down-mixes the
+/// same packets; on a thin link the stream is squeezed to mono / 64 kbps
+/// without changing the decoder's layout.
+#[cfg(feature = "opus")]
+#[test]
+fn opus_stereo_roundtrip_keeps_channels_apart() {
+    use crate::terminal::{CAP_AUDIO10, CAP_OPUS, CAP_STEREO};
+    let caps = CAP_OPUS | CAP_AUDIO10 | CAP_STEREO;
+    let (mut l, mut r) = (SineGen::new(440.0, 8000), SineGen::new(660.0, 1000));
+    let mut enc = AudioEncoder::with_channels(2);
+    let mut dec = AudioDecoder::with_channels(2);
+    let mut mono_dec = AudioDecoder::new();
+    let (mut el, mut er, mut in_l, mut in_r) = (0f64, 0f64, 0f64, 0f64);
+    for i in 0..100 {
+        let tick = stereo_tick(&mut l, &mut r, 480);
+        let ps = enc.encode_ticks(&tick, caps);
+        assert_eq!(ps.len(), 1);
+        let p = &ps[0];
+        assert_eq!(p[0], CODEC_OPUS);
+        assert_eq!(u32::from_be_bytes([p[2], p[3], p[4], p[5]]), 480);
+        assert_ne!(p[HEADER_LEN] & 0x04, 0, "stereo packet (TOC s bit)");
+        let out = dec.decode(p).unwrap();
+        assert_eq!(out.len(), 960, "480 interleaved stereo frames");
+        assert_eq!(mono_dec.decode(p).unwrap().len(), 480, "mono down-mix");
+        if i >= 10 {
+            in_l += energy(&tick, 0, 2);
+            in_r += energy(&tick, 1, 2);
+            el += energy(&out, 0, 2);
+            er += energy(&out, 1, 2);
+        }
+    }
+    assert_eq!(enc.mode(), AudioMode::OpusStereo);
+    // Left is 8x louder than right (~18 dB) and stays so.
+    let (ratio_in, ratio_out) = (in_l / in_r, el / er);
+    assert!(
+        ratio_out > ratio_in / 4.0 && ratio_out < ratio_in * 4.0,
+        "L/R energy {ratio_out:.1} vs {ratio_in:.1}"
+    );
+    let kbps = enc.bitrate() / 1000.0;
+    assert!(kbps > 64.0 && kbps < 200.0, "stereo bitrate {kbps:.1} kbps");
+    // FEC / PLC produce stereo frames.
+    let tick = stereo_tick(&mut l, &mut r, 480);
+    let next = enc.encode_ticks(&tick, caps).remove(0);
+    assert_eq!(dec.decode_fec(&next, 480).unwrap().len(), 960);
+    assert_eq!(dec.conceal(480).unwrap().len(), 960);
+
+    // Thin link: squeezed to mono-coded packets at ~64 kbps, still decoded
+    // as 2 channels (L = R).
+    let now = std::time::Instant::now();
+    assert!(enc.set_link_rate(STEREO_MIN_LINK_RATE / 2, now));
+    let (bytes0, samples0) = (enc.bytes, enc.samples);
+    let mut last = Vec::new();
+    let mut stereo_coded = Vec::new();
+    for i in 0..100 {
+        let tick = stereo_tick(&mut l, &mut r, 480);
+        let p = enc.encode_ticks(&tick, caps).remove(0);
+        if p[HEADER_LEN] & 0x04 != 0 {
+            stereo_coded.push(i);
+        }
+        last = dec.decode(&p).unwrap();
+        assert_eq!(last.len(), 960);
+    }
+    // libopus codes one transition packet in stereo, then mono.
+    assert!(stereo_coded.iter().all(|&i| i < 3), "{stereo_coded:?}");
+    assert_eq!(enc.mode(), AudioMode::OpusSqueezed);
+    assert!(last.chunks(2).all(|f| f[0] == f[1]), "mono plays as L = R");
+    let kbps = (enc.bytes - bytes0) as f64 * 8.0
+        / ((enc.samples - samples0) as f64 / f64::from(SAMPLE_RATE))
+        / 1000.0;
+    assert!(kbps < 90.0, "squeezed bitrate {kbps:.1} kbps");
+}
+
+/// A stereo decoder plays old mono streams (Opus and raw PCM) as L = R.
+#[cfg(feature = "opus")]
+#[test]
+fn stereo_decoder_upmixes_mono_streams() {
+    let mut enc = AudioEncoder::new();
+    let mut dec = AudioDecoder::with_channels(2);
+    let mut g = SineGen::new(440.0, 8000);
+    let mut tick = vec![0i16; 480];
+    for _ in 0..5 {
+        g.tick(&mut tick);
+        let p = enc.encode(&tick, crate::terminal::CAP_OPUS);
+        let out = dec.decode(&p).unwrap();
+        assert_eq!(out.len(), 960);
+        assert!(out.chunks(2).all(|f| f[0] == f[1]));
+    }
+    let raw = encode_audio_frame(&[5, -6], FLAG_NONE);
+    assert_eq!(dec.decode(&raw).unwrap(), vec![5, 5, -6, -6]);
+    assert_eq!(dec.decode_fec(&raw, 480).unwrap().len(), 960);
+}

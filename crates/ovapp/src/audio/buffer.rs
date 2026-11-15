@@ -76,8 +76,13 @@ impl AudioRingBuffer {
 ///   target — latency can never ratchet up behind a stall.
 /// - **Underrun**: a pop that cannot be fully served plays what is there,
 ///   zero-fills the rest, counts it, and re-enters prefill.
+///
+/// Stereo ([`with_ms_channels`](Self::with_ms_channels)`(.., 2)`) holds
+/// interleaved `L R` samples: target, ceiling and depth stay in audio time,
+/// and trims always drop whole frames so the channels never swap.
 pub struct JitterBuffer {
     buf: std::collections::VecDeque<i16>,
+    channels: usize,
     target: usize,
     max: usize,
     primed: bool,
@@ -97,13 +102,21 @@ impl Default for JitterBuffer {
 }
 
 impl JitterBuffer {
-    /// A buffer with `target_ms` prefill and a `max_ms` ceiling.
+    /// A mono buffer with `target_ms` prefill and a `max_ms` ceiling.
     pub fn with_ms(target_ms: u32, max_ms: u32) -> Self {
-        let per_ms = (SAMPLE_RATE / 1000) as usize;
-        let target = (target_ms as usize * per_ms).max(1);
+        Self::with_ms_channels(target_ms, max_ms, 1)
+    }
+
+    /// A buffer of `channels`-channel interleaved audio (1 or 2) with
+    /// `target_ms` prefill and a `max_ms` ceiling.
+    pub fn with_ms_channels(target_ms: u32, max_ms: u32, channels: usize) -> Self {
+        let channels = channels.clamp(1, 2);
+        let per_ms = (SAMPLE_RATE / 1000) as usize * channels;
+        let target = (target_ms as usize * per_ms).max(channels);
         let max = (max_ms as usize * per_ms).max(target);
         Self {
-            buf: std::collections::VecDeque::with_capacity(max + TICK_SAMPLES as usize),
+            buf: std::collections::VecDeque::with_capacity(max + TICK_SAMPLES as usize * channels),
+            channels,
             target,
             max,
             primed: false,
@@ -116,7 +129,10 @@ impl JitterBuffer {
     pub fn push(&mut self, samples: &[i16]) {
         self.buf.extend(samples.iter().copied());
         if self.buf.len() > self.max {
-            let drop = self.buf.len() - self.target;
+            // Whole frames only (the channels must stay in step).
+            let drop = (self.buf.len() - self.target)
+                .next_multiple_of(self.channels)
+                .min(self.buf.len());
             self.buf.drain(..drop);
             self.dropped += drop as u64;
         }
@@ -162,7 +178,12 @@ impl JitterBuffer {
 
     /// Buffered depth in milliseconds.
     pub fn depth_ms(&self) -> u32 {
-        (self.buf.len() as u64 * 1000 / u64::from(SAMPLE_RATE)) as u32
+        (self.buf.len() as u64 * 1000 / (u64::from(SAMPLE_RATE) * self.channels as u64)) as u32
+    }
+
+    /// Interleaved channels (1 = mono, 2 = stereo).
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 
     /// Prefill target (samples).
@@ -193,6 +214,7 @@ impl JitterBuffer {
 #[derive(Clone)]
 pub struct AudioBus {
     buf: std::sync::Arc<std::sync::Mutex<JitterBuffer>>,
+    channels: usize,
     enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -208,15 +230,28 @@ impl AudioBus {
         Self::with_ms(JITTER_TARGET_MS, JITTER_MAX_MS)
     }
 
-    /// A disabled bus with a `target_ms` prefill / `max_ms`
-    /// ceiling jitter buffer (the desktop viewer uses 30 / 90 ms).
+    /// A disabled mono bus with a `target_ms` prefill / `max_ms`
+    /// ceiling jitter buffer.
     pub fn with_ms(target_ms: u32, max_ms: u32) -> Self {
+        Self::with_ms_channels(target_ms, max_ms, 1)
+    }
+
+    /// A disabled bus of `channels`-channel interleaved audio with a
+    /// `target_ms` prefill / `max_ms` ceiling jitter buffer (the desktop
+    /// viewer uses stereo, 30 / 90 ms). The playback device opens with
+    /// [`channels`](Self::channels) channels.
+    pub fn with_ms_channels(target_ms: u32, max_ms: u32, channels: usize) -> Self {
+        let buf = JitterBuffer::with_ms_channels(target_ms, max_ms, channels);
         Self {
-            buf: std::sync::Arc::new(std::sync::Mutex::new(JitterBuffer::with_ms(
-                target_ms, max_ms,
-            ))),
+            channels: buf.channels(),
+            buf: std::sync::Arc::new(std::sync::Mutex::new(buf)),
             enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Interleaved channels of the audio on this bus.
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 
     /// Enable/disable playback; disabling discards buffered audio.

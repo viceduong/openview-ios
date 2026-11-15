@@ -55,6 +55,17 @@ pub fn encode(cmd: &Command) -> Vec<u8> {
         }
         Command::Ping(n) => (OpCode::Ping, n.to_be_bytes().to_vec()),
         Command::Pong(n) => (OpCode::Pong, n.to_be_bytes().to_vec()),
+        Command::PongTimed {
+            nonce,
+            rx_us,
+            tx_us,
+        } => {
+            let mut b = Vec::with_capacity(24);
+            b.extend_from_slice(&nonce.to_be_bytes());
+            b.extend_from_slice(&rx_us.to_be_bytes());
+            b.extend_from_slice(&tx_us.to_be_bytes());
+            (OpCode::Pong, b)
+        }
         Command::FrameBegin {
             seq,
             width,
@@ -265,6 +276,11 @@ pub fn encode(cmd: &Command) -> Vec<u8> {
             (OpCode::MediaGap, b)
         }
         Command::Bye => (OpCode::Bye, Vec::new()),
+        Command::Timing(t) => {
+            let mut b = Vec::with_capacity(crate::latency::FrameTiming::LEN);
+            t.encode(&mut b);
+            (OpCode::Timing, b)
+        }
     };
     let mut out = Vec::with_capacity(payload.len() + 1);
     out.push(op as u8);
@@ -336,12 +352,16 @@ fn decode_command(wire: &[u8]) -> Result<Command, String> {
             }
             Command::Ping(u64::from_be_bytes(payload.try_into().unwrap()))
         }
-        OpCode::Pong => {
-            if payload.len() != 8 {
-                return Err("PONG payload must be 8 bytes".into());
-            }
-            Command::Pong(u64::from_be_bytes(payload.try_into().unwrap()))
-        }
+        // 8 bytes: a plain PONG; 24 bytes: a timed PONG (CAP_TIMING).
+        OpCode::Pong => match payload.len() {
+            8 => Command::Pong(u64::from_be_bytes(payload.try_into().unwrap())),
+            24 => Command::PongTimed {
+                nonce: u64::from_be_bytes(payload[..8].try_into().unwrap()),
+                rx_us: u64::from_be_bytes(payload[8..16].try_into().unwrap()),
+                tx_us: u64::from_be_bytes(payload[16..24].try_into().unwrap()),
+            },
+            _ => return Err("PONG payload must be 8 or 24 bytes".into()),
+        },
         OpCode::FrameBegin => {
             if payload.len() < 30 {
                 return Err("FRAME_BEGIN payload too short".into());
@@ -644,6 +664,7 @@ fn decode_command(wire: &[u8]) -> Result<Command, String> {
             }
         }
         OpCode::Bye => Command::Bye,
+        OpCode::Timing => Command::Timing(crate::latency::FrameTiming::decode(payload)?),
     })
 }
 

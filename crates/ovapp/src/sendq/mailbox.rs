@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::latency::HostStamps;
 use crate::screen::{Frame, PixelFormat};
 use crate::terminal::{compress_frame, Command, FrameCodec};
 use crate::tiles::Delta;
@@ -38,6 +39,11 @@ pub struct EncodedFrame {
     /// Ordering barrier (set by the mailbox): a screen update is
     /// only sent once this many video units went out before it.
     pub barrier: u64,
+    /// Host latency stamps (set by the mailbox from
+    /// [`FrameMailbox::set_capture_stamp`]; `None` = not from a timed
+    /// capture, e.g. a refinement): sent as a TIMING record ahead of the
+    /// update when the viewer negotiated `CAP_TIMING`.
+    pub stamps: Option<HostStamps>,
 }
 
 impl EncodedFrame {
@@ -56,6 +62,7 @@ impl EncodedFrame {
             delta: None,
             video: None,
             barrier: 0,
+            stamps: None,
         }
     }
 
@@ -73,6 +80,7 @@ impl EncodedFrame {
             delta: None,
             video: Some(header),
             barrier: 0,
+            stamps: None,
         }
     }
 
@@ -150,6 +158,8 @@ struct Slot {
     video_taken: u64,
     /// The last `take` returned a video unit (alternate when both wait).
     last_was_video: bool,
+    /// The current capture's stamps (see [`FrameMailbox::set_capture_stamp`]).
+    stamp: Option<HostStamps>,
 }
 
 impl Default for FrameMailbox {
@@ -193,6 +203,7 @@ impl FrameMailbox {
                 // VIDEO_END must precede the region's lossless refresh).
                 let mut frame = frame;
                 frame.barrier = s.video_pushed;
+                stamp_frame(&mut frame, s.stamp);
                 s.frame.replace(frame).is_some()
             }
             Err(_) => return Err(Box::new(frame)),
@@ -233,11 +244,24 @@ impl FrameMailbox {
     /// Queue a video access unit: FIFO, never replaced.
     pub fn push_video(&self, unit: EncodedFrame) {
         if let Ok(mut s) = self.slot.lock() {
+            let mut unit = unit;
+            stamp_frame(&mut unit, s.stamp);
             s.video.push_back(unit);
             s.video_pushed += 1;
         }
         if let Some(n) = &self.notify {
             n();
+        }
+    }
+
+    /// Latency stamps of the capture being encoded: every update put
+    /// (or video unit pushed) until the next call carries them, with its
+    /// encode-done time stamped at the hand-off. The capture thread sets
+    /// them right after a grab and clears them (`None`) once that capture's
+    /// updates are queued, so refinements are never mis-attributed.
+    pub fn set_capture_stamp(&self, stamp: Option<HostStamps>) {
+        if let Ok(mut s) = self.slot.lock() {
+            s.stamp = stamp;
         }
     }
 
@@ -262,6 +286,17 @@ impl FrameMailbox {
     /// Frames dropped because a newer one replaced them before sending.
     pub fn replaced_count(&self) -> u64 {
         self.replaced.load(Ordering::Relaxed)
+    }
+}
+
+/// Stamp an update at its hand-off: the capture's stamps plus "encoded
+/// now" (stamps the encoder already set are kept).
+fn stamp_frame(frame: &mut EncodedFrame, capture: Option<HostStamps>) {
+    if frame.stamps.is_none() {
+        frame.stamps = capture.map(|c| HostStamps {
+            encoded_us: ovcore::clocksync::mono_us(),
+            ..c
+        });
     }
 }
 

@@ -336,6 +336,10 @@ fn buttons_wheel_and_relative_moves() {
     assert_eq!(rec.take(), vec![InputOp::Wheel(-240), InputOp::HWheel(60)]);
     c.handle(&Command::Wheel { dy: 0, dx: 0 }, now);
     assert!(rec.take().is_empty());
+    // High-resolution (sub-notch) deltas pass through unquantised: the
+    // iOS shell streams smooth scrolling as ~12 units per point.
+    c.handle(&Command::Wheel { dy: 7, dx: -1 }, now);
+    assert_eq!(rec.take(), vec![InputOp::Wheel(7), InputOp::HWheel(-1)]);
 }
 
 #[test]

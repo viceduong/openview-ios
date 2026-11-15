@@ -98,10 +98,115 @@ pub(crate) const SHARD_RETX: u8 = 2;
 pub(crate) const FEC_MIN: f64 = 0.10;
 pub(crate) const FEC_MAX: f64 = 0.30;
 
+/// Parity on a clean link where a NACK repairs a loss within a frame
+/// interval (each frame still carries at least one recovery shard).
+pub(crate) const FEC_FLOOR: f64 = 0.02;
+/// A loss estimate at or below this counts as no loss.
+pub(crate) const LOSS_CLEAN: f64 = 0.002;
+/// How long the loss estimate must stay clean before parity drops to
+/// [`FEC_FLOOR`].
+pub(crate) const FEC_CLEAN_HOLD: Duration = Duration::from_secs(3);
+
 /// The FEC ratio for a measured loss rate (0..1): 10 % at no loss, rising
 /// with loss to 30 %.
 pub(crate) fn fec_ratio(loss: f64) -> f64 {
     (FEC_MIN + 4.0 * loss.max(0.0)).clamp(FEC_MIN, FEC_MAX)
+}
+
+/// The adaptive FEC decision for one video frame (pure, deterministic):
+///
+/// - loss above [`LOSS_CLEAN`]: [`fec_ratio`] (10 % + 4 x loss, up to 30 %);
+/// - clean for at least [`FEC_CLEAN_HOLD`] (`clean_for`) **and** the RTT
+///   below the frame interval (a NACK round trip repairs a loss before
+///   the next frame is due, like the receiver's own NACK rule):
+///   [`FEC_FLOOR`] — except keyframes, which are rare and the costliest to
+///   lose, and keep [`FEC_MIN`];
+/// - otherwise [`FEC_MIN`].
+pub(crate) fn adaptive_fec_ratio(
+    loss: f64,
+    clean_for: Option<Duration>,
+    rtt: Option<Duration>,
+    frame_interval: Duration,
+    keyframe: bool,
+) -> f64 {
+    if loss > LOSS_CLEAN {
+        return fec_ratio(loss);
+    }
+    let settled = clean_for.is_some_and(|d| d >= FEC_CLEAN_HOLD);
+    let nack_in_time = rtt.is_some_and(|r| r < frame_interval);
+    if settled && nack_in_time && !keyframe {
+        FEC_FLOOR
+    } else {
+        FEC_MIN
+    }
+}
+
+/// Sender-side state of [`adaptive_fec_ratio`]: since when the loss
+/// estimate is clean, and the smoothed interval between video frames.
+#[derive(Debug, Clone)]
+pub(crate) struct FecController {
+    clean_since: Option<Instant>,
+    last_frame: Option<Instant>,
+    /// Smoothed frame interval, seconds (same smoothing as the receiver).
+    interval: f64,
+    /// The ratio the last frame got.
+    last: f64,
+}
+
+impl Default for FecController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FecController {
+    /// No frame sent yet: [`FEC_MIN`], 30 fps assumed.
+    pub(crate) fn new() -> Self {
+        Self {
+            clean_since: None,
+            last_frame: None,
+            interval: 1.0 / 30.0,
+            last: FEC_MIN,
+        }
+    }
+
+    /// The ratio for a video frame sent at `now`, given the loss estimate
+    /// and the link RTT; updates the clean timer and frame interval.
+    pub(crate) fn next_ratio(
+        &mut self,
+        now: Instant,
+        loss: f64,
+        rtt: Option<Duration>,
+        keyframe: bool,
+    ) -> f64 {
+        if let Some(t) = self.last_frame {
+            let dt = now
+                .saturating_duration_since(t)
+                .as_secs_f64()
+                .clamp(0.004, 0.25);
+            self.interval = 0.9 * self.interval + 0.1 * dt;
+        }
+        self.last_frame = Some(now);
+        let clean_for = if loss > LOSS_CLEAN {
+            self.clean_since = None;
+            None
+        } else {
+            let since = *self.clean_since.get_or_insert(now);
+            Some(now.saturating_duration_since(since))
+        };
+        self.last = adaptive_fec_ratio(loss, clean_for, rtt, self.frame_interval(), keyframe);
+        self.last
+    }
+
+    /// The ratio the last frame got ([`FEC_MIN`] before the first).
+    pub(crate) fn ratio(&self) -> f64 {
+        self.last
+    }
+
+    /// The smoothed interval between sent video frames.
+    pub(crate) fn frame_interval(&self) -> Duration {
+        Duration::from_secs_f64(self.interval)
+    }
 }
 
 // ---------------------------------------------------------------------------

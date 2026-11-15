@@ -66,6 +66,25 @@ struct InFlight {
     begun: bool,
     /// When FRAME_BEGIN went out.
     started: Instant,
+    /// The TIMING record went out (or is not wanted).
+    timed: bool,
+}
+
+/// The TIMING record for `frame`, its first byte leaving now (`None`:
+/// the frame carries no stamps).
+fn timing_record(frame: &EncodedFrame) -> Option<Command> {
+    let stamps = frame.stamps?;
+    let kind = if frame.video.is_some() {
+        crate::latency::KIND_VIDEO
+    } else {
+        crate::latency::KIND_SCREEN
+    };
+    Some(Command::Timing(crate::latency::FrameTiming::from_stamps(
+        kind,
+        frame.seq,
+        &stamps,
+        ovcore::clocksync::mono_us(),
+    )))
 }
 
 /// One record the sender wants on the wire next.
@@ -95,6 +114,9 @@ pub struct PrioritySender {
     /// The transport's delay-based controller governs the rate
     /// (direct v2 path): the PING-window pacer is bypassed.
     governed: bool,
+    /// The viewer negotiated `CAP_TIMING`: stamped updates are preceded by
+    /// a TIMING record (set per flush).
+    timing: bool,
 }
 
 impl PrioritySender {
@@ -109,6 +131,7 @@ impl PrioritySender {
             pacer: LinkPacer::new(),
             media: false,
             governed: false,
+            timing: false,
         }
     }
 
@@ -236,9 +259,16 @@ impl PrioritySender {
                 offset: 0,
                 begun: false,
                 started: now,
+                timed: !self.timing,
             });
         }
         let f = self.inflight.as_mut()?;
+        if !f.timed {
+            f.timed = true;
+            if let Some(t) = timing_record(&f.frame) {
+                return Some(Outgoing::Frame(t));
+            }
+        }
         if !f.begun {
             f.begun = true;
             f.started = now;
@@ -288,6 +318,7 @@ impl PrioritySender {
         // and rate-limits; video rides the media channel.
         self.governed = term.transport_rate().is_some();
         self.media = term.media_ready();
+        self.timing = term.timing_enabled();
         if !self.governed
             && self
                 .pacer
@@ -335,6 +366,12 @@ impl PrioritySender {
                 }
                 Outgoing::Media(f) => {
                     let header = f.video.unwrap_or_default();
+                    // The stamps ride the reliable channel just ahead of
+                    // the unit (the viewer joins them by video seq).
+                    let timing = if self.timing { timing_record(&f) } else { None };
+                    if let Some(t) = &timing {
+                        term.send(t)?;
+                    }
                     if term.send_video_media(&header, &f.data)? {
                         sent += 1;
                         frame_records += 1;
@@ -347,6 +384,7 @@ impl PrioritySender {
                             offset: 0,
                             begun: false,
                             started: Instant::now(),
+                            timed: timing.is_some() || !self.timing,
                         });
                     }
                 }

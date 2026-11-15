@@ -93,6 +93,21 @@ pub const CAP_MEDIA: u32 = 1 << 15;
 /// liveness timeout). A peer sends BYE only to one that set it. Every
 /// [`TerminalSession`] handles BYE, so it is part of [`LOCAL_CAPS`].
 pub const CAP_BYE: u32 = 1 << 16;
+/// [`Command::Caps`] bit (both directions): "I speak latency telemetry" —
+/// a host that sees it answers PINGs with timed PONGs
+/// ([`Command::PongTimed`]) and stamps each update with a
+/// [`Command::Timing`] record; a viewer that sees it sends clock-probe
+/// PINGs (see [`crate::latency`]). Used only when both peers set it; part of
+/// [`LOCAL_CAPS`].
+pub const CAP_TIMING: u32 = 1 << 17;
+/// [`Command::Caps`] bit (viewer): "I decode and play stereo Opus
+/// AUDIO" (2-channel packets; the header's `samples` stays per channel).
+/// A host with a stereo source (system-audio loopback) then sends stereo
+/// Opus (128 kbps, squeezed to mono / 64 kbps on a thin link); everyone
+/// else gets the mono down-mix. Needs [`CAP_OPUS`]. Advertised with the
+/// `opus` feature (see `crate::audio::audio_caps`) and by the iOS shell when
+/// AVAudioConverter decodes stereo Opus.
+pub const CAP_STEREO: u32 = 1 << 18;
 /// What every build supports (tiles + zstd decode in pure Rust; every UDP
 /// carrier understands the reliable framing). The session advertises this
 /// plus `crate::audio::audio_caps` (Opus with the `opus` feature); see
@@ -105,4 +120,5 @@ pub const LOCAL_CAPS: u32 = CAP_TILES
     | CAP_LZ4
     | CAP_BANDS
     | CAP_MOVE
-    | CAP_BYE;
+    | CAP_BYE
+    | CAP_TIMING;

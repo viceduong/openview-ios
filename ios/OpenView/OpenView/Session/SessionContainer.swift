@@ -487,8 +487,9 @@ private struct ReconnectCapsule: View {
     }
 }
 
-/// Connection quality chip: dot (green / amber / red from RTT + liveness)
-/// and the RTT; tap for RTT, FPS, transport and host fingerprint.
+/// Connection quality chip: dot (green / amber / red from RTT + liveness),
+/// the RTT and (timing-capable hosts) the end-to-end latency; tap for RTT,
+/// latency, FPS, transport and host fingerprint.
 private struct StatsChip: View {
     @ObservedObject var liveness: LivenessModel
     let transport: String
@@ -510,9 +511,18 @@ private struct StatsChip: View {
         liveness.rttMs >= 0 ? "\(liveness.rttMs) ms" : "— ms"
     }
 
+    /// Host capture -> presented here, median (nil before a timing host's
+    /// first measured update).
+    private var e2eText: String? {
+        guard let ms = liveness.latency?.total.p50Ms else { return nil }
+        return "\(LatencyBreakdown.format(ms)) ms"
+    }
+
     private var accessibilityText: String {
-        guard let path = liveness.path else { return "Connection quality \(rttText)" }
-        return "Connection quality \(rttText), \(path)"
+        var text = "Connection quality \(rttText)"
+        if let e2e = e2eText { text += ", end-to-end latency \(e2e)" }
+        if let path = liveness.path { text += ", \(path)" }
+        return text
     }
 
     /// "Direct" / "Relay" / "Probing…" next to the RTT.
@@ -535,6 +545,11 @@ private struct StatsChip: View {
                         .frame(width: 8, height: 8)
                     Text(rttText)
                         .font(.caption.monospacedDigit().weight(.semibold))
+                    if let e2e = e2eText {
+                        Text("· e2e \(e2e)")
+                            .font(.caption.monospacedDigit().weight(.semibold))
+                            .foregroundColor(Color.white.opacity(0.75))
+                    }
                     if let p = shortPath {
                         Text("· \(p)")
                             .font(.caption.weight(.semibold))
@@ -553,6 +568,9 @@ private struct StatsChip: View {
                 )
                 if expanded {
                     detailRow("RTT", rttText)
+                    if let lat = liveness.latency {
+                        detailRow("E2E", lat.line)
+                    }
                     detailRow("FPS", String(format: "%.1f", Double(liveness.fps)))
                     detailRow("Link", transport)
                     if let path = liveness.path {

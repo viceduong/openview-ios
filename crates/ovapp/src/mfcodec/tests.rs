@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
+use super::encoder::EncodeParams;
 use super::*;
 use crate::tiles::TileRect;
 use crate::video::{
@@ -64,6 +65,9 @@ fn smoke(pref: EncoderPref) {
     let summary = crate::video::sps::summary(sps_nal).expect("SPS parses");
     eprintln!("SPS: {summary:?}");
     assert!(summary.colour.is_bt709_limited(), "{:?}", summary.colour);
+    // The SPS signals the profile the encoder reports (High by default).
+    assert_eq!(summary.profile_idc, enc.profile().profile_idc());
+    eprintln!("profile {:?}, caps {:?}", enc.profile(), enc.caps());
     assert!(
         aus[1..15].iter().all(|a| !a.keyframe),
         "no spontaneous IDRs"
@@ -449,6 +453,258 @@ fn bench_h264() {
                 f64::from(bitrate) / 1e6,
                 lossless as f64 / bytes.max(1) as f64,
                 psnr / f64::from(pn.max(1))
+            );
+        }
+    }
+}
+
+/// Main and High profile both decode on the Media Foundation decoder (the
+/// viewer path) with the SPS `profile_idc` the encoder reports.
+#[test]
+fn main_and_high_profiles_decode() {
+    let (w, h) = (640, 384);
+    for profile in [H264Profile::Main, H264Profile::High] {
+        let p = EncodeParams {
+            profile,
+            ..EncodeParams::new(w, h, 30, 8_000_000)
+        };
+        let mut enc = match H264Encoder::with_params(&p, EncoderPref::Auto) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skipping {profile:?}: no encoder ({e})");
+                return;
+            }
+        };
+        assert_eq!(enc.profile(), profile, "{} took {profile:?}", enc.name());
+        let mut dec = H264Decoder::new().unwrap();
+        let (mut out, mut decoded, mut psnr) = (Vec::new(), 0u32, 0f64);
+        for t in 0..20u32 {
+            let px = picture(w, h, t);
+            let pts = 1_000_000 + u64::from(t) * 33_333;
+            for au in enc.encode(&px, w as usize * 4, false, pts).unwrap() {
+                if au.keyframe {
+                    let sps = AccessUnit::from_annexb(&au.data).sps.unwrap();
+                    let s = crate::video::sps::summary(&sps).expect("SPS parses");
+                    assert_eq!(s.profile_idc, profile.profile_idc());
+                }
+                if dec.decode(&au.data, w, h, &mut out).unwrap() {
+                    decoded += 1;
+                    if au.pts_us == pts {
+                        psnr = psnr_bgra(&px, &out);
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{profile:?} via {}: {decoded} decoded, last PSNR {psnr:.1} dB",
+            enc.name()
+        );
+        assert!(
+            decoded >= 17 && psnr > 30.0,
+            "{decoded} decoded, {psnr:.1} dB"
+        );
+    }
+}
+
+/// Probe, not a correctness test: prints the optional encoder features
+/// (LTR, intra refresh, ...) of every encoder available here. Run with
+/// `cargo test -p ovapp --features mf -- --ignored --nocapture probe_encoder_caps`.
+#[test]
+#[ignore]
+fn probe_encoder_caps() {
+    for pref in [EncoderPref::Hardware, EncoderPref::Software] {
+        match H264Encoder::new(1280, 720, 30, 4_000_000, pref) {
+            Ok(e) => println!(
+                "{}: profile {:?}, LTR {}, {:?}",
+                e.name(),
+                e.profile(),
+                e.caps().ltr(),
+                e.caps()
+            ),
+            Err(e) => println!("{pref:?}: unavailable: {e}"),
+        }
+    }
+    if let Ok(device) = gpu_device() {
+        match H264Encoder::new_gpu(&device, 1280, 720, 30, 4_000_000) {
+            Ok(e) => println!("{}: LTR {}, {:?}", e.name(), e.caps().ltr(), e.caps()),
+            Err(e) => println!("GPU input: unavailable: {e}"),
+        }
+    }
+}
+
+/// Benchmark, not a correctness test: Main vs High profile bytes at equal
+/// quality (constant QP) and PSNR at equal bitrate (CBR), on a desktop
+/// with a scrolling page, a full-screen desktop with a moving video region,
+/// and natural video. Run with
+/// `cargo test --release -p ovapp --features mf -- --ignored --nocapture bench_profiles`.
+#[test]
+#[ignore]
+fn bench_profiles() {
+    use crate::video::synth_desktop;
+    let (w, h) = (1920u32, 1080u32);
+    let frames = 90u32;
+    let secs = f64::from(frames) / 30.0;
+    let full = TileRect {
+        x: 0,
+        y: 0,
+        w: w as u16,
+        h: h as u16,
+    };
+    let region = TileRect {
+        x: 640,
+        y: 320,
+        w: 640,
+        h: 360,
+    };
+    type Scene = (&'static str, fn(&mut Vec<u8>, u32, TileRect, TileRect));
+    let scenes: [Scene; 3] = [
+        ("scrolling page", |px, t, full, _| {
+            synth_scroll(px, 1920, full, t, 8)
+        }),
+        ("desktop + video region", |px, t, _, region| {
+            synth_video(px, 1920, region, t)
+        }),
+        ("full-screen video", |px, t, full, _| {
+            synth_video(px, 1920, full, t)
+        }),
+    ];
+    for pref in [EncoderPref::Hardware, EncoderPref::Software] {
+        for (label, scene) in scenes {
+            for (mode, qp, bitrate) in [
+                ("QP 26", Some(26u32), 8_000_000u32),
+                ("QP 32", Some(32), 8_000_000),
+                ("CBR 4 Mbps", None, 4_000_000),
+            ] {
+                let mut row = Vec::new();
+                for profile in [H264Profile::Main, H264Profile::High] {
+                    let p = EncodeParams {
+                        profile,
+                        qp,
+                        ..EncodeParams::new(w, h, 30, bitrate)
+                    };
+                    let mut enc = match H264Encoder::with_params(&p, pref) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            println!("{pref:?}: unavailable: {e}");
+                            return;
+                        }
+                    };
+                    let mut dec = H264Decoder::new().unwrap();
+                    let mut px = vec![0u8; (w * h * 4) as usize];
+                    synth_desktop(&mut px, w, h);
+                    let (mut bytes, mut psnr, mut pn) = (0usize, 0f64, 0u32);
+                    let mut out = Vec::new();
+                    let mut sent = std::collections::HashMap::new();
+                    for t in 0..frames {
+                        scene(&mut px, t, full, region);
+                        let pts = 1_000_000 + u64::from(t) * 33_333;
+                        if t >= 10 {
+                            sent.insert(pts, px.clone());
+                        }
+                        for au in enc.encode(&px, w as usize * 4, false, pts).unwrap() {
+                            bytes += au.data.len();
+                            if dec.decode(&au.data, w, h, &mut out).unwrap() {
+                                if let Some(src) = sent.remove(&au.pts_us) {
+                                    psnr += psnr_bgra(&src, &out);
+                                    pn += 1;
+                                }
+                            }
+                        }
+                    }
+                    let kbps = bytes as f64 * 8.0 / 1000.0 / secs;
+                    let db = psnr / f64::from(pn.max(1));
+                    row.push((enc.profile(), kbps, db, enc.name()));
+                }
+                let (m, hi) = (&row[0], &row[1]);
+                println!(
+                    "{} | {label} | {mode}: {:?} {:.0} kbps {:.2} dB | {:?} {:.0} kbps {:.2} dB | High/Main bytes {:.1}%, dPSNR {:+.2} dB",
+                    m.3,
+                    m.0,
+                    m.1,
+                    m.2,
+                    hi.0,
+                    hi.1,
+                    hi.2,
+                    hi.1 / m.1 * 100.0,
+                    hi.2 - m.2
+                );
+            }
+        }
+    }
+}
+
+/// The PPS `transform_8x8_mode_flag` (the High-profile coding tool), or
+/// `None` when the PPS ends before it (Main-style PPS) or does not parse.
+fn pps_transform_8x8(nal: &[u8]) -> Option<bool> {
+    let d = crate::video::sps::unescape(nal);
+    let mut pos = 8usize; // skip the NAL header
+    let total = (d.len() * 8).checked_sub(1 + d.last()?.trailing_zeros() as usize)?;
+    let mut bit = || -> Option<u32> {
+        let b = d.get(pos / 8)? >> (7 - pos % 8) & 1;
+        pos += 1;
+        Some(u32::from(b))
+    };
+    let ue = |bit: &mut dyn FnMut() -> Option<u32>| -> Option<u32> {
+        let mut z = 0;
+        while bit()? == 0 {
+            z += 1;
+            if z > 31 {
+                return None;
+            }
+        }
+        let mut v = 1u32;
+        for _ in 0..z {
+            v = (v << 1) | bit()?;
+        }
+        Some(v - 1)
+    };
+    ue(&mut bit)?; // pps id
+    ue(&mut bit)?; // sps id
+    bit()?; // entropy_coding_mode
+    bit()?; // bottom_field_pic_order_in_frame_present
+    if ue(&mut bit)? != 0 {
+        return None; // slice groups: not produced by our encoders
+    }
+    ue(&mut bit)?;
+    ue(&mut bit)?;
+    bit()?;
+    bit()?;
+    bit()?; // weighted_pred, weighted_bipred_idc (2)
+    for _ in 0..3 {
+        ue(&mut bit)?; // pic_init_qp/qs, chroma_qp_index_offset (se as ue)
+    }
+    bit()?;
+    bit()?;
+    bit()?; // deblocking, constrained_intra, redundant_pic_cnt
+    drop(bit);
+    if pos >= total {
+        return None;
+    }
+    Some(d[pos / 8] >> (7 - pos % 8) & 1 == 1)
+}
+
+/// Prints which encoders actually turn on the High-profile 8x8 transform.
+#[test]
+#[ignore]
+fn probe_high_profile_tools() {
+    for pref in [EncoderPref::Hardware, EncoderPref::Software] {
+        for profile in [H264Profile::Main, H264Profile::High] {
+            let p = EncodeParams {
+                profile,
+                ..EncodeParams::new(640, 384, 30, 4_000_000)
+            };
+            let Ok(mut enc) = H264Encoder::with_params(&p, pref) else {
+                continue;
+            };
+            let px = picture(640, 384, 0);
+            let aus = enc.encode(&px, 640 * 4, true, 1_000_000).unwrap();
+            let pps = aus
+                .iter()
+                .find_map(|a| AccessUnit::from_annexb(&a.data).pps);
+            println!(
+                "{} {profile:?}: transform_8x8_mode {:?}",
+                enc.name(),
+                pps.as_deref().map(pps_transform_8x8)
             );
         }
     }

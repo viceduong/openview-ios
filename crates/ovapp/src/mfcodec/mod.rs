@@ -5,8 +5,10 @@
 //! Sync through `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE)`, driven with the async
 //! event model), falling back to Microsoft's software MFT (synchronous).
 //! Low-latency mode, no B-frames, CBR at the requested bitrate (retargeted
-//! at run time from the link pacer), a long GOP and IDR on demand
-//! (`CODECAPI_AVEncVideoForceKeyFrame`). Input is system-memory NV12
+//! at run time from the link pacer), High profile ([`H264Profile`]; Main if
+//! the MFT refuses it), a long GOP and IDR on demand
+//! (`CODECAPI_AVEncVideoForceKeyFrame`). Optional features (LTR, intra
+//! refresh) are probed once into [`EncoderCaps`]. Input is system-memory NV12
 //! converted from the captured BGRA on the CPU ([`crate::video::bgra_to_nv12`]).
 //! Output is Annex-B; every IDR is made self-contained (SPS/PPS) by
 //! [`ParamSetCache`](crate::video::ParamSetCache).
@@ -32,7 +34,7 @@ mod mft;
 mod tests;
 
 pub use decoder::H264Decoder;
-pub use encoder::H264Encoder;
+pub use encoder::{EncoderCaps, H264Encoder, H264Profile};
 pub use gpu::{gpu_device, GpuFrame};
 
 use std::cell::Cell;

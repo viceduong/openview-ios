@@ -2,8 +2,11 @@
 //! decrypts and decodes every inbound record, keeps the per-command session
 //! state (auto-replies, CAPS, reassembly) and forwards commands to the hook.
 
+use std::time::Instant;
+
 use ovtransport::TransportError;
 
+use crate::latency::{is_clock_probe, KIND_SCREEN};
 use crate::tiles::{Delta, UpdateMeta};
 
 use super::session::PendingFrame;
@@ -49,11 +52,39 @@ impl TerminalSession {
             on_datagram(d);
         }
         self.carrier.poll_recv(&mut on_datagram)?;
+        // One receive stamp per batch (PING t2, PONG t4, reassembly).
+        let rx_at = Instant::now();
+        let rx_us = ovcore::clocksync::instant_us(rx_at);
+        let timed = self.timing_enabled();
         for cmd in &inbox {
             self.stats.cmds_rx += 1;
             match cmd {
                 Command::Ping(nonce) => {
-                    let _ = self.send(&Command::Pong(*nonce));
+                    let reply = if timed {
+                        Command::PongTimed {
+                            nonce: *nonce,
+                            rx_us,
+                            tx_us: ovcore::clocksync::mono_us(),
+                        }
+                    } else {
+                        Command::Pong(*nonce)
+                    };
+                    let _ = self.send(&reply);
+                }
+                Command::PongTimed {
+                    nonce,
+                    rx_us: t2,
+                    tx_us: t3,
+                } => {
+                    self.clock.on_pong(*nonce, *t2, *t3, rx_us);
+                    if !is_clock_probe(*nonce) {
+                        self.last_pong = Some(*nonce);
+                    }
+                }
+                Command::Timing(t) => {
+                    if self.latency_on {
+                        self.latency.on_timing(*t);
+                    }
                 }
                 Command::Echo(payload) => {
                     let _ = self.send(&Command::Echo(payload.clone()));
@@ -84,7 +115,11 @@ impl TerminalSession {
                         tracing::warn!("file transfer: {e} — dropped");
                     }
                 }
-                Command::Pong(nonce) => self.last_pong = Some(*nonce),
+                Command::Pong(nonce) => {
+                    if !is_clock_probe(*nonce) {
+                        self.last_pong = Some(*nonce);
+                    }
+                }
                 // CAPS: remember the peer's bits and answer with
                 // ours once (the viewer announces first; the host replies).
                 Command::Caps { flags } => {
@@ -259,6 +294,9 @@ impl TerminalSession {
                         if data.len() > meta.compressed_len as usize {
                             data.truncate(meta.compressed_len as usize);
                         }
+                        if self.latency_on && data.len() >= meta.compressed_len as usize {
+                            self.latency.on_received(KIND_SCREEN, *seq, rx_at);
+                        }
                         if data.len() < meta.compressed_len as usize {
                             tracing::debug!(
                                 "frame {seq}: got {} wire bytes, declared {} — dropped",
@@ -274,6 +312,10 @@ impl TerminalSession {
                             let ok = self.apply_update(&meta, *seq, &data);
                             self.recycle_wire(data);
                             if ok {
+                                if self.latency_on {
+                                    self.latency
+                                        .on_decoded(KIND_SCREEN, *seq, Instant::now());
+                                }
                                 if let Some(frame) = self.copy_fb() {
                                     if let Some(fh) = self.on_frame.as_mut() {
                                         fh(&frame);
@@ -298,22 +340,39 @@ impl TerminalSession {
             // FILE_XFER_DATA chunks likewise stay out of the hook (they are
             // already reassembled by the pump); FILE_XFER_COMPLETE is the
             // completion event and still reaches the hook.
-            if !matches!(
-                cmd,
-                Command::FrameBegin { .. }
-                    | Command::TilesBegin { .. }
-                    | Command::VideoBegin { .. }
-                    | Command::VideoUnit { .. }
-                    | Command::FrameData(_)
-                    | Command::FrameEnd(_)
-                    | Command::FileXferData { .. }
-            ) {
+            // A timed PONG reaches the hook as a plain PONG (clock-probe
+            // echoes not at all); TIMING records stay in the session.
+            let plain;
+            let cmd = if let Command::PongTimed { nonce, .. } = cmd {
+                plain = Command::Pong(*nonce);
+                &plain
+            } else {
+                cmd
+            };
+            let internal = match cmd {
+                Command::Pong(n) => is_clock_probe(*n),
+                Command::Timing(_) => true,
+                _ => false,
+            };
+            if !internal
+                && !matches!(
+                    cmd,
+                    Command::FrameBegin { .. }
+                        | Command::TilesBegin { .. }
+                        | Command::VideoBegin { .. }
+                        | Command::VideoUnit { .. }
+                        | Command::FrameData(_)
+                        | Command::FrameEnd(_)
+                        | Command::FileXferData { .. }
+                )
+            {
                 if let Some(hook) = self.on_cmd.as_mut() {
                     hook(cmd);
                 }
             }
         }
         self.pump_media();
+        self.clock_probe_tick(Instant::now());
         if self.peer_bye {
             return Err(TransportError::Closed);
         }

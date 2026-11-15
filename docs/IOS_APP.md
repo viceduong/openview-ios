@@ -46,10 +46,11 @@ paths below are relative to that folder unless noted.
 | `SessionModels.swift` | `SessionPhase`, `SessionError`, `LogLine`, `ChatMessage`, `ReceivedFile`, `IdentityMismatch` |
 | `SessionDialer.swift` | `ConnectMode`, `ConnectRequest`, `SessionDialer.dial`, `PairingState` |
 | `TransportPlan.swift` | `TransportPlan`, `DialRoute`, `NetworkReach`, `LegFailure`: LAN first or relay, and when a LAN leg falls back to the relay; pure, unit-tested |
-| `RemoteAudioPlayer.swift` | PC audio playback (PCM / Opus, jitter cushion) |
+| `RemoteAudioPlayer.swift` | PC audio playback (PCM / mono or stereo Opus, jitter cushion) |
 | `ClipboardBridge.swift` | Pasteboard sync with echo guard |
 | `SessionHost.swift` | `SessionChrome`, `SessionHostingController` (full-screen UIKit host), `SessionPresenter` |
 | `SessionContainer.swift` | The immersive session view: phase overlays, stats chip, reconnect capsule, toasts, error card, gesture help, sheet routing |
+| `SessionController+Latency.swift`, `LatencyBreakdown.swift` | Latency telemetry: presents reported to `ov_screen_latency_presented`, the breakdown read twice a second (`ov_screen_latency_stats`) into `LivenessModel.latency`; `LatencyRows` for the session sheet |
 | `SessionSheets.swift` | Session menu, chat, files, session log, `DocumentPicker`, `ShareSheet` |
 | `FloatingToolbar.swift` | Collapsible toolbar pill and drag handle |
 | `KeyBarToolbarLink.swift` | Shares toolbar state and actions with the key bar (keyboard-up handle and toolbar button) |
@@ -65,7 +66,8 @@ paths below are relative to that folder unless noted.
 | `RemoteVideo.swift` | `RemoteVideoPacket`, `H264SampleBuilder`, `VideoOverlay` |
 | **Input/** | |
 | `RemoteInput.swift` | `InputWire` encoders, `KeyStroke`, `ZoomPreset`, `RemoteInputController`, `PowerGovernor`, `FrameTicker` |
-| `TrackpadTouchRecognizer.swift`, `FlingTracker.swift` | One-finger touch source; trackpad scroll inertia |
+| `TrackpadTouchRecognizer.swift`, `FlingTracker.swift` | One-finger touch source; scroll inertia (touch and trackpad) |
+| `WheelScroll.swift` | `WheelScroll` (natural-direction wheel units per point), `WheelAccumulator` (fractional carry, ~120 Hz release); pure, unit-tested |
 | `RemoteKeyboard.swift` | `HIDKeyMap`, `HardwareKeyRouter` (Cmd→Ctrl), `RemoteKeyInputView` (soft keyboard responder) |
 | `KeyAccessoryBar.swift` | Special-keys ribbon (input accessory view) |
 | `PointerSupport.swift` | `PointerHider`, `GCMouseBridge`, `PointerLockHostingController` |
@@ -551,7 +553,7 @@ Touch always behaves as a trackpad:
 | double-tap and drag | Left drag, with a haptic and a ring indicator |
 | long press 0.30 s | Right click |
 | 2-finger tap / 3-finger tap | Right click / middle click |
-| 2-finger pan | Wheel: 120 per 10 pt, natural direction, both axes, no inertia |
+| 2-finger pan | Smooth wheel: 12 units per pt (a notch per 10 pt) sent as high-resolution deltas, natural direction, both axes; glides on after the lift (`FlingTracker`, 250 ms decay) until any finger lands |
 | pinch | Local zoom around the cursor. On release it snaps to fit, fill or 1:1 within ±20%. Range: fit … max(2 pt/px, fit). |
 | (session start) | The viewport opens at `ZoomPreset.openDefault`: the remote screen's height fills 1/3 of the view, clamped to the zoom range (`ViewportMath`). |
 | "Lock local zoom" on | Pinch becomes Ctrl+wheel on the host |
@@ -567,8 +569,14 @@ Touch always behaves as a trackpad:
 - Hovering moves the cursor (absolute moves). Clicks and secondary clicks
   arrive as indirect pointer touches; this needs
   `UIApplicationSupportsIndirectInputEvents`.
-- Trackpad scrolling produces WHEEL commands, with fling inertia from
-  `FlingTracker`.
+- Trackpad scrolling produces WHEEL commands (a notch per 36 pt, as
+  high-resolution deltas), with fling inertia from `FlingTracker`.
+- **Wheel pacing** (`WheelAccumulator` in `RemoteInputController`): fractional
+  units carry over, and whole units go out at most once per 7 ms (about one
+  per 120 Hz frame). Windows passes sub-notch WHEEL / HWHEEL deltas through
+  `SendInput` unchanged, so modern apps scroll smoothly and legacy ones step a
+  line per accumulated notch. The pinch-to-Ctrl+wheel release still flushes
+  at once, so ordering holds.
 - The system pointer is hidden over the remote screen (`PointerHider`).
 - **Pointer lock** (setting, or **Cmd+Shift+P**):
   `PointerLockHostingController.wantsPointerLock`. While the pointer is
@@ -639,7 +647,10 @@ Touch always behaves as a trackpad:
 
 - **Connecting**: dimmed last frame, spinner, step text, Cancel.
 - **Live**:
-  - Stats chip (RTT colour dot plus "Relay/Direct"; tap to expand).
+  - Stats chip (RTT colour dot, end-to-end latency "e2e" with a
+    `CAP_TIMING` host, plus "Relay/Direct"; tap to expand: the expanded
+    chip shows the per-stage line, the session sheet's Session section each
+    stage's median and p95).
   - "Reconnecting…" capsule.
   - Toasts.
   - Gesture help on first use.
@@ -688,6 +699,15 @@ the "on" ones (`sendDesktopWishes`).
 - If `AVAudioConverter` can decode Opus (`opusDecodeAvailable`), the app
   advertises `CAP_OPUS` and decodes Opus packets. The packet duration comes
   from the TOC byte. Otherwise it receives raw s16le PCM ticks.
+- If it also decodes 2-channel Opus (`opusStereoDecodeAvailable`), the app
+  calls `ov_screen_set_opus_stereo` and advertises `CAP_STEREO`. A host
+  streaming system audio then sends stereo Opus (128 kbit/s, 10 ms, FEC). The
+  TOC `s` bit selects a mono or a stereo converter. The converter is rebuilt
+  when that changes, which happens when a thin link squeezes the stream to
+  mono.
+- The player node always runs in stereo, and mono buffers (PCM, mono Opus)
+  are copied into both channels. The jitter rules count frames, so they stay
+  in audio time for either layout.
 - Playback uses `AVAudioEngine` + `AVAudioPlayerNode` with audio session
   category `.playback` and `.mixWithOthers`, and a 10 ms I/O buffer.
 - The jitter cushion has a 30 ms prefill and a 30 ms headroom. Each underrun

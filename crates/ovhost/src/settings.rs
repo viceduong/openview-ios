@@ -103,4 +103,7 @@ pub(crate) fn apply(cli: &Cli) {
     }
     NO_MEDIA.store(cli.no_media, Ordering::Relaxed);
     NO_PACING.store(cli.no_pacing, Ordering::Relaxed);
+    if cli.latency_probe {
+        crate::probe::enable(cli.test_pattern.is_none());
+    }
 }

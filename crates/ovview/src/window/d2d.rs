@@ -2,9 +2,17 @@
 //! drawn with `D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC` (a pre-filtered
 //! downscale, cubic upscale), the remote cursor
 //! as its own premultiplied layer on top (never baked into the frame), and
-//! the HUD with DirectWrite, into a flip-model swap chain presented on
-//! vsync without blocking the viewer loop (`DXGI_PRESENT_DO_NOT_WAIT`;
-//! a refused present is retried on the next loop turn).
+//! the HUD with DirectWrite, into a flip-model swap chain (one frame of
+//! latency, `SetMaximumFrameLatency(1)`) presented without blocking the
+//! viewer loop (`DXGI_PRESENT_DO_NOT_WAIT`; a refused present is retried on
+//! the next loop turn).
+//!
+//! Present mode: by default (low latency) `Present(0, ...)` — immediately,
+//! not on the vertical blank — with `DXGI_PRESENT_ALLOW_TEARING` on a swap
+//! chain created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` when the system
+//! supports it (`DXGI_FEATURE_PRESENT_ALLOW_TEARING`: Windows 10 1709+ and
+//! a capable driver; this also lets variable-refresh displays follow the
+//! stream). `ovview --vsync` keeps the classic `Present(1, ...)` path.
 //!
 //! Any failure (no D3D11 device, device removed) makes the window drop the
 //! renderer and fall back to the GDI path for good.
@@ -12,7 +20,7 @@
 //! Threading: the factory is single-threaded; every call runs on the window
 //! thread, serialized by the `Mutex` the renderer lives in.
 
-use windows::core::{w, Interface};
+use windows::core::{w, Interface, BOOL};
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
@@ -40,10 +48,11 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIAdapter, IDXGIDevice1, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
-    DXGI_ERROR_WAS_STILL_DRAWING, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT_DO_NOT_WAIT,
-    DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIAdapter, IDXGIDevice1, IDXGIFactory2, IDXGIFactory5, IDXGISurface, IDXGISwapChain1,
+    DXGI_ERROR_WAS_STILL_DRAWING, DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_MWA_NO_ALT_ENTER,
+    DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT, DXGI_SCALING_NONE,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 use super::{CursorBmp, CursorOverlay, HudState};
@@ -53,9 +62,79 @@ use ovapp::screen::Frame;
 #[cfg(test)]
 mod tests;
 
+/// How frames reach the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PresentMode {
+    /// `Present(1)`: on the vertical blank (`--vsync`).
+    Vsync,
+    /// `Present(0)`: immediately; the compositor shows it at its next
+    /// refresh (tearing unsupported here).
+    Immediate,
+    /// `Present(0, ALLOW_TEARING)`: immediately, tearing allowed (lowest
+    /// latency; independent flip / VRR when full screen).
+    Tearing,
+}
+
+impl PresentMode {
+    /// The mode for `vsync` given tearing support.
+    pub(super) fn choose(vsync: bool, tearing_supported: bool) -> Self {
+        match (vsync, tearing_supported) {
+            (true, _) => Self::Vsync,
+            (false, true) => Self::Tearing,
+            (false, false) => Self::Immediate,
+        }
+    }
+
+    /// `Present`'s sync interval and flags (never blocking).
+    pub(super) fn present_args(self) -> (u32, DXGI_PRESENT) {
+        match self {
+            Self::Vsync => (1, DXGI_PRESENT_DO_NOT_WAIT),
+            Self::Immediate => (0, DXGI_PRESENT_DO_NOT_WAIT),
+            Self::Tearing => (0, DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_ALLOW_TEARING),
+        }
+    }
+
+    /// The swap-chain flags (creation and every `ResizeBuffers`).
+    pub(super) fn swap_flags(self) -> DXGI_SWAP_CHAIN_FLAG {
+        match self {
+            Self::Tearing => DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+            Self::Vsync | Self::Immediate => DXGI_SWAP_CHAIN_FLAG(0),
+        }
+    }
+
+    /// For the renderer name in logs.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vsync => "vsync",
+            Self::Immediate => "immediate (no vsync)",
+            Self::Tearing => "immediate + tearing",
+        }
+    }
+}
+
+/// Whether tearing presents are supported (DXGI 1.5 factory and driver).
+fn tearing_supported(factory: &IDXGIFactory2) -> bool {
+    let Ok(f5) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut allow = BOOL(0);
+    // SAFETY: the feature data is a BOOL, as DXGI_FEATURE_PRESENT_ALLOW_TEARING
+    // specifies; the pointer and size describe the local `allow`.
+    let ok = unsafe {
+        f5.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&mut allow as *mut BOOL).cast(),
+            std::mem::size_of::<BOOL>() as u32,
+        )
+    }
+    .is_ok();
+    ok && allow.as_bool()
+}
+
 /// The renderer state bound to one window.
 pub(super) struct D2dRenderer {
     swap: IDXGISwapChain1,
+    mode: PresentMode,
     dc: ID2D1DeviceContext,
     text: IDWriteTextFormat,
     hud_brush: ID2D1SolidColorBrush,
@@ -124,8 +203,9 @@ fn create_dc(dxgi: &IDXGIDevice1) -> Result<ID2D1DeviceContext, String> {
 }
 
 impl D2dRenderer {
-    /// Bind a flip-model swap chain + D2D device context to `hwnd`.
-    pub(super) fn new(hwnd: HWND) -> Result<Self, String> {
+    /// Bind a flip-model swap chain + D2D device context to `hwnd`,
+    /// presenting on vsync or immediately (see [`PresentMode`]).
+    pub(super) fn new(hwnd: HWND, vsync: bool) -> Result<Self, String> {
         let (device, driver) = create_device()?;
         // SAFETY: plain COM/D3D object creation on live interfaces; `hwnd` is
         // the caller's live window; every result is checked.
@@ -143,6 +223,7 @@ impl D2dRenderer {
                 })
                 .unwrap_or_default();
             let factory: IDXGIFactory2 = adapter.GetParent().map_err(|e| hr("IDXGIFactory2", e))?;
+            let mode = PresentMode::choose(vsync, !vsync && tearing_supported(&factory));
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: 0,
                 Height: 0,
@@ -157,7 +238,7 @@ impl D2dRenderer {
                 Scaling: DXGI_SCALING_NONE,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-                Flags: 0,
+                Flags: mode.swap_flags().0 as u32,
             };
             let swap = factory
                 .CreateSwapChainForHwnd(&device, hwnd, &desc, None, None)
@@ -188,6 +269,7 @@ impl D2dRenderer {
                 .map_err(|e| hr("brush", e))?;
             Ok(Self {
                 swap,
+                mode,
                 dc,
                 text,
                 hud_brush,
@@ -198,7 +280,8 @@ impl D2dRenderer {
                 frame_bmp: None,
                 cursor_bmp: None,
                 name: format!(
-                    "Direct2D on {adapter_name} ({driver}), flip-model vsync, high-quality cubic"
+                    "Direct2D on {adapter_name} ({driver}), flip-model {}, high-quality cubic",
+                    mode.label()
                 ),
             })
         }
@@ -224,7 +307,7 @@ impl D2dRenderer {
             // SAFETY: as above (the target was just released).
             let resized = unsafe {
                 self.swap
-                    .ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, self.mode.swap_flags())
             };
             // First use only matches the client size exactly: not fatal.
             if self.size != (0, 0) {
@@ -354,7 +437,7 @@ impl D2dRenderer {
     }
 
     /// Draw and present. `Ok(false)`: the swap chain was still busy with the
-    /// previous frame (vsync); the caller repaints shortly.
+    /// previous frame (one frame in flight); the caller repaints shortly.
     pub(super) fn render(
         &mut self,
         frame: Option<&Frame>,
@@ -473,7 +556,8 @@ impl D2dRenderer {
                 );
             }
             self.dc.EndDraw(None, None).map_err(|e| hr("EndDraw", e))?;
-            let rc = self.swap.Present(1, DXGI_PRESENT_DO_NOT_WAIT);
+            let (interval, flags) = self.mode.present_args();
+            let rc = self.swap.Present(interval, flags);
             if rc == DXGI_ERROR_WAS_STILL_DRAWING {
                 return Ok(false);
             }

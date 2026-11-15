@@ -195,6 +195,10 @@ final class SessionController: ObservableObject {
     let pumpEpochNs = DispatchTime.now().uptimeNanoseconds
     /// Last liveness values published, so the HUD only re-renders on change.
     var lastLiveness: (alive: Bool, rtt: Int32, fpsTenths: Int) = (true, -1, 0)
+    /// Latency telemetry: when the breakdown was last read (session queue
+    /// ms) and what was published (only changes go to main).
+    var lastLatencyPublishMs: Int64 = 0
+    var lastLatency: LatencyBreakdown?
     /// H.264 overlay state: CMSampleBuffer builder, whether a motion period
     /// is running, its generation, and the generation whose END is waiting
     /// for the refresh frame.
@@ -300,6 +304,11 @@ final class SessionController: ObservableObject {
                 guard let self, !self.halted else { return }
                 self.screen.requestVideoIdr()
             }
+        }
+        // Latency telemetry: every presented Metal drawable reports when
+        // it was drawn and when it reached the screen.
+        screenModel.uploads?.onPresented = { [weak self] drawnAt, presentedAt in
+            self?.notePresented(drawnAt: drawnAt, presentedAt: presentedAt)
         }
         // A new Metal surface (or lost staging) needs the whole frame again;
         // re-stage it from the Rust framebuffer.
@@ -414,6 +423,7 @@ final class SessionController: ObservableObject {
         livenessModel.rttMs = -1
         livenessModel.fps = 0
         livenessModel.path = nil
+        livenessModel.latency = nil
         hostSupportsDesktopFx = false
         screenModel.video.hide(generation: screenModel.video.generation)
         log("Connecting to \(req.displayName) via \(req.transport.detail)")

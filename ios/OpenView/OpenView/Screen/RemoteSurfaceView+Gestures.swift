@@ -53,8 +53,6 @@ extension RemoteSurfaceView {
     /// Finger travel (points) that makes a touch a move instead of a tap.
     static let tapSlop: CGFloat = 10
     static let longPressDelay: TimeInterval = 0.30
-    /// Touch scrolling: one wheel notch (120 units) per 10 pt.
-    static let scrollStepPoints: CGFloat = 10
 
     func handleTrackpad(_ phase: TrackpadTouchRecognizer.Phase, _ loc: CGPoint, _ time: TimeInterval) {
         switch phase {
@@ -70,6 +68,8 @@ extension RemoteSurfaceView {
     }
 
     func trackpadBegan(_ loc: CGPoint, _ time: TimeInterval) {
+        // Any finger landing stops a scroll glide (as on iOS).
+        stopFlings()
         cancelTrackpadTimer()
         tp = TrackpadTouch()
         // A finger left over from (or right after) a multi-finger gesture
@@ -258,49 +258,33 @@ extension RemoteSurfaceView {
         tpTimer = nil
     }
 
-    /// Touch scrolling: finger travel accumulates and every whole
-    /// 10 pt is one wheel notch (120 units), natural direction (content
-    /// follows the finger), horizontal too.
-    func stepWheel(byViewPoints t: CGPoint) {
-        guard t.x.isFinite, t.y.isFinite else { return }
-        scrollStepAcc.x += t.x
-        scrollStepAcc.y += t.y
-        let sx = (scrollStepAcc.x / Self.scrollStepPoints).rounded(.towardZero)
-        let sy = (scrollStepAcc.y / Self.scrollStepPoints).rounded(.towardZero)
-        guard sx != 0 || sy != 0 else { return }
-        scrollStepAcc.x -= sx * Self.scrollStepPoints
-        scrollStepAcc.y -= sy * Self.scrollStepPoints
-        // Fingers down / right = content down / right = wheel up / left.
-        input.wheel(dx: Double(-sx * 120), dy: Double(sy * 120))
-    }
-
-    /// iPad trackpad scrolling: glide on after the release.
-    func startScrollFling(velocity v: CGPoint) {
+    /// Glide on after the release (two-finger touch pan, iPad trackpad):
+    /// exponential decay from the lift velocity, sent as wheel deltas at
+    /// `unitsPerPoint` until it dies out or a finger lands.
+    func startScrollFling(velocity v: CGPoint, unitsPerPoint k: CGFloat) {
+        scrollFlingUnitsPerPoint = k
         scrollFling.start(velocity: v, now: CACurrentMediaTime())
         if scrollFling.isActive { animTicker.start() }
     }
 
-    /// Two-finger pan and iPad trackpad / wheel scrolling -> WHEEL.
-    /// Two-finger pan: at the cursor, one notch per 10 pt, no inertia;
-    /// iPad pointer scrolling stays continuous (trackpads
-    /// glide on after release).
+    /// Two-finger pan and iPad trackpad / wheel scrolling -> WHEEL, as
+    /// smooth high-resolution deltas at the cursor (Windows scrolls by
+    /// fractions of a notch): two-finger pan at 12 units per pt (a notch
+    /// per 10 pt), iPad pointer scrolling at a notch per 36 pt; both glide
+    /// on after the lift (a mouse's discrete wheel does not).
     @objc func handleScroll(_ g: UIPanGestureRecognizer) {
         let touchPan = g === pan2
+        let k = touchPan ? WheelScroll.touchUnitsPerPoint : WheelScroll.trackpadUnitsPerPoint
         switch g.state {
         case .began:
             scrollFling.stop()
-            scrollStepAcc = .zero
         case .changed:
             let t = g.translation(in: self)
             g.setTranslation(.zero, in: self)
-            if touchPan {
-                stepWheel(byViewPoints: t)
-            } else {
-                sendWheel(byViewPoints: t, factor: Self.wheelUnitsPerPoint)
-            }
+            sendWheel(byViewPoints: t, factor: k)
         case .ended:
-            guard !touchPan, g !== scrollDiscrete, input.input2 else { return }
-            startScrollFling(velocity: g.velocity(in: self))
+            guard g !== scrollDiscrete, input.input2 else { return }
+            startScrollFling(velocity: g.velocity(in: self), unitsPerPoint: k)
         default:
             break
         }
@@ -309,7 +293,8 @@ extension RemoteSurfaceView {
     /// Natural scrolling: fingers down (t.y > 0) = content down = scroll
     /// up (dy > 0); fingers right = content right = scroll left (dx < 0).
     func sendWheel(byViewPoints t: CGPoint, factor k: CGFloat) {
-        input.wheel(dx: Double(-t.x * k), dy: Double(t.y * k))
+        let w = WheelScroll.units(forTravel: t, unitsPerPoint: k)
+        input.wheel(dx: w.dx, dy: w.dy)
     }
 
     @objc func handlePinch(_ g: UIPinchGestureRecognizer) {

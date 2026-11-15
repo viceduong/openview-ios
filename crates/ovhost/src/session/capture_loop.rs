@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use ovapp::adapt::{AutoQuality, RateGovernor, RateStats};
 use ovapp::sendq::{SubmitOutcome, UpdateEncoder};
+use ovcore::clocksync::instant_us;
 use tracing::{debug, warn};
 
 use super::hooks::{PendingRegion, SharedInput};
@@ -430,6 +431,20 @@ pub(super) fn capture_loop(
                 let grabbed = Instant::now();
                 metrics.grabs += 1;
                 metrics.grab_time += grabbed - started;
+                // Latency telemetry: this capture's updates carry its
+                // present (or grab start) and grab-done times. A present
+                // older than a second is a static screen's first grab, not
+                // capture latency.
+                let shown = g
+                    .present_age
+                    .filter(|age| *age < Duration::from_secs(1))
+                    .and_then(|age| grabbed.checked_sub(age))
+                    .unwrap_or(started);
+                mailbox.set_capture_stamp(Some(ovapp::latency::HostStamps {
+                    capture_us: instant_us(shown),
+                    grabbed_us: instant_us(grabbed),
+                    encoded_us: 0,
+                }));
                 // The video region is masked out of tile updates; the
                 // motion detector then sees this capture's dirty tiles
                 // (after copy-rect, so a scroll is not motion).
@@ -532,6 +547,8 @@ pub(super) fn capture_loop(
             }
             Err(e) => debug!("capture error: {e}"),
         }
+        // Refinements (no capture) carry no stamps.
+        mailbox.set_capture_stamp(None);
         if let Some(l) = src.take_latency() {
             metrics.latency += l;
             metrics.latency_n += 1;

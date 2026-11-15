@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::cc::CcStats;
-use crate::media::{MediaKeys, MediaRx, MediaRxStats, ReplayWindow};
+use crate::media::{FecController, MediaKeys, MediaRx, MediaRxStats, ReplayWindow};
 
 /// Media sender keying (session-wide: survives path changes).
 pub(super) struct MediaTx {
@@ -52,7 +52,8 @@ pub struct MediaStats {
     pub target_bps: f64,
     /// Current loss estimate (0..1).
     pub loss: f64,
-    /// Current FEC parity ratio.
+    /// FEC parity ratio of the last video frame (adaptive: 2 % on a clean
+    /// link with NACK in time, 10-30 % with loss).
     pub fec_ratio: f64,
     /// Estimated queueing delay, milliseconds.
     pub queue_delay_ms: f64,
@@ -68,6 +69,8 @@ pub(super) struct MediaState {
     pub(super) next_aseq: u32,
     pub(super) sent: VecDeque<SentFrame>,
     pub(super) sent_bytes: usize,
+    /// Adaptive video FEC (parity ratio per frame).
+    pub(super) fec: FecController,
     pub(super) stats: MediaStats,
 }
 
@@ -90,6 +93,7 @@ impl MediaState {
             next_aseq: 0,
             sent: VecDeque::new(),
             sent_bytes: 0,
+            fec: FecController::new(),
             stats: MediaStats::default(),
         }
     }

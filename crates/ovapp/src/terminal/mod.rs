@@ -24,6 +24,7 @@
 //! | `0x18` | FILE_XFER_COMPLETE | `4B file_id u32-BE` + `8B total u64-BE` + `1B ok` + optional UTF-8 name |
 //! | `0x10` | PING         | `8B u64-BE nonce`                                              |
 //! | `0x11` | PONG         | the same `8B nonce` echoed back                                |
+//! |        |              | or, with [`CAP_TIMING`], `8B nonce` + `8B rx_us` + `8B tx_us` (the replier's monotonic µs clock) |
 //! | `0x20` | FRAME_BEGIN  | `8B seq` + `4B w` + `4B h` + `4B stride` + `1B fmt` + `4B total` + `1B codec` + `4B compressed_len`, all BE (host->viewer) |
 //! | `0x21` | FRAME_DATA   | a chunk of the update's (compressed) payload                   |
 //! | `0x22` | FRAME_END    | `8B seq u64-BE`; closes the open FRAME_BEGIN / TILES_BEGIN / VIDEO_BEGIN |
@@ -51,6 +52,7 @@
 //! | `0x61` | DIRECT_CANDIDATES | `1B count` + per entry `1B kind` + `1B family (4\|6)` + address + `2B port BE` (host->viewer, [`CAP_DIRECT`]) |
 //! | `0x62` | SESSION_OPTION | `1B key` + `1B value` (viewer->host, [`CAP_DESKTOP_FX`])     |
 //! | `0x63` | MEDIA_GAP    | `1B kind` + `2B packets` + `4B samples` (local only: media lost for good) |
+//! | `0x65` | TIMING       | 29-byte [`crate::latency::FrameTiming`]: the next update's host stamps (host->viewer, [`CAP_TIMING`]) |
 //!
 //! FRAME_BEGIN / TILES_BEGIN carry a [`FrameCodec`] byte: `0` = raw pixels,
 //! `1` = raw DEFLATE, `2` = zstd, `3` = LZ4 block, `4` = band container —
@@ -137,8 +139,12 @@ mod wire;
 #[cfg(test)]
 mod tiles_media_wire_tests;
 #[cfg(test)]
+mod timing_tests;
+#[cfg(test)]
 mod wire_session_tests;
 
+pub use caps::CAP_STEREO;
+pub use caps::CAP_TIMING;
 pub use caps::{
     CAP_AUDIO10, CAP_BANDS, CAP_BYE, CAP_CACHE, CAP_DESKTOP_FX, CAP_DIRECT, CAP_H264, CAP_INPUT2,
     CAP_KEYFRAME, CAP_LOSSY, CAP_LZ4, CAP_MEDIA, CAP_MOVE, CAP_OPUS, CAP_RUDP, CAP_TILES, CAP_ZSTD,

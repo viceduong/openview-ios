@@ -112,3 +112,45 @@ fn d2d_hq_cubic_downscale_offscreen() {
         assert!(lo >= 100 && hi <= 155, "aliasing: {lo}..={hi}");
     }
 }
+
+/// `--vsync` always waits for the vertical blank; the default presents
+/// immediately, with tearing only on a swap chain created for it.
+#[test]
+fn present_mode_follows_vsync_and_tearing_support() {
+    assert_eq!(PresentMode::choose(true, true), PresentMode::Vsync);
+    assert_eq!(PresentMode::choose(true, false), PresentMode::Vsync);
+    assert_eq!(PresentMode::choose(false, true), PresentMode::Tearing);
+    assert_eq!(PresentMode::choose(false, false), PresentMode::Immediate);
+    assert_eq!(PresentMode::Vsync.present_args().0, 1);
+    for m in [
+        PresentMode::Vsync,
+        PresentMode::Immediate,
+        PresentMode::Tearing,
+    ] {
+        let (interval, flags) = m.present_args();
+        assert!(flags.contains(DXGI_PRESENT_DO_NOT_WAIT), "never blocks");
+        let tearing = flags.contains(DXGI_PRESENT_ALLOW_TEARING);
+        assert_eq!(tearing, m == PresentMode::Tearing);
+        // ALLOW_TEARING is only legal with interval 0 on a tearing swap chain.
+        assert_eq!(
+            m.swap_flags() == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+            tearing
+        );
+        assert!(!tearing || interval == 0);
+    }
+}
+
+/// Prints whether this machine supports tearing presents.
+#[test]
+fn tearing_support_probe() {
+    let Ok((device, _)) = create_device() else {
+        eprintln!("skipping: no D3D11 device");
+        return;
+    };
+    // SAFETY: getters on live COM objects.
+    let factory: IDXGIFactory2 = unsafe {
+        let dxgi: IDXGIDevice1 = device.cast().unwrap();
+        dxgi.GetAdapter().unwrap().GetParent().unwrap()
+    };
+    eprintln!("tearing supported: {}", tearing_supported(&factory));
+}

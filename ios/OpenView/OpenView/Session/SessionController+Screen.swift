@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import QuartzCore
 
 // Screen side of SessionController: the OvScreenBox sinks (frames, cursor,
 // liveness, monitors, audio, clipboard, files, H.264) wired on the session
@@ -102,6 +103,11 @@ extension SessionController {
                 self.audioPlayer.playOpus(packet, samples: samples)
             }
             screen.enableOpus()
+            // Stereo system audio (CAP_STEREO) when AVAudioConverter
+            // decodes 2-channel Opus; the player plays both layouts.
+            if RemoteAudioPlayer.opusStereoDecodeAvailable {
+                screen.enableOpusStereo()
+            }
         }
         // Clipboard sync: apply peer text to the pasteboard (main)
         // and arm the echo guard so we never re-send what we just applied.
@@ -164,8 +170,12 @@ extension SessionController {
         let flush = built.formatChanged
         let rect = packet.rect
         let size = packet.screenSize
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
             overlay.enqueue(sample, rect: rect, screen: size, generation: gen, flush: flush)
+            // Latency telemetry: the display layer decodes and shows it
+            // from here (enqueue time stands in for the present).
+            let now = CACurrentMediaTime()
+            self?.notePresented(drawnAt: now, presentedAt: now)
         }
     }
 

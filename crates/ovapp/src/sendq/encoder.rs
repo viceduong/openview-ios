@@ -626,6 +626,7 @@ impl UpdateEncoder {
                     }),
                     video: None,
                     barrier: 0,
+                    stamps: None,
                 };
                 match mailbox.put_if_taken(frame, taken, true) {
                     Ok(_) => {
@@ -746,6 +747,7 @@ impl UpdateEncoder {
                 delta: None,
                 video: None,
                 barrier: 0,
+                stamps: None,
             });
             // A full frame refreshes everything; its lossy tiles start the
             // backlog again.

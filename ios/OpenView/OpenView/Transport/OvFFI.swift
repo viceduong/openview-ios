@@ -527,6 +527,15 @@ final class OvScreenBox {
         })
     }
 
+    /// With the Opus sink installed, also advertise CAP_STEREO: a host
+    /// streaming system audio then sends stereo Opus packets (TOC `s` bit
+    /// set; `samples` stays per channel) to `onOpus`. Call after
+    /// `enableOpus()` and before the first `feed`, and only when the device
+    /// decodes 2-channel Opus (`RemoteAudioPlayer.opusStereoDecodeAvailable`).
+    func enableOpusStereo() {
+        ov_screen_set_opus_stereo(ptr, 1)
+    }
+
     /// Install the H.264 video sink so our CAPS advertise CAP_H264
     /// and a capable host streams high-motion regions as H.264 instead of
     /// lossless tiles. Call before the first `feed` (CAPS go out once), and
@@ -561,6 +570,31 @@ final class OvScreenBox {
     /// Session queue only, and never from inside a sink.
     func requestVideoIdr() {
         ov_screen_request_video_idr(ptr)
+    }
+
+    /// Rolling per-stage latency medians (CAP_TIMING hosts). Session
+    /// queue only, never from inside a sink.
+    func latencyStats() -> LatencyBreakdown? {
+        var s = ov_latency_stats()
+        guard ov_screen_latency_stats(ptr, &s) == 0 else { return nil }
+        func stage(_ label: String, _ st: ov_latency_stage) -> LatencyBreakdown.Stage {
+            st.samples == 0
+                ? LatencyBreakdown.Stage(label: label, p50Ms: nil, p95Ms: nil)
+                : LatencyBreakdown.Stage(label: label, p50Ms: Double(st.p50_us) / 1000,
+                                         p95Ms: Double(st.p95_us) / 1000)
+        }
+        return LatencyBreakdown(
+            stages: [stage("cap", s.capture), stage("enc", s.encode), stage("send", s.send),
+                     stage("net", s.network), stage("dec", s.decode), stage("pres", s.present)],
+            total: stage("total", s.total),
+            frames: s.frames)
+    }
+
+    /// A picture reached the screen: updates handed over at least
+    /// `drawnAgeUs` ago were presented `presentedAgeUs` ago. Session queue
+    /// only, never from inside a sink.
+    func latencyPresented(drawnAgeUs: Int64, presentedAgeUs: Int64) {
+        _ = ov_screen_latency_presented(ptr, drawnAgeUs, presentedAgeUs)
     }
 
     /// Drop every Swift-side callback (session teardown) so the closures —

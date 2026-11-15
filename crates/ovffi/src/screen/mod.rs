@@ -9,12 +9,14 @@
 
 mod feed;
 mod framebuffer;
+mod latency;
 mod liveness;
 mod sinks;
 mod video;
 
 pub use feed::*;
 pub use framebuffer::*;
+pub use latency::*;
 pub use liveness::*;
 pub use sinks::*;
 pub use video::*;
@@ -76,6 +78,9 @@ pub struct OvScreen {
     /// our CAPS advertise `CAP_OPUS`; without it the host keeps sending raw
     /// PCM to `audio_sink`.
     opus_sink: Sink<OpusSink>,
+    /// Advertise `CAP_STEREO` with the Opus sink (the shell decodes
+    /// 2-channel Opus; [`ov_screen_set_opus_stereo`]).
+    opus_stereo: bool,
     /// H.264 video sink: access units passed through (SPS/PPS +
     /// AVCC) for VideoToolbox. Installing it advertises `CAP_H264`.
     video_sink: Sink<VideoSink>,
@@ -118,6 +123,11 @@ pub struct OvScreen {
     pong_reply_nonce: Option<u64>,
     /// The Instant `ov_screen_new` ran at — the epoch for `Instant` math.
     epoch: std::time::Instant,
+    /// Clock offset to the host over clock-probe PINGs / timed PONGs
+    /// (`CAP_TIMING`).
+    clock: ovapp::latency::ClockProbe,
+    /// Per-update latency join ([`ov_screen_latency_stats`]).
+    latency: ovapp::latency::LatencyTracker,
 }
 
 impl OvScreen {
@@ -139,6 +149,7 @@ impl OvScreen {
             cursor_shape_sink: Sink::none(),
             audio_sink: Sink::none(),
             opus_sink: Sink::none(),
+            opus_stereo: false,
             video_sink: Sink::none(),
             rx_video: None,
             video_rx: ovapp::video::VideoRx::new(),
@@ -158,6 +169,8 @@ impl OvScreen {
             liveness_sink: Sink::none(),
             pong_reply_nonce: None,
             epoch: now,
+            clock: ovapp::latency::ClockProbe::new(),
+            latency: ovapp::latency::LatencyTracker::new(),
         }
     }
 
@@ -200,6 +213,11 @@ impl OvScreen {
             // The iOS player reads the packet duration from the Opus TOC,
             // so 10 ms packets are fine too.
             flags |= ovapp::terminal::CAP_OPUS | ovapp::terminal::CAP_AUDIO10;
+            if self.opus_stereo {
+                // Stereo system audio: the packets' TOC carries the
+                // channel count, the sink signature is unchanged.
+                flags |= ovapp::terminal::CAP_STEREO;
+            }
         }
         if self.video_sink.f.is_some() {
             flags |= ovapp::terminal::CAP_H264;
@@ -264,6 +282,28 @@ pub unsafe extern "C" fn ov_screen_free(s: *mut OvScreen) {
             // freed only once (caller contract).
             drop(unsafe { Box::from_raw(s) });
         }
+    })
+}
+
+/// Advertise `CAP_STEREO` in our CAPS when an Opus sink is installed
+/// (call before the first screen command, and only when the shell decodes
+/// 2-channel Opus): a host with stereo system audio then sends stereo Opus
+/// packets to the Opus sink (the TOC byte's `s` bit marks them; the
+/// `samples` count stays per channel). Returns 0 or -1.
+///
+/// # Safety
+/// `s` must be null or a live handle from [`ov_screen_new`], not used
+/// concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn ov_screen_set_opus_stereo(s: *mut OvScreen, on: i32) -> i32 {
+    ffi_guard!(OV_ERR_PANIC, {
+        // SAFETY: `s` is null or a live screen with no concurrent use
+        // (caller contract).
+        let Some(screen) = (unsafe { s.as_mut() }) else {
+            return -1;
+        };
+        screen.opus_stereo = on != 0;
+        0
     })
 }
 

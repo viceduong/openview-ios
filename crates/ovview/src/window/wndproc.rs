@@ -342,12 +342,9 @@ pub(super) fn create_window() -> Result<Arc<WindowState>, String> {
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_raw as isize) };
     state.hwnd.store(hwnd.0, Ordering::Relaxed);
     // The Direct2D presenter (GDI when it cannot start).
-    if RENDERER
-        .lock()
-        .map(|r| *r == RendererPref::Direct2D)
-        .unwrap_or(false)
-    {
-        match d2d::D2dRenderer::new(hwnd) {
+    let pref = RENDERER.lock().map(|r| *r).unwrap_or(RendererPref::Gdi);
+    if let RendererPref::Direct2D { vsync } = pref {
+        match d2d::D2dRenderer::new(hwnd, vsync) {
             Ok(r) => {
                 if let Ok(mut slot) = state.d2d.lock() {
                     *slot = Some(r);

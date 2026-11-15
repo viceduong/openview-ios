@@ -172,6 +172,11 @@ impl OvScreen {
             matrix: self.video_colour[2],
             full_range: self.video_colour[3],
         };
+        if verdict == VideoVerdict::Deliver {
+            // Reassembled and handed to VideoToolbox now (its decode
+            // counts toward the present stage).
+            self.latency_delivered(ovapp::latency::KIND_VIDEO, h.seq, std::time::Instant::now());
+        }
         f(self.video_sink.user, &pkt);
     }
 }

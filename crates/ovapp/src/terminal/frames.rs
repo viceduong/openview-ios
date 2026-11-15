@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use ovtransport::TransportError;
 
+use crate::latency::{KIND_SCREEN, KIND_VIDEO};
 use crate::screen::{Frame, FrameHook};
 use crate::tiles::{ApplyError, UpdateMeta};
 
@@ -97,6 +98,7 @@ impl TerminalSession {
                     let ok = self.apply_update(&meta, seq, &data);
                     self.recycle_wire(data);
                     if ok {
+                        self.note_decoded(KIND_SCREEN, seq);
                         return self.copy_fb();
                     }
                 }
@@ -104,6 +106,7 @@ impl TerminalSession {
                     let ok = self.apply_video(&header, &data);
                     self.recycle_wire(data);
                     if ok {
+                        self.note_decoded(KIND_VIDEO, header.seq);
                         return self.copy_fb();
                     }
                 }
@@ -163,7 +166,19 @@ impl TerminalSession {
             }
             out = self.copy_fb();
         }
+        // Everything queued was consumed: what was skipped or merged
+        // reaches the screen with this snapshot.
+        if self.latency_on && out.is_some() {
+            self.latency.on_decoded_all(Instant::now());
+        }
         out
+    }
+
+    /// Latency: update `(kind, seq)` was applied now.
+    fn note_decoded(&mut self, kind: u8, seq: u64) {
+        if self.latency_on {
+            self.latency.on_decoded(kind, seq, Instant::now());
+        }
     }
 
     /// Apply one complete update to the framebuffer; on failure count it
@@ -295,10 +310,18 @@ impl TerminalSession {
             VideoVerdict::Deliver => {
                 self.video_stats.units += 1;
                 self.video_stats.bytes += data.len() as u64;
+                if self.latency_on {
+                    self.latency
+                        .on_received(KIND_VIDEO, header.seq, Instant::now());
+                }
                 if self.on_frame.is_some() {
                     let ok = self.apply_video(&header, &data);
                     self.recycle_wire(data);
                     if ok {
+                        if self.latency_on {
+                            self.latency
+                                .on_decoded(KIND_VIDEO, header.seq, Instant::now());
+                        }
                         if let Some(frame) = self.copy_fb() {
                             if let Some(fh) = self.on_frame.as_mut() {
                                 fh(&frame);

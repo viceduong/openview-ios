@@ -113,13 +113,14 @@ mod ffi {
         pub fn CloseHandle(h: Handle) -> i32;
     }
 
-    pub fn pcm_format() -> WAVEFORMATEX {
+    /// 48 kHz s16le PCM with `channels` interleaved channels.
+    pub fn pcm_format(channels: u16) -> WAVEFORMATEX {
         WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_PCM,
-            nChannels: 1,
+            nChannels: channels,
             nSamplesPerSec: super::SAMPLE_RATE,
-            nAvgBytesPerSec: super::SAMPLE_RATE * 2,
-            nBlockAlign: 2,
+            nAvgBytesPerSec: super::SAMPLE_RATE * 2 * u32::from(channels),
+            nBlockAlign: 2 * channels,
             wBitsPerSample: 16,
             cbSize: 0,
         }
@@ -165,9 +166,10 @@ struct HdrRing {
 }
 
 impl HdrRing {
-    fn new(n: usize) -> Self {
+    /// `n` headers of `samples` samples each.
+    fn new(n: usize, samples: usize) -> Self {
         let mut bufs: Vec<Box<[i16]>> = (0..n)
-            .map(|_| vec![0i16; TICK_SAMPLES as usize].into_boxed_slice())
+            .map(|_| vec![0i16; samples].into_boxed_slice())
             .collect();
         let hdrs = bufs
             .iter_mut()
@@ -238,7 +240,7 @@ impl WinmmMic {
     /// surface as `Err`, never a panic.
     pub fn open() -> Result<Self, AppError> {
         let event = Event::new()?;
-        let fmt = ffi::pcm_format();
+        let fmt = ffi::pcm_format(1);
         let mut hwi: usize = 0;
         // SAFETY: valid pointers; the handle is closed in Drop.
         let err = unsafe {
@@ -259,7 +261,7 @@ impl WinmmMic {
         let mic = Self {
             hwi,
             event,
-            ring: HdrRing::new(MIC_BUFFERS),
+            ring: HdrRing::new(MIC_BUFFERS, TICK_SAMPLES as usize),
             next: 0,
         };
         for &h in &mic.ring.hdrs {
@@ -336,7 +338,7 @@ impl Drop for WinmmMic {
     }
 }
 
-/// The default output device: WinMM `waveOut`, 48 kHz mono s16le, with
+/// The default output device: WinMM `waveOut`, 48 kHz s16le (mono or stereo), with
 /// `SPEAKER_BUFFERS` rotating headers and a completion event.
 pub struct WinmmSpeaker {
     hwo: usize,
@@ -349,10 +351,17 @@ pub struct WinmmSpeaker {
 unsafe impl Send for WinmmSpeaker {}
 
 impl WinmmSpeaker {
-    /// Open the default output device.
+    /// Open the default output device, mono.
     pub fn open() -> Result<Self, AppError> {
+        Self::open_channels(1)
+    }
+
+    /// Open the default output device with `channels` (1 or 2) interleaved
+    /// channels; each header then holds one 20 ms tick of frames.
+    pub fn open_channels(channels: u16) -> Result<Self, AppError> {
+        let channels = channels.clamp(1, 2);
         let event = Event::new()?;
-        let fmt = ffi::pcm_format();
+        let fmt = ffi::pcm_format(channels);
         let mut hwo: usize = 0;
         // SAFETY: valid pointers; the handle is closed in Drop.
         let err = unsafe {
@@ -373,7 +382,10 @@ impl WinmmSpeaker {
         let spk = Self {
             hwo,
             event,
-            ring: HdrRing::new(SPEAKER_BUFFERS),
+            ring: HdrRing::new(
+                SPEAKER_BUFFERS,
+                TICK_SAMPLES as usize * usize::from(channels),
+            ),
             queued: [false; SPEAKER_BUFFERS],
         };
         for &h in &spk.ring.hdrs {
@@ -462,7 +474,8 @@ pub fn spawn_playback(
 }
 
 fn playback_loop(bus: AudioBus, stop: Arc<AtomicBool>, tag: &str) {
-    let mut out = match WinmmSpeaker::open() {
+    let channels = if bus.channels() == 2 { 2 } else { 1 };
+    let mut out = match WinmmSpeaker::open_channels(channels) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("{tag}: speaker unavailable, audio playback disabled: {e}");

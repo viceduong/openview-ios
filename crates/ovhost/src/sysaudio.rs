@@ -2,11 +2,13 @@
 //! the default render endpoint — what the host's speakers play — in
 //! event-driven shared mode with a 10 ms period.
 //!
-//! The mix format (usually 32-bit float stereo at 48 kHz) is down-mixed to
-//! mono, converted to s16 and, if the device does not run at 48 kHz,
-//! linearly resampled to it; [`MicSource::read_tick`] then hands out 10 ms
-//! ticks ([`OPUS10_SAMPLES`]) that the session encodes as 10 ms Opus
-//! packets (with in-band FEC) for a `CAP_AUDIO10` viewer.
+//! The mix format (usually 32-bit float stereo at 48 kHz) is mapped to
+//! **stereo** (a mono device is duplicated, surround is folded down with
+//! `fold_to_stereo`), converted to s16 and, if the device does not run at
+//! 48 kHz, linearly resampled to it; [`MicSource::read_tick`] then hands out
+//! 10 ms interleaved stereo ticks ([`OPUS10_SAMPLES`] frames) that the
+//! session encodes as 10 ms stereo Opus packets (with in-band FEC) for a
+//! `CAP_STEREO` viewer, and as the mono down-mix for any other.
 //!
 //! A loopback stream delivers no packets while nothing plays; the source
 //! then emits silent ticks at the real-time pace (so the mic loop stays
@@ -37,19 +39,94 @@ enum SampleFmt {
     I32,
 }
 
+/// Most mix-format channels we read (7.1); further ones are ignored.
+const MAX_CHANNELS: usize = 8;
+
+/// Fold one device frame (WAVE channel order: FL FR FC LFE BL BR SL SR) to
+/// `(left, right)`: mono is duplicated, stereo passes through, and
+/// surround mixes the centre (-3 dB) into both sides and the back / side
+/// pairs into their side, normalised by the weights (LFE dropped).
+fn fold_to_stereo(frame: &[f32]) -> (f32, f32) {
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    // (weight into left, weight into right) per channel.
+    const W: [(f32, f32); MAX_CHANNELS] = [
+        (1.0, 0.0),
+        (0.0, 1.0),
+        (C, C),
+        (0.0, 0.0),
+        (C, 0.0),
+        (0.0, C),
+        (C, 0.0),
+        (0.0, C),
+    ];
+    match frame {
+        [] => (0.0, 0.0),
+        [m] => (*m, *m),
+        [l, r] => (*l, *r),
+        _ => {
+            let (mut l, mut r, mut wl, mut wr) = (0.0, 0.0, 0.0, 0.0);
+            for (x, (a, b)) in frame.iter().zip(W) {
+                l += x * a;
+                r += x * b;
+                wl += a;
+                wr += b;
+            }
+            (l / wl.max(1.0), r / wr.max(1.0))
+        }
+    }
+}
+
+/// Linear device-rate -> 48 kHz resampler for interleaved stereo; emits s16.
+struct StereoResampler {
+    rate: u32,
+    /// Fractional read position between the previous and the next frame.
+    phase: f64,
+    prev: (f32, f32),
+}
+
+impl StereoResampler {
+    fn new(rate: u32) -> Self {
+        Self {
+            rate: rate.max(1),
+            phase: 0.0,
+            prev: (0.0, 0.0),
+        }
+    }
+
+    /// Feed one device-rate frame; append the 48 kHz frames it completes.
+    fn push(&mut self, l: f32, r: f32, out: &mut VecDeque<i16>) {
+        let to_i16 = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0) as i16;
+        if self.rate == SAMPLE_RATE {
+            out.push_back(to_i16(l));
+            out.push_back(to_i16(r));
+            return;
+        }
+        // Output frames fall at phase steps of rate/48000 input frames;
+        // interpolate between `prev` and this frame for those in (prev, x].
+        let step = f64::from(self.rate) / f64::from(SAMPLE_RATE);
+        let (pl, pr) = self.prev;
+        while self.phase <= 1.0 {
+            let t = self.phase as f32;
+            out.push_back(to_i16(pl + (l - pl) * t));
+            out.push_back(to_i16(pr + (r - pr) * t));
+            self.phase += step;
+        }
+        self.phase -= 1.0;
+        self.prev = (l, r);
+    }
+}
+
 /// Default-render-endpoint loopback capture (see the module docs).
 pub(crate) struct LoopbackSource {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     event: HANDLE,
     channels: usize,
-    rate: u32,
     fmt: SampleFmt,
-    /// Mono s16 at 48 kHz, not yet handed out.
+    /// Interleaved stereo s16 at 48 kHz, not yet handed out.
     pending: VecDeque<i16>,
-    /// Resampler state: fractional read position and the previous sample.
-    phase: f64,
-    prev: f32,
+    /// Device rate -> 48 kHz.
+    resampler: StereoResampler,
     /// When the next tick is due if the device stays silent.
     next_due: Instant,
     pub(crate) description: String,
@@ -131,14 +208,12 @@ impl LoopbackSource {
                 capture,
                 event,
                 channels,
-                rate: rate.max(1),
                 fmt,
-                pending: VecDeque::with_capacity(4 * OPUS10_SAMPLES as usize),
-                phase: 0.0,
-                prev: 0.0,
+                pending: VecDeque::with_capacity(8 * OPUS10_SAMPLES as usize),
+                resampler: StereoResampler::new(rate.max(1)),
                 next_due: Instant::now(),
                 description: format!(
-                    "WASAPI loopback, {rate} Hz x{channels} {fmt:?}, 10 ms period"
+                    "WASAPI loopback, {rate} Hz x{channels} {fmt:?} -> 48 kHz stereo, 10 ms period"
                 ),
             })
         }
@@ -167,14 +242,15 @@ impl LoopbackSource {
                     .map_err(|e| format!("GetBuffer: {e}"))?;
                 let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
                 let frames_us = frames as usize;
+                let mut frame = [0.0f32; MAX_CHANNELS];
+                let ch = self.channels.min(MAX_CHANNELS);
                 for f in 0..frames_us {
-                    let mono = if silent {
-                        0.0
+                    let (l, r) = if silent {
+                        (0.0, 0.0)
                     } else {
-                        let mut acc = 0.0f32;
-                        for c in 0..self.channels {
+                        for (c, slot) in frame.iter_mut().enumerate().take(ch) {
                             let i = f * self.channels + c;
-                            acc += match self.fmt {
+                            *slot = match self.fmt {
                                 SampleFmt::F32 => {
                                     std::ptr::read_unaligned((data as *const f32).add(i))
                                 }
@@ -188,40 +264,22 @@ impl LoopbackSource {
                                 }
                             };
                         }
-                        acc / self.channels as f32
+                        fold_to_stereo(&frame[..ch])
                     };
-                    self.push_resampled(mono);
+                    self.resampler.push(l, r, &mut self.pending);
                 }
                 let _ = self.capture.ReleaseBuffer(frames);
                 any = true;
             }
         }
     }
-
-    /// Feed one device-rate mono sample; emit 48 kHz s16 samples.
-    fn push_resampled(&mut self, x: f32) {
-        let to_i16 = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0) as i16;
-        if self.rate == SAMPLE_RATE {
-            self.pending.push_back(to_i16(x));
-            return;
-        }
-        // Output samples fall at phase steps of rate/48000 input samples;
-        // interpolate between `prev` and `x` for those in (prev, x].
-        let step = f64::from(self.rate) / f64::from(SAMPLE_RATE);
-        while self.phase <= 1.0 {
-            let t = self.phase as f32;
-            self.pending
-                .push_back(to_i16(self.prev + (x - self.prev) * t));
-            self.phase += step;
-        }
-        self.phase -= 1.0;
-        self.prev = x;
-    }
 }
 
 impl MicSource for LoopbackSource {
     fn read_tick(&mut self, out: &mut [i16]) -> Result<(), String> {
-        let tick = Duration::from_micros(out.len() as u64 * 1_000_000 / u64::from(SAMPLE_RATE));
+        // `out` is interleaved stereo: half as many frames as samples.
+        let frames = out.len() / 2;
+        let tick = Duration::from_micros(frames as u64 * 1_000_000 / u64::from(SAMPLE_RATE));
         loop {
             if self.pending.len() >= out.len() {
                 let n = out.len();
@@ -261,6 +319,10 @@ impl MicSource for LoopbackSource {
     fn tick_samples(&self) -> usize {
         OPUS10_SAMPLES as usize
     }
+
+    fn channels(&self) -> usize {
+        2
+    }
 }
 
 impl Drop for LoopbackSource {
@@ -289,7 +351,8 @@ mod tests {
             }
         };
         eprintln!("{}", src.description);
-        let mut buf = vec![0i16; src.tick_samples()];
+        assert_eq!(src.channels(), 2, "loopback delivers stereo");
+        let mut buf = vec![0i16; src.tick_samples() * src.channels()];
         let t0 = Instant::now();
         for _ in 0..30 {
             src.read_tick(&mut buf).unwrap();
@@ -300,21 +363,43 @@ mod tests {
     }
 
     #[test]
-    fn resampler_keeps_the_48k_rate() {
-        // Exercise the pure resampler via a fake state (no device).
-        let mut pending = VecDeque::new();
-        let (mut phase, mut prev) = (0.0f64, 0.0f32);
-        let step = 44_100.0 / 48_000.0;
+    fn resampler_keeps_the_48k_rate_in_stereo() {
+        let mut out = VecDeque::new();
+        let mut rs = StereoResampler::new(44_100);
         for i in 0..44_100 {
             let x = ((i as f32) * 0.01).sin();
-            while phase <= 1.0 {
-                pending.push_back(prev + (x - prev) * phase as f32);
-                phase += step;
-            }
-            phase -= 1.0;
-            prev = x;
+            rs.push(x, -x, &mut out);
         }
-        let n = pending.len() as i64;
-        assert!((n - 48_000).abs() <= 2, "{n}");
+        assert_eq!(out.len() % 2, 0, "whole frames only");
+        let frames = out.len() as i64 / 2;
+        assert!((frames - 48_000).abs() <= 2, "{frames}");
+        // The channels stay apart (R = -L).
+        let v: Vec<i16> = out.into_iter().collect();
+        assert!(v
+            .chunks(2)
+            .all(|f| (i32::from(f[0]) + i32::from(f[1])).abs() <= 1));
+    }
+
+    #[test]
+    fn resampler_passes_48k_through() {
+        let mut out = VecDeque::new();
+        let mut rs = StereoResampler::new(SAMPLE_RATE);
+        rs.push(0.5, -0.25, &mut out);
+        assert_eq!(out, [16_383, -8_191]);
+    }
+
+    #[test]
+    fn fold_maps_mono_stereo_and_surround() {
+        assert_eq!(fold_to_stereo(&[0.3]), (0.3, 0.3));
+        assert_eq!(fold_to_stereo(&[0.1, 0.2]), (0.1, 0.2));
+        // 5.1: a centre-only signal lands equally on both sides, LFE never.
+        let (l, r) = fold_to_stereo(&[0.0, 0.0, 0.5, 1.0, 0.0, 0.0]);
+        assert!((l - r).abs() < 1e-6 && l > 0.0 && l <= 0.5, "{l} {r}");
+        // A left-only 7.1 signal stays left.
+        let (l, r) = fold_to_stereo(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+        assert!(l > 0.0 && r == 0.0, "{l} {r}");
+        // Full scale everywhere never exceeds full scale.
+        let (l, r) = fold_to_stereo(&[1.0; 8]);
+        assert!(l <= 1.0 + 1e-6 && r <= 1.0 + 1e-6, "{l} {r}");
     }
 }

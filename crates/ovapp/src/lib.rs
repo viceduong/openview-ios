@@ -31,6 +31,7 @@ pub mod error;
 pub mod file_transfer;
 pub mod gdisrc;
 pub mod image;
+pub mod latency;
 pub mod liveness;
 pub mod lossy;
 #[cfg(all(windows, feature = "mf"))]

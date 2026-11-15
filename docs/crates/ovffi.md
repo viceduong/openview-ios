@@ -11,7 +11,7 @@ liveness, file transfer) lives in Rust. Swift only moves bytes and renders.
 | Source | `crates/ovffi/src/` (module map below; `lib.rs` holds the crate doc and the module list) |
 | C header | `ios/OvFFI/include/shim.h` (+ `module.modulemap`, module `OvFFI`, shipped inside the XCFramework; Swift uses `import OvFFI`) |
 | Swift wrapper | `ios/OpenView/OpenView/Transport/OvFFI.swift` (`OvSessionBox`, `OvScreenBox`) |
-| Tests | `src/tests/` (`ffi.rs`, `relay.rs`, `direct.rs`, `pin.rs`, `lan.rs`, `header.rs`) |
+| Tests | `src/tests/` (`ffi.rs`, `relay.rs`, `direct.rs`, `pin.rs`, `lan.rs`, `latency.rs`, `header.rs`) |
 | Dependencies | `ovcore`, `ovtransport` (without the `ws-client` feature: the app owns its WebSocket and uses the byte-stream bridge), `ovapp`; dev-dep `ovrelay` (`Cargo.toml`) |
 
 Module map (`crates/ovffi/src/`):
@@ -31,12 +31,12 @@ Module map (`crates/ovffi/src/`):
 | `media.rs` | Media-channel negotiation and delivery as channel-0 commands |
 | `file_transfer.rs` | `ov_file_send` |
 | `screen/mod.rs` | `ov_screen_*`: the channel-0 screen assembler |
-| `screen/feed.rs`, `screen/framebuffer.rs`, `screen/liveness.rs`, `screen/sinks.rs`, `screen/video.rs` | Command decode and routing; zero-copy framebuffer access; keepalive and watchdog; screen sink types and setters; H.264 pass-through |
+| `screen/feed.rs`, `screen/framebuffer.rs`, `screen/latency.rs`, `screen/liveness.rs`, `screen/sinks.rs`, `screen/video.rs` | Command decode and routing; zero-copy framebuffer access; latency telemetry (`ov_screen_latency_*`, `OvLatencyStats`); keepalive and watchdog; screen sink types and setters; H.264 pass-through |
 | `tests/mod.rs` | Tests through the C entry points |
 
-The header and the crate export the same 53 `ov_*` symbols; `src/tests/header.rs`
+The header and the crate export the same 57 `ov_*` symbols; `src/tests/header.rs`
 fails `cargo test -p ovffi` when they drift apart (it also checks the
-`ov_video_packet` field order and the shared constants). Swift calls all of
+`ov_video_packet` and `ov_latency_stats` field order and the shared constants). Swift calls all of
 them except `ov_identity_fingerprint` and `ov_identity_free`.
 
 ---
@@ -536,6 +536,7 @@ once. The caps are:
 ```
 LOCAL_CAPS | CAP_LZ4 | VIEWER_W2_CAPS        (always)
   + CAP_OPUS | CAP_AUDIO10                    if an Opus sink is installed
+    + CAP_STEREO                              ... and ov_screen_set_opus_stereo(1)
   + CAP_H264                                  if a video sink is installed
   + CAP_DIRECT | CAP_MEDIA                    if ov_screen_set_direct_capable(1)
 ```
@@ -679,6 +680,42 @@ int64_t ov_screen_inbound_age_ms(OvScreen*, int64_t now_ms);  // ms since last i
   2 s rolling window.
 - `inbound_age_ms` is for a shell-side watchdog. The host sends at least a
   keepalive every 5 s.
+- With a `CAP_TIMING` host, `keepalive_tick` also returns **clock-probe**
+  sequences (tagged `"OVT"` in the top 24 bits, always positive; 8 at 100 ms,
+  then one per second) whenever no keepalive is due. The shell sends them
+  like any PING; their timed PONGs measure the clock offset (§7.8) and never
+  touch the keepalive RTT.
+
+### 7.8 Latency telemetry (`CAP_TIMING`)
+
+```c
+typedef struct ov_latency_stage { uint32_t p50_us, p95_us, samples; } ov_latency_stage;
+typedef struct ov_latency_stats {
+    ov_latency_stage capture, encode, send, network, decode, present, total;
+    uint32_t clock_valid; uint64_t frames; int64_t clock_offset_us; uint64_t clock_rtt_us;
+} ov_latency_stats;                      // 112 bytes, = OvLatencyStats (#[repr(C)])
+int32_t ov_screen_latency_stats(OvScreen*, ov_latency_stats *out);          // 0 / -1
+int32_t ov_screen_latency_presented(OvScreen*, int64_t drawn_age_us,
+                                    int64_t presented_age_us);             // updates measured / -1
+```
+
+- The assembler joins the host's TIMING records (capture → grab → encode →
+  first byte, host clock) with its own reassembly and delivery times, and
+  with the presents the shell reports; see [ovapp.md](ovapp.md) §6.1 for
+  the stages. `network` and `total` need the clock offset
+  (`clock_valid`). `decode` is reassembled → handed to the shell (tiles are
+  decoded in Rust; H.264 is handed to VideoToolbox, whose decode counts
+  toward `present`).
+- `latency_stats` fills rolling p50 / p95 over the last 120 updates per
+  stage (`samples` 0 = no data yet). The app reads it twice a second on the
+  session queue: the stats chip shows the total, the session sheet the
+  breakdown.
+- `latency_presented`: every update handed to the shell at least
+  `drawn_age_us` ago reached the screen `presented_age_us` ago (both
+  relative to the call). The app reports each Metal drawable from its
+  presented handler (`CACurrentMediaTime() − drawable.presentedTime`, hopped
+  to the session queue) and each H.264 sample right after its
+  `AVSampleBufferDisplayLayer` enqueue (0 / 0, an approximation).
 
 ---
 
@@ -764,6 +801,11 @@ intact, records behind it too, and the viewer's reply reaches the host;
 every datagram stays <= 1214 B. With the old raw start it fails at the
 handshake. `examples/lan_probe.rs` runs the same viewer against a real
 `ovhost --lan-port` (`PROBE_LOSS=<percent>`).
+
+**`src/tests/latency.rs`** — `screen_measures_latency_against_a_timing_host`
+(clock probes out of `keepalive_tick`, timed PONGs, a TIMING-stamped frame,
+`latency_presented`, `latency_stats`) and
+`probe_echoes_do_not_disturb_the_keepalive_rtt`.
 
 **`src/tests/relay.rs`** — uses a real in-process `ovrelay::Relay`. Each
 session has its own `Collector`, so there is no global state.

@@ -81,6 +81,7 @@ own (see `TerminalSession::pump`, `Command::Caps` arm in
 | `CAP_CACHE` + `CAP_BANDS` | tile-cache REF / STORE records |
 | `CAP_H264` | `VIDEO_BEGIN` H.264 access units (needs a working decoder) |
 | `CAP_OPUS` (+`CAP_AUDIO10`) | Opus audio, in 20 ms (or 10 ms) packets |
+| `CAP_STEREO` + `CAP_OPUS` | stereo Opus system audio (mono down-mix otherwise) |
 | `CAP_RUDP` | the UDP carrier switches to reliable framing |
 | `CAP_DIRECT` + `CAP_MEDIA` (both sides) | direct UDP path, delay-based congestion control, unreliable media channel |
 
@@ -194,8 +195,13 @@ While in motion:
 3. **Encoding.** `mfcodec::MfVideoEncoder`:
    - Uses hardware NVENC/AMF/QSV MFTs, falling back to the Microsoft software
      MFT.
-   - Runs in low-latency mode: CBR, no B-frames, GOP of `fps*60`, Main
-     profile.
+   - Runs in low-latency mode: CBR, no B-frames, GOP of `fps*60`, High
+     profile (Main if the MFT refuses High). NVENC then uses the 8x8
+     transform; the Microsoft software MFT signals High but codes like
+     Main. Both the Media Foundation decoder and VideoToolbox decode it.
+   - Probes the MFT's optional features once (`EncoderCaps`, logged at
+     debug): long-term references (`LTRBufferControl` / `MarkLTRFrame` /
+     `UseLTRFrame`), gradual intra refresh, temporal layers.
    - Inputs:
      - **CPU path:** `bgra_to_nv12` (BT.709 limited range, multithreaded for
        pictures of at least 300k pixels).
@@ -333,6 +339,12 @@ FrameMailbox                       PrioritySender::flush(term, mailbox, max)
   unreliable, RS-FEC-protected media channel (`TerminalSession::
   send_video_media`). If the channel closes mid-stream, the unit is streamed
   reliably instead.
+- **Adaptive FEC.** The parity per frame follows the link
+  (`media::FecController`): 10 % + 4 × loss (up to 30 %) as soon as the
+  controller measures loss; after 3 s without loss, and while the RTT is
+  below the frame interval (a NACK repairs a loss before the next frame is
+  due), delta frames drop to 2 % (still at least one recovery shard per
+  frame). Keyframes keep 10 %.
 
 ---
 
@@ -452,8 +464,8 @@ sequenceDiagram
   participant V as Viewer hook
   participant JB as AudioBus (JitterBuffer)
   participant Spk as WinmmSpeaker
-  Mic->>AE: 20 ms (960) or 10 ms (480) s16 ticks
-  AE->>AE: Opus 48 kbps VBR, in-band FEC 10 %<br/>(CAP_OPUS) or raw PCM
+  Mic->>AE: 20 ms (960) mono or 10 ms (480 frames) stereo s16 ticks
+  AE->>AE: Opus VBR, in-band FEC 10 %: stereo 128 kbps (CAP_STEREO),<br/>mono 48 kbps (CAP_OPUS), or raw mono PCM
   AE->>TS: AUDIO payload(s)
   TS->>Net: send_audio: media channel if ready,<br/>else reliable AUDIO record
   Net->>V: AUDIO (+ MEDIA_GAP{audio} before it if packets lost)
@@ -463,12 +475,30 @@ sequenceDiagram
 ```
 
 - **Format** (`ovapp/src/audio/mod.rs`): `u8 codec | u8 flags | u32 samples (BE)
-  | body`, 48 kHz mono.
-  - Codec 0 carries s16le PCM (768 kbit/s).
-  - Codec 1 carries one Opus packet (about 48 kbit/s).
+  | body`, 48 kHz; `samples` counts frames per channel.
+  - Codec 0 carries s16le PCM, always mono (768 kbit/s).
+  - Codec 1 carries one Opus packet: mono (about 48 kbit/s), or stereo for a
+    `CAP_STEREO` peer. The packet's TOC byte says which (`s` bit), so the header
+    is the same for both.
 - **Packet size.** 10 ms Opus packets (`CAP_AUDIO10`) halve the packetisation
   delay. `ovhost`'s WASAPI loopback (`ovhost/src/sysaudio.rs`) delivers 10 ms
   ticks.
+- **Stereo** (`ovapp/src/audio/stereo.rs`). The loopback captures interleaved
+  stereo: a mono device is duplicated, and 5.1/7.1 is folded down (centre at
+  -3 dB, LFE dropped). `AudioEncoder::with_channels(2)` sends it as stereo Opus
+  (128 kbit/s VBR, 10 ms, FEC on) to a peer that set `CAP_STEREO` + `CAP_OPUS`.
+  Every other peer gets the `(L + R) / 2` down-mix as mono. The mic paths stay
+  mono.
+  - **Thin links.** `StereoGate` watches the link rate the screen loop already
+    computes: the congestion controller's target on the direct path, or the
+    pacer's delivery rate on the relay. Below 1 Mbit/s the stereo encoder is
+    forced to mono at 64 kbit/s. Stereo returns after 5 s at 1.5 Mbit/s or
+    more. The stream stays 2-channel, so a mono-coded packet decodes to L = R
+    and receivers never reconfigure (one transition packet).
+  - **Decoders.** `AudioDecoder::with_channels(n)` fixes the output layout.
+    libopus mixes any packet into it, and raw PCM is duplicated. `ovview`
+    decodes to stereo and opens `waveOut` with 2 channels. The host's speaker
+    (viewer mic) stays mono.
 - **Loss handling.** Over the reliable channel audio never loses packets. On
   the media channel, the pump synthesises `MEDIA_GAP{kind: audio, packets,
   samples}` before the next AUDIO. The viewer then recovers the lost audio
@@ -477,8 +507,10 @@ sequenceDiagram
 - **Playback.** `JitterBuffer` prefills to its target, trims back to the
   target past its ceiling, and re-enters prefill after an underrun.
   - Defaults are 60/120 ms.
-  - `ovview` uses `AudioBus::with_ms(30, 90)`.
-  - `WinmmSpeaker` keeps 3 rotating 20 ms buffers.
+  - `ovview` uses `AudioBus::with_ms_channels(30, 90, 2)`. Depth, target and
+    ceiling are in audio time, and trims drop whole frames.
+  - `WinmmSpeaker` keeps 3 rotating 20 ms buffers (`open_channels(2)` for
+    stereo).
 - **Direction.** AUDIO is direction-agnostic, so viewer mic to host also
   works (`ovapp/tests/audio_duplex_over_relay.rs`).
 
@@ -522,7 +554,10 @@ The byte-level tables are in [`crates/ovapp.md` §3.3 and §4.3](crates/ovapp.md
 | Motion thresholds | `MotionConfig` | 65 ms enter / 1 s exit, 320x240 | How eagerly regions switch to video |
 | Video bitrate | `VideoSession::set_bits_per_pixel`, `target_bitrate_bpp` | 0.2 bpp, ≤ 70 % link, 0.5-40 Mbps | Quality vs link share |
 | Video backlog | `MAX_VIDEO_QUEUE` | 3 | Latency vs skipped encodes |
+| Video FEC | `media::FEC_FLOOR`, `FEC_MIN`/`FEC_MAX`, `FEC_CLEAN_HOLD`, `LOSS_CLEAN` | 2 % clean, 10-30 % with loss, 3 s, 0.2 % | Parity overhead vs repair without a NACK round trip |
+| Viewer present | `ovview --vsync` | off: immediate, tearing allowed | Display latency vs tearing |
 | Audio packet | `CAP_AUDIO10` | 10 ms with `opus` | Latency vs overhead |
+| Stereo system audio | `CAP_STEREO`, `OPUS_STEREO_BITRATE`, `StereoGate` | 128 kbps; mono/64k below 1 Mbit/s | Stereo image vs bytes on thin links |
 | Jitter buffer | `AudioBus::with_ms` | 60/120 ms (viewer 30/90) | Audio latency vs dropouts |
 | Timer resolution | `netwait::high_res_timers()` | — | 1 ms waits for the pacer |
 
