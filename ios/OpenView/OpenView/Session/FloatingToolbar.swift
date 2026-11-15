@@ -96,7 +96,6 @@ struct FloatingToolbar: View {
         .onDisappear {
             let link = keyBarLink
             link.onShowToolbar = nil
-            link.onToggleToolbar = nil
             link.attached = false
         }
     }
@@ -122,10 +121,6 @@ struct FloatingToolbar: View {
     private func syncKeyBar() {
         let link = keyBarLink
         link.onShowToolbar = showToolbarFromKeyBar
-        link.onToggleToolbar = {
-            chrome.poke()
-            setCollapsed(!(chrome.toolbarCollapsed || !expandedOverKeyboard))
-        }
         if link.handleVisible != collapsedOverKeyboard {
             link.handleVisible = collapsedOverKeyboard
         }

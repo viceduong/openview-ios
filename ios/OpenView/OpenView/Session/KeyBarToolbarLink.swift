@@ -26,8 +26,6 @@ final class KeyBarToolbarLink: ObservableObject {
 
     /// Handle tapped: expand the toolbar over the keyboard.
     var onShowToolbar: (() -> Void)?
-    /// The key row's toolbar button: expand / collapse the toolbar.
-    var onToggleToolbar: (() -> Void)?
 
     private final class Entry {
         weak var owner: RemoteInputController?

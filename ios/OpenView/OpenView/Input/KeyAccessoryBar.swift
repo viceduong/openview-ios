@@ -12,11 +12,10 @@ import UIKit
 /// tap = locked (filled). The first time the bar appears, a hint says the
 /// ribbon scrolls.
 ///
-/// Toolbar: a fixed toolbar button (next to "hide keyboard") expands /
-/// collapses the floating toolbar over the keyboard, and while the toolbar
-/// is collapsed its handle is drawn by this bar, protruding above the
-/// top-trailing corner, so it moves with the key row by construction
-/// (`KeyBarToolbarLink` carries the state and actions).
+/// Toolbar: while the floating toolbar is collapsed over the keyboard its
+/// handle is drawn by this bar, protruding above the top-trailing corner,
+/// so it moves with the key row by construction (`KeyBarToolbarLink`
+/// carries the state and actions).
 final class KeyAccessoryBar: UIView {
     static let barHeight: CGFloat = 46
     /// UserDefaults flag: the "swipe for more keys" hint was shown.
@@ -38,14 +37,12 @@ final class KeyAccessoryBar: UIView {
     private let link: KeyBarToolbarLink
     private var linkCancellable: AnyCancellable?
     private let toolbarHandle = KeyBarToolbarHandle()
-    private var toolbarButton: UIButton?
     private var handleFramePending = false
     /// Geometry of the floating toolbar's own handle: 44 pt wide touch
     /// target, 26 x 64 capsule, 8 pt above the key row.
     private static let handleWidth: CGFloat = 44
     private static let handleHeight: CGFloat = 64
     private static let handleGap: CGFloat = 8
-    private static let toolbarButtonWidth: CGFloat = 44
 
     init(input: RemoteInputController) {
         self.input = input
@@ -105,8 +102,7 @@ final class KeyAccessoryBar: UIView {
 
     /// Touches on the protruding handle belong to the bar too (whether
     /// they reach it depends on the keyboard's host views; the toolbar
-    /// keeps a tap target under the handle and the toolbar button for
-    /// when they do not).
+    /// keeps a tap target under the handle for when they do not).
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
         if super.point(inside: point, with: event) { return true }
         return handleTakesTouches && toolbarHandle.frame.contains(point)
@@ -136,14 +132,6 @@ final class KeyAccessoryBar: UIView {
         hide.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hide)
 
-        // Floating toolbar: show (or hide) it over the keyboard.
-        let toolbar = makeButton(title: nil, symbol: "sidebar.right", label: "Show toolbar",
-                                 width: Self.toolbarButtonWidth) { [weak self] in
-            self?.link.onToggleToolbar?()
-        }
-        addSubview(toolbar)
-        toolbarButton = toolbar
-
         let divider = UIView()
         divider.backgroundColor = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
@@ -168,9 +156,7 @@ final class KeyAccessoryBar: UIView {
         NSLayoutConstraint.activate([
             hide.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             hide.centerYAnchor.constraint(equalTo: centerYAnchor),
-            toolbar.trailingAnchor.constraint(equalTo: hide.leadingAnchor, constant: -4),
-            toolbar.centerYAnchor.constraint(equalTo: centerYAnchor),
-            divider.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -4),
+            divider.trailingAnchor.constraint(equalTo: hide.leadingAnchor, constant: -4),
             divider.widthAnchor.constraint(equalToConstant: 1),
             divider.heightAnchor.constraint(equalToConstant: 26),
             divider.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -284,15 +270,6 @@ final class KeyAccessoryBar: UIView {
                 self.toolbarHandle.alpha = target
             }
         }
-        if let button = toolbarButton {
-            // Expanded over the keyboard: tinted, and the button hides it.
-            let expanded = attached && !handleVisible
-            var cfg = Self.baseConfiguration(expanded ? .latched : .off)
-            cfg.image = button.configuration?.image
-            button.configuration = cfg
-            button.accessibilityLabel = expanded ? "Hide toolbar" : "Show toolbar"
-            button.isEnabled = attached
-        }
     }
 
     @objc private func keyboardDidMove(_ note: Notification) {
@@ -300,6 +277,13 @@ final class KeyAccessoryBar: UIView {
     }
 
     @objc private func keyboardWillHide(_ note: Notification) {
+        // The toolbar comes back right away as the keyboard hides, so the
+        // handle vanishes at once instead of riding down with the bar.
+        UIView.performWithoutAnimation {
+            toolbarHandle.layer.removeAllAnimations()
+            toolbarHandle.alpha = 0
+        }
+        toolbarHandle.isUserInteractionEnabled = false
         if !link.handleFrame.isNull {
             link.handleFrame = .null
         }
