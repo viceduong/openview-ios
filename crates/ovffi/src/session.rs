@@ -289,7 +289,14 @@ fn begin(s: &OvSession, auth_mode: i32, psk: Option<[u8; 32]>) -> i32 {
             } else {
                 Role::Client
             };
-            g.handshake = Some(Handshake::new(role, g.device_id, &g.identity, auth));
+            #[allow(unused_mut)]
+            let mut hs = Handshake::new(role, g.device_id, &g.identity, auth);
+            // Unit tests run in parallel in one process: give every test
+            // thread its own PIN throttle, so a test that deliberately trips
+            // the lockout cannot rate-limit the others.
+            #[cfg(test)]
+            hs.set_throttle(crate::tests::thread_throttle());
+            g.handshake = Some(hs);
             Ok(0)
         })
         .unwrap_or(-1)

@@ -11,3 +11,14 @@ mod header;
 mod lan;
 mod pin;
 mod relay;
+
+thread_local! {
+    static THROTTLE: std::sync::Arc<ovcore::throttle::AuthThrottle> =
+        std::sync::Arc::new(ovcore::throttle::AuthThrottle::default());
+}
+
+/// The PIN throttle for handshakes created on the current test thread (see
+/// `session.rs`): per-thread, so parallel tests never share lockout state.
+pub(crate) fn thread_throttle() -> std::sync::Arc<ovcore::throttle::AuthThrottle> {
+    THROTTLE.with(std::sync::Arc::clone)
+}
