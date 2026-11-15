@@ -678,10 +678,13 @@ final class SessionController: ObservableObject {
         onMain { $0.appendLine(text) }
     }
 
-    /// Developer detail (transport events, retries, power state): unified
-    /// log only, at debug level (not persisted, not shown in the app).
+    /// Developer detail (transport events, relay close reasons, watchdog,
+    /// LAN/relay fallback, power state): unified log at debug level plus the
+    /// diagnostics file (never per-frame, so cheap), but not shown in the
+    /// in-app session log.
     func debug(_ text: String) {
         Log.transport.debug("\(text, privacy: .public)")
+        DiagLog.shared.log("[detail] " + text)
     }
 
     /// Main thread: append and cap the log at `maxLines`.

@@ -34,8 +34,8 @@ struct SettingsView: View {
     @State private var confirmForgetPINs = false
     @State private var biometryUnavailable = false
     /// Diagnostics: the kept session log files offered to the share sheet.
-    @State private var shareLogs: [URL] = []
-    @State private var showShareLogs = false
+    @State private var shareLogs: LogShare?
+    @State private var logNotice: String?
 
     private var version: String {
         let info = Bundle.main.infoDictionary
@@ -242,8 +242,14 @@ struct SettingsView: View {
                 Text("Last session log")
             }
             Button {
-                shareLogs = DiagLog.shared.allFiles()
-                showShareLogs = !shareLogs.isEmpty
+                let files = DiagLog.shared.allFiles()
+                if files.isEmpty {
+                    logNotice = "No diagnostic logs yet."
+                } else {
+                    // `.sheet(item:)` builds the sheet from this value, so it
+                    // can never open with a stale (empty) list.
+                    shareLogs = LogShare(files: files)
+                }
             } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Share diagnostic logs")
@@ -252,8 +258,23 @@ struct SettingsView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            .sheet(isPresented: $showShareLogs) {
-                ShareSheet(items: shareLogs)
+            .sheet(item: $shareLogs) { share in
+                ShareSheet(items: share.files)
+            }
+            Button("Copy diagnostic log") {
+                let text = DiagLog.shared.recentText()
+                if text.isEmpty {
+                    logNotice = "No diagnostic logs yet."
+                } else {
+                    UIPasteboard.general.string = text
+                    logNotice = "Copied \(text.count / 1024 + 1) KB — paste it into a message."
+                }
+            }
+            .alert(logNotice ?? "", isPresented: Binding(
+                get: { logNotice != nil },
+                set: { if !$0 { logNotice = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
             }
         }
     }
@@ -272,4 +293,11 @@ struct SettingsView: View {
     private static func canAuthenticate() -> Bool {
         LAContext().canEvaluatePolicy(.deviceOwnerAuthentication, error: nil)
     }
+}
+
+/// The files offered by "Share diagnostic logs" (identity per tap, for
+/// `.sheet(item:)`).
+struct LogShare: Identifiable {
+    let id = UUID()
+    let files: [URL]
 }

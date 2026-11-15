@@ -152,6 +152,22 @@ final class DiagLog {
         }
     }
 
+    /// The newest log files' text (newest first), capped at `limit` bytes,
+    /// for "Copy diagnostic log".
+    func recentText(limit: Int = 200_000) -> String {
+        let urls = allFiles()
+        var out = ""
+        for url in urls {
+            guard let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty else { continue }
+            out += "==== \(url.lastPathComponent)\n" + text + "\n"
+            if out.utf8.count >= limit { break }
+        }
+        if out.utf8.count > limit {
+            out = String(decoding: Array(out.utf8.prefix(limit)), as: UTF8.self)
+        }
+        return out
+    }
+
     private static func files(_ dir: URL) -> [URL] {
         let all = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         return all
