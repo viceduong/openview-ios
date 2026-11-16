@@ -13,11 +13,8 @@ import UIKit
 /// 70% after 3 s without interaction ("Fade toolbar when idle", default
 /// off) — purely visual: every tap acts immediately, faded or not.
 /// Cmd+Shift+Space toggles it (SessionHostingController). While the soft
-/// keyboard or the key accessory bar is up (`input.keyInputActive`) the
-/// toolbar collapses to its handle (tap to expand over the keyboard). That
-/// handle is drawn by the key bar itself (KeyAccessoryBar, above its
-/// top-trailing corner) so it moves with the key row; `KeyBarToolbarLink`
-/// carries the collapsed / faded state there and the actions back.
+/// keyboard or the key accessory bar is up the toolbar is hidden entirely
+/// (no handle); it comes back as soon as the keyboard starts hiding.
 ///
 /// The pill / handle report their frames (`reportsChromeFrame`) so the
 /// remote surface underneath never takes touches meant for them.
@@ -33,8 +30,6 @@ struct FloatingToolbar: View {
     @AppStorage(SettingsKey.toolbarHandleEdge) private var handleEdge = "trailing"
     @AppStorage(SettingsKey.toolbarHandleY) private var handleY: Double = 0.7
     @State private var dragOffset: CGSize = .zero
-    /// Expanded by the user while the keyboard is up (reset per keyboard).
-    @State private var expandedOverKeyboard = false
     /// The on-screen keyboard (incl. the key bar shown alone) as iOS
     /// reports it, animated with iOS's own keyboard timing.
     @StateObject private var keyboard = KeyboardTracker()
@@ -45,9 +40,6 @@ struct FloatingToolbar: View {
     private static let spacing: CGFloat = 2
     private static let pillInset: CGFloat = 4
     private static let edgeGap: CGFloat = 12
-    /// Gap between the keyboard's top edge and the pill (the key bar's
-    /// handle uses the same gap above the key row).
-    private static let keyboardGap: CGFloat = 8
     /// Length of the pill along its axis (4 x 44 + spacing + insets).
     private static let pillLength: CGFloat =
         FloatingToolbar.buttonCount * FloatingToolbar.target
@@ -57,16 +49,11 @@ struct FloatingToolbar: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                if isCollapsed {
-                    if keyboardUp {
-                        // The handle is drawn by the key bar; this is only
-                        // a tap target under it (see KeyBarHandleTarget).
-                        KeyBarHandleTarget(link: keyBarLink,
-                                           globalOrigin: geo.frame(in: .global).origin,
-                                           onTap: showToolbarFromKeyBar)
-                    } else {
-                        handle(in: geo)
-                    }
+                if keyboardUp {
+                    // Hidden while the keyboard / key bar is up.
+                    EmptyView()
+                } else if isCollapsed {
+                    handle(in: geo)
                 } else {
                     expanded(in: geo)
                 }
@@ -80,69 +67,6 @@ struct FloatingToolbar: View {
         .opacity(chrome.toolbarFaded ? SessionChrome.fadedOpacity : 1)
         .animation(.easeInOut(duration: 0.3), value: chrome.toolbarFaded)
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: isCollapsed)
-        .onChange(of: keyboardUp) { _ in
-            // Each keyboard appearance starts collapsed again.
-            expandedOverKeyboard = false
-        }
-        .onChange(of: collapsedOverKeyboard) { _ in
-            syncKeyBar()
-        }
-        .onChange(of: chrome.toolbarFaded) { _ in
-            syncKeyBar()
-        }
-        .onAppear {
-            syncKeyBar()
-        }
-        .onDisappear {
-            let link = keyBarLink
-            link.onShowToolbar = nil
-            link.attached = false
-        }
-    }
-
-    // MARK: Key bar handle
-
-    /// The key bar shared with the remote key input view (see
-    /// KeyBarToolbarLink).
-    private var keyBarLink: KeyBarToolbarLink {
-        KeyBarToolbarLink.link(for: input)
-    }
-
-    /// Collapsed whenever the keyboard is up: the key bar shows the handle
-    /// (the bar only exists while the keyboard / bar is up, so this does
-    /// not depend on `keyboardUp`, and the handle rides up with the bar
-    /// from its first frame). Equals `isCollapsed` while the keyboard is up.
-    private var collapsedOverKeyboard: Bool {
-        chrome.toolbarCollapsed || !expandedOverKeyboard
-    }
-
-    /// Push the state and actions to the key bar. Called from onAppear /
-    /// onChange (never during a view update).
-    private func syncKeyBar() {
-        let link = keyBarLink
-        link.onShowToolbar = showToolbarFromKeyBar
-        if link.handleVisible != collapsedOverKeyboard {
-            link.handleVisible = collapsedOverKeyboard
-        }
-        if link.faded != chrome.toolbarFaded {
-            link.faded = chrome.toolbarFaded
-        }
-        if !link.attached {
-            link.attached = true
-        }
-    }
-
-    /// The key bar's handle (or its tap target) was tapped: expand the
-    /// toolbar over the keyboard.
-    private func showToolbarFromKeyBar() {
-        chrome.poke()
-        // An explicit "show toolbar" from the key bar wins over a collapse
-        // the user set before the keyboard came up; otherwise the tap would
-        // do nothing.
-        if keyboardUp && chrome.toolbarCollapsed {
-            chrome.toolbarCollapsed = false
-        }
-        setCollapsed(false)
     }
 
     /// The keyboard (or the key bar alone) is on screen. iOS's keyboard
@@ -152,28 +76,14 @@ struct FloatingToolbar: View {
         keyboard.up
     }
 
-    /// Keyboard top edge in this view's local coordinates (the view ignores
-    /// the keyboard safe area, so it keeps its full height).
-    private func keyboardTop(in geo: GeometryProxy) -> CGFloat {
-        let global = geo.frame(in: .global)
-        let screenHeight = UIScreen.main.bounds.height
-        return screenHeight - keyboard.height - global.minY
-    }
-
-    /// While the soft keyboard / key bar is up the toolbar collapses to its
-    /// normal handle (the user's own collapsed setting is untouched and
-    /// applies again when the keyboard hides). Tapping the handle expands
-    /// it over the keyboard until the keyboard goes away.
+    /// The user's collapsed setting (the keyboard hides the toolbar
+    /// separately, see `body`).
     private var isCollapsed: Bool {
-        chrome.toolbarCollapsed || (keyboardUp && !expandedOverKeyboard)
+        chrome.toolbarCollapsed
     }
 
     private func setCollapsed(_ collapsed: Bool) {
-        if keyboardUp {
-            expandedOverKeyboard = !collapsed
-        } else {
-            chrome.toolbarCollapsed = collapsed
-        }
+        chrome.toolbarCollapsed = collapsed
     }
 
     // MARK: Expanded pill
@@ -189,17 +99,6 @@ struct FloatingToolbar: View {
         // Too short: the button column scrolls inside a pill filling the
         // edge (at least one button tall).
         let scrollLength: CGFloat? = fits ? nil : max(room - 2 * Self.pillInset, Self.target)
-        if keyboardUp {
-            // Expanded over the keyboard: sits just above it on the trailing
-            // edge, scrolling if the space above the keyboard is too short.
-            let kbTop = keyboardTop(in: geo)
-            let above = max(kbTop - 2 * Self.edgeGap, Self.target)
-            let length: CGFloat? = above >= Self.pillLength ? nil : max(above - 2 * Self.pillInset, Self.target)
-            return AnyView(pill(scrollLength: length)
-                .padding(.trailing, Self.edgeGap)
-                .padding(.bottom, max(size.height - kbTop, 0) + Self.keyboardGap)
-                .frame(width: size.width, height: size.height, alignment: .bottomTrailing))
-        }
         return AnyView(pill(scrollLength: scrollLength)
             .padding(.trailing, Self.edgeGap)
             .padding(.bottom, below ? Self.edgeGap : 0)
@@ -315,33 +214,6 @@ struct FloatingToolbar: View {
             .accessibilityAddTraits(.isButton)
             .reportsChromeFrame()
             .position(x: x + dragOffset.width, y: y + dragOffset.height)
-    }
-}
-
-// MARK: - Key bar handle tap target
-
-/// An invisible tap target under the handle the key bar draws above its
-/// top-trailing corner. The handle sits outside the bar's bounds; should
-/// the keyboard's window not deliver touches there, they fall through to
-/// the session window — here — instead of clicking the remote screen (the
-/// frame is reported as chrome). Placed at the handle's settled frame.
-private struct KeyBarHandleTarget: View {
-    @ObservedObject var link: KeyBarToolbarLink
-    /// This view's origin in `.global` (the link's frame is global).
-    let globalOrigin: CGPoint
-    let onTap: () -> Void
-
-    var body: some View {
-        let frame = link.handleFrame
-        if link.attached && link.handleVisible && !frame.isNull && !frame.isEmpty {
-            Color.clear
-                .frame(width: frame.width, height: frame.height)
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onTap)
-                .reportsChromeFrame()
-                .accessibilityHidden(true)
-                .position(x: frame.midX - globalOrigin.x, y: frame.midY - globalOrigin.y)
-        }
     }
 }
 
