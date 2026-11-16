@@ -14,11 +14,12 @@ use ovcore::handshake::{Auth, Handshake, HandshakeEvent, Role};
 use ovcore::identity::Identity;
 use ovtransport::{Carrier, DirectSockets, RelayTunnelCarrier, TunnelRole};
 
+use crate::direct::FfiDirect;
 use crate::{
     ov_session_begin, ov_session_create, ov_session_direct_path, ov_session_direct_state,
-    ov_session_free, ov_session_on_direct_datagram, ov_session_pump_relay,
-    ov_session_relay_connect, ov_session_send_record, ov_session_set_direct_sinks,
-    ov_session_set_record_sink, OvSession,
+    ov_session_direct_take_event, ov_session_free, ov_session_on_direct_datagram,
+    ov_session_pump_relay, ov_session_relay_connect, ov_session_send_record,
+    ov_session_set_direct_sinks, ov_session_set_record_sink, OvSession,
 };
 
 #[derive(Default)]
@@ -592,5 +593,66 @@ fn ffi_client_receives_the_media_channel() {
         .count();
     assert_eq!(audio, 10);
     drop(g);
+    unsafe { ov_session_free(s) };
+}
+
+/// `ov_session_direct_take_event`: argument checks, addresses for path ids
+/// (`path#10` is not eaten by `path#1`), truncation at a UTF-8 boundary,
+/// and the bounded queue (oldest dropped).
+#[test]
+fn ffi_direct_events_are_taken_in_order() {
+    let code = CString::new("424242").unwrap();
+    let s: *mut OvSession = unsafe { ov_session_create(0, code.as_ptr()) };
+    let take = |cap: usize| -> (i32, String) {
+        let mut buf = vec![1 as c_char; cap];
+        let n = unsafe { ov_session_direct_take_event(s, buf.as_mut_ptr(), cap) };
+        if n <= 0 {
+            return (n, String::new());
+        }
+        assert_eq!(buf[n as usize], 0, "NUL-terminated");
+        let text = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        (n, text.to_owned())
+    };
+    let push = |lines: &[String]| {
+        let mut g = unsafe { &*s }.inner.lock().unwrap();
+        let d = g.direct.get_or_insert_with(|| FfiDirect {
+            engine: ovtransport::direct::DirectEngine::new(false, [1; 32]),
+            inbound: Default::default(),
+            paths: (0..11).map(|i| format!("10.0.0.{i}:9")).collect(),
+            events: Default::default(),
+        });
+        for l in lines {
+            d.push_event(l.clone());
+        }
+    };
+    let mut buf = [0 as c_char; 8];
+    let null = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { ov_session_direct_take_event(null, buf.as_mut_ptr(), 8) },
+        -1
+    );
+    assert_eq!(
+        unsafe { ov_session_direct_take_event(s, null.cast(), 8) },
+        -1
+    );
+    assert_eq!(
+        unsafe { ov_session_direct_take_event(s, buf.as_mut_ptr(), 0) },
+        -1
+    );
+    assert_eq!(take(64), (0, String::new()), "no engine yet");
+    push(&["path#10 then path#1".into()]);
+    let line = "10.0.0.10:9 then 10.0.0.1:9";
+    assert_eq!(take(64), (line.len() as i32, line.into()));
+    assert_eq!(take(64).0, 0, "drained");
+    // 3 of the 6 bytes fit beside the NUL: cut back to a char boundary.
+    push(&["\u{e9}\u{e9}\u{e9}".into()]);
+    assert_eq!(take(4), (2, "\u{e9}".into()));
+    push(&(0..40).map(|i| format!("e{i}")).collect::<Vec<_>>());
+    let mut got = Vec::new();
+    while let (1.., e) = take(64) {
+        got.push(e);
+    }
+    let want: Vec<String> = (8..40).map(|i| format!("e{i}")).collect();
+    assert_eq!(got, want, "the 32 newest");
     unsafe { ov_session_free(s) };
 }

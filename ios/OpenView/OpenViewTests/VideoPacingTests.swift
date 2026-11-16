@@ -17,7 +17,6 @@ final class VideoPacingTests: XCTestCase {
         XCTAssertEqual(p.offer(1, generation: g), .queued)
         XCTAssertEqual(p.offer(2, generation: g), .replaced)
         XCTAssertEqual(p.offer(3, generation: g), .replaced)
-        XCTAssertEqual(p.dropped, 2)
         let t = p.take()
         XCTAssertEqual(t.frame, 3)
         XCTAssertTrue(t.active)

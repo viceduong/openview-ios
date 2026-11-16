@@ -683,8 +683,93 @@ fn network_change_reprobes_at_once() {
     let mut io = MemIo::default();
     v.poll(t0 + PROBE_ROUND, &mut io, &mut |_| {});
     assert_eq!(v.state(), DirectState::Relay, "round failed, backing off");
-    let t = t0 + PROBE_ROUND + Duration::from_millis(1);
+    // Grow the backoff past its first step.
+    let mut t = t0 + PROBE_ROUND;
+    for _ in 0..2 {
+        t += v.next_deadline(t).unwrap();
+        v.poll(t, &mut io, &mut |_| {});
+        t += PROBE_ROUND;
+        v.poll(t, &mut io, &mut |_| {});
+    }
+    assert!(v.next_deadline(t).unwrap() > REPROBE_AFTER);
+    let t = t + Duration::from_millis(1);
     v.network_changed(t, &mut io);
     assert_eq!(v.state(), DirectState::Probing);
-    assert_eq!(v.stats().probe_rounds, 2);
+    assert_eq!(v.stats().probe_rounds, 4);
+    // The backoff restarts from its first step.
+    let t = t + PROBE_ROUND;
+    v.poll(t, &mut io, &mut |_| {});
+    assert_eq!(v.state(), DirectState::Relay);
+    assert_eq!(v.next_deadline(t), Some(REPROBE_AFTER));
+}
+
+/// On the direct path a network change sends a REBIND at once (no new
+/// probe round).
+#[test]
+fn network_change_rebinds_an_active_link() {
+    let t0 = Instant::now();
+    let key = [2; 32];
+    let mut v = DirectEngine::new(false, key);
+    v.arm();
+    v.start_probe(vec![0], t0);
+    let mut io = MemIo::default();
+    v.link = Some(v.make_link(0, t0, true));
+    v.on_direct = true;
+    v.network_changed(t0 + Duration::from_millis(1), &mut io);
+    assert_eq!(v.state(), DirectState::Direct);
+    assert_eq!(v.stats().probe_rounds, 1);
+    assert_eq!(v.stats().rebinds, 1);
+    let sent: Vec<u8> = io
+        .direct
+        .iter()
+        .filter_map(|d| open_probe(&key, d).map(|(ty, ..)| ty))
+        .collect();
+    assert_eq!(sent, vec![P_REBIND]);
+}
+
+/// A lost COMMIT is repeated while the viewer sends on the unconfirmed
+/// link: the host still promotes within two keepalive periods.
+#[test]
+fn lost_commit_is_repeated() {
+    let t0 = Instant::now();
+    let key = [5; 32];
+    let mut h = DirectEngine::new(true, key);
+    let mut v = DirectEngine::new(false, key);
+    h.arm();
+    v.arm();
+    v.start_probe(vec![0], t0);
+    let (mut hio, mut vio) = (MemIo::default(), MemIo::default());
+    let mut dropped = None;
+    let mut t = t0;
+    while t < t0 + Duration::from_secs(2) && h.state() != DirectState::Direct {
+        t += Duration::from_millis(10);
+        v.send(b"rec", t, &mut vio).unwrap();
+        v.poll(t, &mut vio, &mut |_| {});
+        h.poll(t, &mut hio, &mut |_| {});
+        for d in std::mem::take(&mut vio.relay) {
+            h.on_primary(&d, t, &mut hio, &mut |_| {});
+        }
+        for d in std::mem::take(&mut hio.relay) {
+            v.on_primary(&d, t, &mut vio, &mut |_| {});
+        }
+        for d in std::mem::take(&mut vio.direct) {
+            let commit = open_probe(&key, &d).is_some_and(|(ty, ..)| ty == P_COMMIT);
+            if commit && dropped.is_none() {
+                dropped = Some(t);
+                continue;
+            }
+            h.on_direct(0, &d, t, &mut hio, &mut |_| {});
+        }
+        for d in std::mem::take(&mut hio.direct) {
+            v.on_direct(0, &d, t, &mut vio, &mut |_| {});
+        }
+    }
+    let dropped = dropped.expect("no COMMIT sent");
+    assert_eq!(h.state(), DirectState::Direct, "host never promoted");
+    assert!(
+        t - dropped <= KEEPALIVE * 2,
+        "promoted {:?} after the loss",
+        t - dropped
+    );
+    assert!(h.take_events().iter().any(|e| e.contains("committed")));
 }

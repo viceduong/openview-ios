@@ -174,11 +174,11 @@ int32_t ov_session_on_direct_datagram(OvSession *s, uint32_t path_id, const uint
 int32_t ov_session_direct_state(OvSession *s);        /* 0 relay, 1 probing, 2 direct, -1 null */
 int64_t ov_session_direct_deadline_ms(OvSession *s);  /* -1 = no timer pending */
 int64_t ov_session_direct_path(OvSession *s);         /* active path_id or -1 */
-// The local network changed: re-probe now (relay) / REBIND (direct).
-// 0, -1 null session, -2 no direct engine.
+// The local network changed: re-probe now (relay) / REBIND (direct); the
+// next pump sends the probes. 0, -1 null session, -2 no direct engine.
 int32_t ov_session_direct_network_changed(OvSession *s);
 // Oldest direct-path event line into `out` (NUL-terminated, truncated to
-// fit). Returns its length, 0 = none, -1 bad args.
+// fit). Returns its length, 0 = none, -1 bad args, -2 poisoned session.
 int32_t ov_session_direct_take_event(OvSession *s, char *out, size_t cap);
 // SESSION_OPTION payload (key 1 = hide wallpaper, 2 = disable animations;
 // value 0/1) for ov_session_send_record on channel 0. Returns the length

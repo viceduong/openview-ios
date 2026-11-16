@@ -27,25 +27,30 @@ pub(crate) struct FfiDirect {
     /// Datagrams from the shell, `(path_id, bytes)`.
     pub(crate) inbound: VecDeque<(u32, Vec<u8>)>,
     /// Candidate addresses by path id.
-    paths: Vec<String>,
+    pub(crate) paths: Vec<String>,
     /// Path-event lines (`path#N` replaced by the address) for the shell's
     /// log, drained by [`ov_session_direct_take_event`].
-    events: VecDeque<String>,
+    pub(crate) events: VecDeque<String>,
 }
 
 impl FfiDirect {
     /// Move the engine's path events into [`events`](Self::events).
     pub(crate) fn collect_events(&mut self) {
-        for mut e in self.engine.take_events() {
-            // Longest ids first so `path#1` never eats `path#10`.
-            for (i, a) in self.paths.iter().enumerate().rev() {
-                e = e.replace(&format!("path#{i}"), a);
-            }
-            if self.events.len() == DIRECT_EVENTS_CAP {
-                self.events.pop_front();
-            }
-            self.events.push_back(e);
+        for e in self.engine.take_events() {
+            self.push_event(e);
         }
+    }
+
+    /// Queue one event line with `path#N` replaced by the address.
+    pub(crate) fn push_event(&mut self, mut e: String) {
+        // Longest ids first so `path#1` never eats `path#10`.
+        for (i, a) in self.paths.iter().enumerate().rev() {
+            e = e.replace(&format!("path#{i}"), a);
+        }
+        if self.events.len() == DIRECT_EVENTS_CAP {
+            self.events.pop_front();
+        }
+        self.events.push_back(e);
     }
 }
 
@@ -114,13 +119,10 @@ pub(crate) fn start_direct_probe(g: &mut Inner, cands: &[(u8, std::net::SocketAd
         };
         ids.push(id);
     }
+    // No poll here: on a live link it would release held records into
+    // nowhere. The round's first REQs go out on the next pump (its
+    // deadline is due at once).
     dir.engine.start_probe(ids, std::time::Instant::now());
-    let mut io = FfiDirectIo {
-        transport: &mut g.transport,
-        sink: g.direct_send_sink,
-    };
-    dir.engine
-        .poll(std::time::Instant::now(), &mut io, &mut |_| {});
 }
 
 /// 0 relay, 1 probing, 2 direct.
@@ -263,6 +265,8 @@ pub unsafe extern "C" fn ov_session_direct_path(s: *mut OvSession) -> i64 {
 /// The local network changed (iOS: an `NWPathMonitor` update): on the relay
 /// the engine probes the host's candidates again right away (backoff
 /// reset); on the direct path it tells the host its possibly new address.
+/// The probe REQs go out on the next pump; call `ov_session_pump_relay`
+/// right after.
 /// Returns 0, -1 (null session), -2 (no direct engine).
 ///
 /// # Safety
@@ -285,8 +289,9 @@ pub unsafe extern "C" fn ov_session_direct_network_changed(s: *mut OvSession) ->
                     sink: g.direct_send_sink,
                 };
                 let now = std::time::Instant::now();
+                // No poll: it would drop records held for in-order
+                // delivery. The caller's next pump sends the REQs.
                 dir.engine.network_changed(now, &mut io);
-                dir.engine.poll(now, &mut io, &mut |_| {});
                 0
             }
             Err(e) => e,
@@ -296,7 +301,8 @@ pub unsafe extern "C" fn ov_session_direct_network_changed(s: *mut OvSession) ->
 
 /// Take the oldest direct-path event line (promotion, fallback, probe
 /// result) into `out` as a NUL-terminated UTF-8 string, truncated to fit.
-/// Returns its length, 0 when there is none, -1 on bad arguments.
+/// Returns its length, 0 when there is none, -1 on bad arguments, -2 on a
+/// poisoned session.
 ///
 /// # Safety
 /// `s` must be null or a live session; `out` null or writable for `cap`
@@ -315,7 +321,10 @@ pub unsafe extern "C" fn ov_session_direct_take_event(
         if out.is_null() || cap == 0 {
             return -1;
         }
-        let Ok(mut g) = lock(s) else { return -1 };
+        let mut g = match lock(s) {
+            Ok(g) => g,
+            Err(e) => return e,
+        };
         let Some(dir) = g.direct.as_mut() else {
             return 0;
         };

@@ -571,7 +571,6 @@ impl DirectEngine {
             self.demote(now, io, why);
         }
         let delivered = self.delivered;
-        let commit = (!self.is_server).then(|| probe(&key, P_COMMIT, &self.commit_nonce, t_now));
         let mut recs: Vec<Vec<u8>> = Vec::new();
         if let Some(link) = self.link.as_mut() {
             let path = link.path;
@@ -582,7 +581,7 @@ impl DirectEngine {
             // Viewer: a silent link may mean our NAT / VPN mapping changed
             // (the host's replies go to the old one): tell the host where we
             // are now, authenticated.
-            if let Some(c) = commit.as_ref() {
+            if !self.is_server {
                 let since = |t: Option<Instant>, d: Duration| {
                     t.is_none_or(|t| now.saturating_duration_since(t) >= d)
                 };
@@ -592,7 +591,8 @@ impl DirectEngine {
                     // the path while we already send on it).
                     if since(link.last_rebind, KEEPALIVE) {
                         link.last_rebind = Some(now);
-                        let _ = io.direct_send(path, c);
+                        let c = probe(&key, P_COMMIT, &self.commit_nonce, t_now);
+                        let _ = io.direct_send(path, &c);
                     }
                 } else if now.saturating_duration_since(link.last_rx) >= REBIND_AFTER
                     && since(link.last_rebind, REBIND_INTERVAL)

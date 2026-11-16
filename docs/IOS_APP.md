@@ -421,13 +421,16 @@ Behaviour once enabled:
 - While probing or direct, pumps run at the engine deadline, at most 20 ms
   apart (`afterRelayPump`). On the relay the engine keeps re-probing
   (backoff 1 s → 10 s) for the whole session.
-- A `NetworkPathWatcher` change (status or interface set) re-creates the
-  idle path sockets and calls `ov_session_direct_network_changed`, so the
-  engine probes at once (or sends a REBIND on the active path).
+- A `NetworkPathWatcher` change (status, interface set, gateways, or the
+  expensive / constrained flags), once the burst settles (400 ms),
+  re-creates the idle path sockets, calls
+  `ov_session_direct_network_changed` and pumps, so the engine probes at
+  once (or sends a REBIND on the active path).
 - The stats chip shows "Relay", "Probing…" or "Direct (LAN|Internet)"
   (`LivenessModel.path`); "Probing…" only during a connection's first
-  probe round, the background re-probes on the relay stay "Relay". Promotions and fallbacks go to the session log;
-  probing and socket details, and the engine's path events
+  probe round, the background re-probes on the relay stay "Relay".
+  Promotions and fallbacks go to the session log; probing and socket
+  details, and the engine's path events
   (`ov_session_direct_take_event`: probe answered / unanswered, rebinds,
   demotion reasons), go to the unified log and DiagLog as `[detail]`.
 - If the relay dies while the direct path is active, the session continues

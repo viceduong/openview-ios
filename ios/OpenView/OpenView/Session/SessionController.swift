@@ -231,6 +231,8 @@ final class SessionController: ObservableObject {
     /// Direct datagrams queued since the last pump / a pump is scheduled.
     var p2pQueued = 0
     var p2pPumpScheduled = false
+    /// The pending (debounced) network-change handling.
+    var networkChangeWork: DispatchWorkItem?
     /// Last direct state / path published (UI + log only on change).
     var lastDirectState: Int32 = -1
     var lastDirectPath: Int64 = -1
@@ -241,6 +243,8 @@ final class SessionController: ObservableObject {
     /// up), so a slow first frame never counts as silence.
     var watchdogArmedMs: Int64?
     static let p2pMaxIntervalMs: Int64 = 20
+    /// Quiet time after the last network path update before acting on it.
+    static let networkSettle: DispatchTimeInterval = .milliseconds(400)
 
     /// Screen updates coalesced across threads (guarded by `screenLock`).
     let screenLock = NSLock()
@@ -588,13 +592,14 @@ final class SessionController: ObservableObject {
                                         object: nil, queue: .main) { [weak self] _ in
             self?.willTerminate()
         })
-        // Thermal state / Low Power Mode changes re-apply the requested host
-        // frame rate.
+        // Network path changes refresh the direct path.
         observers.append(nc.addObserver(forName: NetworkPathWatcher.didChange,
                                         object: nil, queue: nil) { [weak self] _ in
             guard let self else { return }
-            self.queue.async { self.networkPathChanged() }
+            self.queue.async { self.networkPathDidChange() }
         })
+        // Thermal state / Low Power Mode changes re-apply the requested host
+        // frame rate.
         observers.append(nc.addObserver(forName: PowerGovernor.didChange,
                                         object: nil, queue: .main) { [weak self] _ in
             self?.powerStateChanged()

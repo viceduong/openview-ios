@@ -159,8 +159,9 @@ impl VideoSession {
     /// Stable encode surface during motion (default on): within a motion
     /// period, a growth past the encoder re-opens it once at the full
     /// screen (and the encoder is then kept until the period ends) instead
-    /// of one re-open + IDR per 128 px bucket.
-    pub fn set_fixed_surface(&mut self, on: bool) {
+    /// of one re-open + IDR per 128 px bucket. Tests compare both modes.
+    #[cfg(test)]
+    pub(crate) fn set_fixed_surface(&mut self, on: bool) {
         self.fixed_surface = on;
     }
 

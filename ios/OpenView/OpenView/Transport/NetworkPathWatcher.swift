@@ -8,9 +8,9 @@ import Network
 
 final class NetworkPathWatcher {
     static let shared = NetworkPathWatcher()
-    /// Posted (on the monitor's queue) when the path's status or interface
-    /// set changes after the first update — a direct path may now work (or
-    /// need re-binding).
+    /// Posted (on the monitor's queue) when the path's status, interface
+    /// set, gateways or cost flags change after the first update — a direct
+    /// path may now work (or need re-binding).
     static let didChange = Notification.Name("ov.networkPath.didChange")
 
     private let monitor = NWPathMonitor()
@@ -18,7 +18,8 @@ final class NetworkPathWatcher {
     /// Latest classification (guarded by `lock`); `.unknown` until the
     /// monitor's first update.
     private var reach: NetworkReach = .unknown
-    /// Status + interface names of the last update (change detection).
+    /// Status, interfaces, gateways and cost flags of the last update
+    /// (change detection; the gateways catch a Wi-Fi roam on the same en0).
     private var signature: String?
     private var started = false
 
@@ -53,7 +54,12 @@ final class NetworkPathWatcher {
         let value = NetworkReach.classify(satisfied: path.status == .satisfied,
                                           hasLocalInterface: local,
                                           hasCellular: cellular)
-        let sig = "\(path.status) " + path.availableInterfaces.map { $0.name }.joined(separator: ",")
+        let sig = [
+            "\(path.status)",
+            path.availableInterfaces.map { $0.name }.joined(separator: ","),
+            path.gateways.map { "\($0)" }.joined(separator: ","),
+            "\(path.isExpensive) \(path.isConstrained)",
+        ].joined(separator: " ")
         lock.lock()
         reach = value
         let changed = signature != nil && signature != sig

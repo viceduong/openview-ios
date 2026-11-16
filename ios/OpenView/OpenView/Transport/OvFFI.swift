@@ -323,11 +323,14 @@ final class OvSessionBox {
     /// The oldest direct-path event line (promotion, fallback, probe
     /// result), or nil.
     func takeDirectEvent() -> String? {
-        var buf = [CChar](repeating: 0, count: 256)
-        let n = Breadcrumb.shared.run("ov_session_direct_take_event") {
-            ov_session_direct_take_event(ptr, &buf, buf.count)
+        // Stack scratch: this runs on every pump.
+        withUnsafeTemporaryAllocation(of: CChar.self, capacity: 256) { (buf) -> String? in
+            guard let base = buf.baseAddress else { return nil }
+            let n = Breadcrumb.shared.run("ov_session_direct_take_event") {
+                ov_session_direct_take_event(ptr, base, buf.count)
+            }
+            return n > 0 ? String(cString: base) : nil
         }
-        return n > 0 ? String(cString: buf) : nil
     }
 
     /// Drop every Swift-side callback (session teardown). The C sinks stay

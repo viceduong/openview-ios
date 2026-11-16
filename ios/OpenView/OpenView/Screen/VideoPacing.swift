@@ -38,8 +38,6 @@ struct VideoFramePacer<Frame> {
     private(set) var generation = 0
     private(set) var active = false
     private var pending: Frame?
-    /// Frames replaced before any tick took them.
-    private(set) var dropped: UInt64 = 0
 
     var hasPending: Bool { pending != nil }
 
@@ -61,11 +59,7 @@ struct VideoFramePacer<Frame> {
         guard active, gen == generation else { return .rejected }
         let replaced = pending != nil
         pending = frame
-        if replaced {
-            dropped &+= 1
-            return .replaced
-        }
-        return .queued
+        return replaced ? .replaced : .queued
     }
 
     /// Display-link tick: the newest frame (the slot empties).

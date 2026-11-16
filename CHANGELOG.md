@@ -114,13 +114,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for recovery instead of leaving the region black. Latency telemetry now
   ends video's decode stage at the VideoToolbox callback
   (`ov_screen_latency_video_decoded`) and its present stage at the Metal
-  presented time of the drawable showing it. Without the Metal compositor
-  the app does not advertise `CAP_H264` (lossless tiles only). The frame
-  texture is a render target only while video is composited, so a
-  tiles-only session's dirty-rect blits never pay for Metal's lossless
-  texture compression.
+  presented time of the drawable showing it. The frame texture is a
+  render target only while video is composited, so a tiles-only session's
+  dirty-rect blits never pay for Metal's lossless texture compression.
 - iOS: owed control replies (PONG, recovery requests, LTR acks) are all
   sent at once instead of one per pump, so the host's RTT is not inflated.
+
+### Removed
+
+- iOS: devices without the Metal video compositor no longer get H.264
+  video through the old `AVSampleBufferDisplayLayer` overlay; they show
+  the screen as lossless tiles only (the app does not advertise
+  `CAP_H264`).
 
 ## [0.1.0] - 2026-11-14
 

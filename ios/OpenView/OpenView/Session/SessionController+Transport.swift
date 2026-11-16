@@ -228,6 +228,8 @@ extension SessionController {
         p2pQueued = 0
         p2pPumpScheduled = false
         p2pTimerDue = nil
+        networkChangeWork?.cancel()
+        networkChangeWork = nil
         lastDirectState = -1
         lastDirectPath = -1
         directProbeSettled = false
@@ -430,15 +432,34 @@ extension SessionController {
         timer.schedule(deadline: due, repeating: .never, leeway: .milliseconds(1))
     }
 
+    /// A network path update (session queue). NWPathMonitor reports a
+    /// switch (Wi-Fi -> cellular, VPN up) as a burst of updates: act once
+    /// it settles, so one change starts one probe round.
+    func networkPathDidChange() {
+        networkChangeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.networkChangeWork = nil
+            self.networkPathChanged()
+        }
+        networkChangeWork = work
+        queue.asyncAfter(deadline: .now() + Self.networkSettle, execute: work)
+    }
+
     /// The phone's network changed (session queue): fresh sockets for the
     /// idle candidate paths (they pick the new route), then let the engine
-    /// re-probe at once instead of waiting out its backoff.
+    /// re-probe at once instead of waiting out its backoff (or, on the
+    /// direct path, send a REBIND). The pump sends the probes.
     func networkPathChanged() {
         guard relayMode, !halted, p2pEnabled, let session, let paths = p2pPaths else { return }
-        debug("Network changed; re-probing the direct path")
+        if session.directState == 2 {
+            debug("Network changed; re-binding the direct path")
+        } else {
+            debug("Network changed; re-probing the direct path")
+        }
         paths.reopenIdle(activePathID: session.directPath)
         session.directNetworkChanged()
-        afterRelayPump()
+        p2pPump()
     }
 
     /// Publish "Relay" / "Probing…" / "Direct (LAN|Internet)" on change and
@@ -616,6 +637,8 @@ extension SessionController {
         p2pTimer?.cancel()
         p2pTimer = nil
         p2pTimerDue = nil
+        networkChangeWork?.cancel()
+        networkChangeWork = nil
         let paths = p2pPaths
         p2pPaths = nil
         p2pEnabled = false
