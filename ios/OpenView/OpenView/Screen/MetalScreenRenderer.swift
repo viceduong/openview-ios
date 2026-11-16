@@ -1,5 +1,4 @@
 import CoreGraphics
-import CoreVideo
 import Foundation
 import Metal
 import QuartzCore
@@ -36,12 +35,6 @@ final class MetalContext {
     let areaY: MTLRenderPipelineState
     let bilinear: MTLRenderPipelineState
     let sharpen: MTLRenderPipelineState
-    /// NV12 -> framebuffer compositor for hardware video. nil = the
-    /// shader is missing: the session never advertises video (tiles only).
-    let yuvComposite: MTLRenderPipelineState?
-
-    /// Whether decoded video can be composited (see `yuvComposite`).
-    var supportsVideo: Bool { yuvComposite != nil }
 
     private init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -58,10 +51,6 @@ final class MetalContext {
         areaY = ay
         bilinear = bl
         sharpen = sh
-        yuvComposite = MetalContext.pipeline(device, library, vs, "ov_yuv_composite")
-        if yuvComposite == nil {
-            Log.render.error("Metal: no YUV compositor, hardware video disabled")
-        }
     }
 
     private static func pipeline(_ device: MTLDevice, _ library: MTLLibrary,
@@ -330,34 +319,6 @@ private struct ScaleParams {
     var pad: Float
 }
 
-/// Uniforms of `ov_yuv_composite`; layout must match `YUVParams` in
-/// RemoteScreen.metal (80 bytes: three float4 rows, four float2s).
-private struct YUVParams {
-    var rowR: SIMD4<Float>
-    var rowG: SIMD4<Float>
-    var rowB: SIMD4<Float>
-    var rectOrigin: SIMD2<Float>
-    var rectSize: SIMD2<Float>
-    var uvOrigin: SIMD2<Float>
-    var uvScale: SIMD2<Float>
-}
-
-/// The decoded video picture currently composited into the framebuffer:
-/// its plane textures (CVMetalTexture keeps the IOSurface alive) and
-/// placement. Re-composited when tile uploads land on the frame texture
-/// while its motion period runs (a full re-stage would otherwise put the
-/// pre-motion tiles back over the region).
-private struct HeldVideo {
-    let generation: Int
-    let lumaRef: CVMetalTexture
-    let chromaRef: CVMetalTexture
-    let luma: MTLTexture
-    let chroma: MTLTexture
-    let rect: CGRect
-    let screenSize: CGSize
-    var params: YUVParams
-}
-
 final class MetalScreenRenderer {
     /// Unsharp-mask strength (scale.rs DEFAULT_SHARPEN).
     static let sharpenStrength: Float = 0.5
@@ -375,16 +336,6 @@ final class MetalScreenRenderer {
     /// still on the GPU (~1-2 ms of work, so practically never) is retried
     /// at the next display refresh instead of blocking main.
     private let inFlight = DispatchSemaphore(value: 1)
-    /// Wraps decoded video planes as Metal textures (no copy). Created
-    /// with the first picture.
-    private var textureCache: CVMetalTextureCache?
-    /// The video picture of the running motion period (see `HeldVideo`).
-    private var heldVideo: HeldVideo?
-    /// When a video picture was last composited (CACurrentMediaTime); the
-    /// render-target frame texture goes back to the plain tile texture
-    /// `videoIdleRevert` after that.
-    private var lastVideoAt: CFTimeInterval = 0
-    private static let videoIdleRevert: CFTimeInterval = 2
 
     /// nil when Metal (or the compiled shaders) is unavailable — the
     /// surface then keeps its CGImage layer.
@@ -426,11 +377,6 @@ final class MetalScreenRenderer {
                                                                 width: d.width,
                                                                 height: d.height,
                                                                 mipmapped: false)
-            // A plain tile texture (shader read only). A render
-            // target usage would let Metal losslessly compress it, and
-            // every dirty-rect blit would then pay a decompression; the
-            // video path upgrades it only while video is composited
-            // (`videoTarget`).
             desc.usage = [.shaderRead]
             desc.storageMode = .private
             target = ctx.device.makeTexture(descriptor: desc)
@@ -488,16 +434,11 @@ final class MetalScreenRenderer {
     /// `onPresented` runs (any thread) once this drawable is on screen,
     /// with its presented time (CACurrentMediaTime clock); it is dropped
     /// when nothing could be drawn (the caller's fallback covers that).
-    /// The newest decoded video picture (`video`, at most one per redraw —
-    /// older ones were already dropped) is composited into the frame
-    /// texture after the uploads, so it is scaled and sharpened with the
-    /// tiles in this same pass.
     /// Returns false when the previous command buffer is still on the GPU:
     /// nothing was done (not even the uploads) — retry at the next refresh.
     @discardableResult
     func render(scale: CGFloat, offset: CGPoint, sharpenOn: Bool,
-                uploads: FrameUploadQueue?, video: VideoFrameQueue? = nil,
-                onPresented: ((CFTimeInterval) -> Void)? = nil) -> Bool {
+                uploads: FrameUploadQueue?, onPresented: ((CFTimeInterval) -> Void)? = nil) -> Bool {
         let ds = layer.drawableSize
         let cs = layer.contentsScale
         let dw = Int(ds.width), dh = Int(ds.height)
@@ -509,7 +450,6 @@ final class MetalScreenRenderer {
             return true
         }
         let staged = encodeUploads(cb, uploads)
-        encodeVideo(cb, video, uploadsLanded: !staged.isEmpty)
         let sem = inFlight
         cb.addCompletedHandler { _ in
             uploads?.recycle(staged)
@@ -592,188 +532,6 @@ final class MetalScreenRenderer {
         cb.present(drawable)
         cb.commit()
         return true
-    }
-
-    // MARK: Hardware video
-
-    /// Take the newest decoded picture (if any) and composite it into the
-    /// frame texture; re-composite the held one when uploads just landed
-    /// over it. A motion period that ended (VIDEO_END: its lossless refresh
-    /// is in the uploads) drops the held picture — the refresh stays.
-    private func encodeVideo(_ cb: MTLCommandBuffer, _ video: VideoFrameQueue?, uploadsLanded: Bool) {
-        guard let video else { return }
-        let take = video.take()
-        if let h = heldVideo, !take.active || h.generation != take.generation {
-            heldVideo = nil
-        }
-        // Tiles only (no motion period, nothing held): nothing to do but,
-        // once video has been idle a while, hand the tile path its plain
-        // tile texture back.
-        if heldVideo == nil, take.frame == nil || !take.active {
-            revertVideoTarget(cb)
-            return
-        }
-        var fresh = false
-        if let frame = take.frame, take.active {
-            if let made = makeHeldVideo(frame, generation: take.generation) {
-                heldVideo = made
-                fresh = true
-            }
-        }
-        guard let held = heldVideo, fresh || uploadsLanded,
-              let pipeline = ctx.yuvComposite,
-              let current = frameTexture,
-              Int(held.screenSize.width) == current.width,
-              Int(held.screenSize.height) == current.height,
-              let target = videoTarget(cb) else { return }
-        lastVideoAt = CACurrentMediaTime()
-        // Clip the rect to the framebuffer (the shader places the picture
-        // by the unclipped rect).
-        let x0 = max(0, Int(held.rect.minX.rounded(.down)))
-        let y0 = max(0, Int(held.rect.minY.rounded(.down)))
-        let x1 = min(target.width, Int(held.rect.maxX.rounded(.up)))
-        let y1 = min(target.height, Int(held.rect.maxY.rounded(.up)))
-        guard x1 > x0, y1 > y0 else { return }
-        let rp = MTLRenderPassDescriptor()
-        rp.colorAttachments[0].texture = target
-        rp.colorAttachments[0].loadAction = .load
-        rp.colorAttachments[0].storeAction = .store
-        guard let enc = cb.makeRenderCommandEncoder(descriptor: rp) else { return }
-        enc.setRenderPipelineState(pipeline)
-        enc.setViewport(MTLViewport(originX: Double(x0), originY: Double(y0),
-                                    width: Double(x1 - x0), height: Double(y1 - y0),
-                                    znear: 0, zfar: 1))
-        enc.setFragmentTexture(held.luma, index: 0)
-        enc.setFragmentTexture(held.chroma, index: 1)
-        var params = held.params
-        enc.setFragmentBytes(&params, length: MemoryLayout<YUVParams>.stride, index: 0)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        enc.endEncoding()
-        // The CVMetalTextures (and through them the IOSurface) must outlive
-        // the GPU's read of them.
-        let keep = (held.lumaRef, held.chromaRef)
-        cb.addCompletedHandler { _ in
-            withExtendedLifetime(keep) {}
-        }
-    }
-
-    /// The frame texture as a render target for the video composite. The
-    /// plain tile texture is swapped (GPU copy, same command buffer, after
-    /// this redraw's blits) for one with `.renderTarget` usage and GPU
-    /// optimisation (lossless compression) off, so the dirty-rect blits
-    /// that keep landing on it cost what they cost on the tile texture.
-    private func videoTarget(_ cb: MTLCommandBuffer) -> MTLTexture? {
-        guard let tex = frameTexture else { return nil }
-        if tex.usage.contains(.renderTarget) { return tex }
-        guard let up = Self.frameTextureCopy(of: tex, renderTarget: true, cb: cb, device: ctx.device) else {
-            return nil
-        }
-        frameTexture = up
-        return up
-    }
-
-    /// Video idle for `videoIdleRevert`: back to the plain tile
-    /// texture, contents copied on the GPU.
-    private func revertVideoTarget(_ cb: MTLCommandBuffer) {
-        guard let tex = frameTexture, tex.usage.contains(.renderTarget),
-              CACurrentMediaTime() - lastVideoAt >= Self.videoIdleRevert,
-              let plain = Self.frameTextureCopy(of: tex, renderTarget: false, cb: cb, device: ctx.device) else {
-            return
-        }
-        frameTexture = plain
-    }
-
-    /// A same-size frame texture (render-target capable or the plain tile
-    /// one) holding `tex`'s pixels, copied by a blit in `cb`.
-    private static func frameTextureCopy(of tex: MTLTexture, renderTarget: Bool,
-                                         cb: MTLCommandBuffer, device: MTLDevice) -> MTLTexture? {
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                            width: tex.width,
-                                                            height: tex.height,
-                                                            mipmapped: false)
-        desc.storageMode = .private
-        if renderTarget {
-            desc.usage = [.shaderRead, .renderTarget]
-            desc.allowGPUOptimizedContents = false
-        } else {
-            desc.usage = [.shaderRead]
-        }
-        guard let copy = device.makeTexture(descriptor: desc),
-              let blit = cb.makeBlitCommandEncoder() else { return nil }
-        blit.copy(from: tex, to: copy)
-        blit.endEncoding()
-        return copy
-    }
-
-    /// Wrap a decoded NV12 picture's planes as textures and work out its
-    /// conversion; nil for anything but 4:2:0 bi-planar 8-bit.
-    private func makeHeldVideo(_ frame: VideoFrameQueue.Frame, generation: Int) -> HeldVideo? {
-        let pb = frame.pixelBuffer
-        let fullRange: Bool
-        switch CVPixelBufferGetPixelFormatType(pb) {
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            fullRange = true
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-            fullRange = false
-        default:
-            Log.render.error("video: unexpected decoder pixel format")
-            return nil
-        }
-        guard CVPixelBufferGetPlaneCount(pb) >= 2 else { return nil }
-        if textureCache == nil {
-            var cache: CVMetalTextureCache?
-            guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, ctx.device, nil, &cache)
-                    == kCVReturnSuccess else { return nil }
-            textureCache = cache
-        }
-        guard let cache = textureCache else { return nil }
-        let lw = CVPixelBufferGetWidthOfPlane(pb, 0)
-        let lh = CVPixelBufferGetHeightOfPlane(pb, 0)
-        let cw = CVPixelBufferGetWidthOfPlane(pb, 1)
-        let ch = CVPixelBufferGetHeightOfPlane(pb, 1)
-        guard lw > 0, lh > 0, cw > 0, ch > 0 else { return nil }
-        var lumaRef: CVMetalTexture?
-        var chromaRef: CVMetalTexture?
-        guard CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, nil,
-                                                        .r8Unorm, lw, lh, 0, &lumaRef) == kCVReturnSuccess,
-              CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, nil,
-                                                        .rg8Unorm, cw, ch, 1, &chromaRef) == kCVReturnSuccess,
-              let lumaRef, let chromaRef,
-              let luma = CVMetalTextureGetTexture(lumaRef),
-              let chroma = CVMetalTextureGetTexture(chromaRef) else {
-            // Stale cache entries can block new ones: start over next time.
-            CVMetalTextureCacheFlush(cache, 0)
-            return nil
-        }
-        // The picture inside the (possibly padded) buffer: its clean
-        // aperture, normalised.
-        let bw = CGFloat(CVPixelBufferGetWidth(pb))
-        let bh = CGFloat(CVPixelBufferGetHeight(pb))
-        var clean = CVImageBufferGetCleanRect(pb)
-        if !(clean.width > 0 && clean.height > 0 && clean.minX >= 0 && clean.minY >= 0
-             && clean.maxX <= bw && clean.maxY <= bh) || bw <= 0 || bh <= 0 {
-            clean = CGRect(x: 0, y: 0, width: max(bw, 1), height: max(bh, 1))
-        }
-        let bwSafe = max(bw, 1), bhSafe = max(bh, 1)
-        let conv = YUVToRGB.make(matrixCodePoint: frame.matrix, fullRange: fullRange)
-        let params = YUVParams(
-            rowR: conv.r, rowG: conv.g, rowB: conv.b,
-            rectOrigin: SIMD2<Float>(Float(frame.rect.minX), Float(frame.rect.minY)),
-            rectSize: SIMD2<Float>(Float(frame.rect.width), Float(frame.rect.height)),
-            uvOrigin: SIMD2<Float>(Float(clean.minX / bwSafe), Float(clean.minY / bhSafe)),
-            uvScale: SIMD2<Float>(Float(clean.width / bwSafe), Float(clean.height / bhSafe)))
-        return HeldVideo(generation: generation, lumaRef: lumaRef, chromaRef: chromaRef,
-                         luma: luma, chroma: chroma, rect: frame.rect,
-                         screenSize: frame.screenSize, params: params)
-    }
-
-    /// Drop the held video picture and the texture cache's idle entries
-    /// (surface teardown / memory pressure).
-    func releaseVideo() {
-        heldVideo = nil
-        if let cache = textureCache {
-            CVMetalTextureCacheFlush(cache, 0)
-        }
     }
 
     /// One full-viewport triangle with `pipeline`, reading `texture`.

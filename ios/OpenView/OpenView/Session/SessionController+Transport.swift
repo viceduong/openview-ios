@@ -218,9 +218,7 @@ extension SessionController {
         lastErrorLine = nil
         lastLiveness = (alive: true, rtt: -1, fpsTenths: 0)
         lastLatency = nil
-        videoActive = false
-        screenModel.video.end()
-        videoDecoder.reset()
+        resetVideoOnQueue()
         lastPeerCaps = 0
         sentDesktopFx = false
         relayMode = false
@@ -683,5 +681,6 @@ extension SessionController {
         haltOnQueue()
         session?.clearCallbacks()
         screen.clearCallbacks()
+        resetVideoOnQueue()
     }
 }

@@ -199,19 +199,15 @@ final class SessionController: ObservableObject {
     /// ms) and what was published (only changes go to main).
     var lastLatencyPublishMs: Int64 = 0
     var lastLatency: LatencyBreakdown?
-    /// Hardware video (session queue): the VideoToolbox decoder, whether
-    /// a motion period is running and its generation
-    /// (`screenModel.video.begin()`). Created on first use; its output
-    /// closures run on VideoToolbox's thread.
-    lazy var videoDecoder = VideoDecoder(
-        onFrame: { [weak self] pixelBuffer, unit, decodedAt in
-            self?.videoDecoded(pixelBuffer, unit: unit, decodedAt: decodedAt)
-        },
-        onError: { [weak self] status in
-            self?.videoDecodeFailed(status)
-        })
+    /// Hardware video (session queue): the sample builder, whether a
+    /// motion period is running and its generation, the generation whose
+    /// END waits for the refresh frame, and where the overlay was last
+    /// placed in this period.
+    let videoSamples = VideoSampleBuilder()
     var videoActive = false
     var videoGen = 0
+    var pendingHideGen: Int?
+    var videoPlacement: (rect: CGRect, screen: CGSize)?
     /// Last host CAPS seen (CAP_INPUT2 picks the input commands).
     var lastPeerCaps: UInt32 = 0
     /// The desktop-effect wishes went out to this host.
@@ -312,6 +308,10 @@ final class SessionController: ObservableObject {
         }
         input.viewportReporter.send = { [weak self] payload in
             self?.sendCommand(payload)
+        }
+        // The video overlay was hidden (main): drop its picture.
+        screenModel.video.onHidden = { [weak self] gen in
+            self?.videoOverlayHidden(generation: gen)
         }
         // Latency telemetry: every presented Metal drawable reports when
         // it was drawn and when it reached the screen.
@@ -436,8 +436,6 @@ final class SessionController: ObservableObject {
         livenessModel.path = nil
         livenessModel.latency = nil
         hostSupportsDesktopFx = false
-        // No picture of the previous attempt's motion period lands any more.
-        screenModel.video.end()
         log("Connecting to \(req.displayName) via \(req.transport.detail)")
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
             self?.handshakeTimedOut(generation: gen)

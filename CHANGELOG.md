@@ -113,21 +113,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exponential-decay inertia that stops when a finger lands. The natural
   direction is unchanged. iPad trackpad scrolling uses the same paced
   sender.
-- iOS: hardware video is decoded with a `VTDecompressionSession` (real
-  time) instead of an `AVSampleBufferDisplayLayer` overlay, and composited
-  into the Metal frame in the same pass as the tiles (BT.709 / BT.601 /
-  BT.2020 YCbCr conversion from the stream's VUI), so video is scaled and
-  sharpened like the rest of the screen and the end-of-motion stale flash
-  and its hide timer are gone. Decoded pictures are paced by the display
-  link (up to 120 Hz on ProMotion), newest wins, never more than one
-  queued. HEVC streams are decoded too (`CAP_HEVC`, advertised only with
-  VideoToolbox hardware HEVC decode). Every decode failure asks the host
-  for recovery instead of leaving the region black. Latency telemetry now
-  ends video's decode stage at the VideoToolbox callback
-  (`ov_screen_latency_video_decoded`) and its present stage at the Metal
-  presented time of the drawable showing it. The frame texture is a
-  render target only while video is composited, so a tiles-only session's
-  dirty-rect blits never pay for Metal's lossless texture compression.
+- Smoother video on iPhone: video is displayed by the system video layer
+  again (an `AVSampleBufferDisplayLayer` over the tile frame, as in 0.1.x)
+  instead of being decoded into the app's Metal renderer. The app enqueues
+  each unit from its session queue and the system decodes and shows it as
+  soon as it is decoded, so a busy main thread or GPU no longer delays or
+  skips video frames (occasional stutter); Metal draws the tiles only. HEVC
+  streams are shown too (`CAP_HEVC`, advertised only with hardware HEVC
+  decode), superseded units of a burst are decoded but not displayed, and
+  a unit that cannot be decoded or a failed layer asks the host for an IDR.
+  Video now also works on the CGImage fallback path (no Metal).
 - iOS: owed control replies (PONG, recovery requests, LTR acks) are all
   sent at once instead of one per pump, so the host's RTT is not inflated.
 

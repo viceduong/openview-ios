@@ -1,5 +1,4 @@
 import CoreGraphics
-import CoreVideo
 import Foundation
 import QuartzCore
 
@@ -18,11 +17,14 @@ extension SessionController {
                 guard let self else { return }
                 uploads.stage(view)
                 let size = CGSize(width: CGFloat(view.width), height: CGFloat(view.height))
-                // (The first frame after VIDEO_END carries the lossless
-                // refresh of the region; it simply overwrites the last
-                // composited video picture in the frame texture.)
+                // The first frame after VIDEO_END carries the lossless
+                // refresh of the region: the video overlay is hidden once
+                // it is on screen.
+                let hide = self.pendingHideGen
+                self.pendingHideGen = nil
                 self.postScreen {
                     $0.frame = (image: nil, size: size)
+                    if let hide { $0.hideVideoGen = hide }
                 }
             }
         } else {
@@ -35,18 +37,19 @@ extension SessionController {
                                                  format: format, pixels: pixels) else { return }
                 let img = made.image
                 let size = CGSize(width: CGFloat(img.width), height: CGFloat(img.height))
+                let hide = self.pendingHideGen
+                self.pendingHideGen = nil
                 self.postScreen {
                     $0.frame = (image: img, size: size)
+                    if let hide { $0.hideVideoGen = hide }
                 }
             }
         }
-        // Hardware video for high-motion regions — only on the Metal
-        // path (decoded pictures are composited into the frame texture;
-        // the CGImage fallback stays tiles-only) and only when VideoToolbox
-        // decodes H.264 in hardware (`enableVideo` advertises CAP_H264).
-        // HEVC (CAP_HEVC) on top when the hardware decodes it too.
-        if screenModel.uploads != nil, MetalContext.shared?.supportsVideo == true,
-           RemoteVideoCodec.h264.hardwareDecodable {
+        // Hardware video for high-motion regions (on both frame paths: the
+        // display layer sits over either) — only when VideoToolbox decodes
+        // H.264 in hardware (`enableVideo` advertises CAP_H264; otherwise
+        // tiles only). HEVC (CAP_HEVC) on top when the hardware decodes it too.
+        if RemoteVideoCodec.h264.hardwareDecodable {
             screen.onVideo = { [weak self] packet in
                 self?.handleVideo(packet)
             }
@@ -144,37 +147,55 @@ extension SessionController {
 
     // MARK: Hardware video (session queue)
 
-    /// One H.264 / HEVC packet (fires inside `screen.feed`): handed to the
-    /// VideoToolbox session here, asynchronously; the picture comes back
-    /// through `videoDecoded`. END closes the motion period: pictures still
-    /// in the decoder are dropped, the last composited one stays in the
-    /// frame texture until the lossless refresh (the next frame) replaces it.
+    /// One H.264 / HEVC packet (fires inside `screen.feed`): built into a
+    /// sample and enqueued on the display layer right here — it decodes and
+    /// shows the picture itself, off main. Main only places / shows the
+    /// overlay (first sample of a motion period, region moved). END only
+    /// marks the generation to hide with the next (refresh) frame.
     func handleVideo(_ packet: RemoteVideoPacket) {
-        let frames = screenModel.video
         if packet.isEnd {
             if videoActive {
                 videoActive = false
-                frames.end()
+                pendingHideGen = videoGen
             }
             return
         }
         if !videoActive {
             videoActive = true
-            videoGen = frames.begin()
+            videoGen += 1
+            pendingHideGen = nil
+            videoPlacement = nil
         }
-        switch videoDecoder.decode(packet, generation: videoGen) {
-        case .submitted:
-            break
-        case .needKeyframe:
-            // Not decodable (no keyframe / session yet, bad data, a dead
-            // session): ask the host for recovery.
+        guard let built = videoSamples.make(packet) else {
+            // Not decodable (no keyframe yet / bad data): ask for recovery.
             requestVideoRecovery()
+            return
+        }
+        let overlay = screenModel.video
+        guard overlay.enqueue(built.sample, keyframe: packet.isKeyframe, flush: built.formatChanged) else {
+            // The layer's decoder had failed (flushed now): back in
+            // through an IDR.
+            requestVideoRecovery()
+            return
+        }
+        // Latency telemetry: the layer decodes and shows it from here
+        // (enqueue time stands in for the present).
+        let now = CACurrentMediaTime()
+        notePresented(drawnAt: now, presentedAt: now)
+        let rect = packet.rect
+        let size = packet.screenSize
+        if videoPlacement?.rect != rect || videoPlacement?.screen != size {
+            videoPlacement = (rect: rect, screen: size)
+            let gen = videoGen
+            DispatchQueue.main.async {
+                overlay.show(rect: rect, screen: size, generation: gen)
+            }
         }
     }
 
-    /// Ask the host for an IDR (or an LTR recovery point on a CAP_LTR host:
-    /// Rust picks) — deferred, as this may run inside ov_screen_feed. Rust
-    /// rate-limits it and skips P-frames until the recovery arrives.
+    /// Ask the host for an IDR — deferred, as this may run inside
+    /// ov_screen_feed. Rust rate-limits it and skips P-frames until the
+    /// keyframe arrives.
     func requestVideoRecovery() {
         queue.async { [weak self] in
             guard let self, !self.halted else { return }
@@ -182,34 +203,27 @@ extension SessionController {
         }
     }
 
-    /// VideoToolbox thread: a decoded picture. Into the newest-wins slot
-    /// (the surface redraws at the next display refresh), and its decode
-    /// time to the latency assembler (decode stage = this callback; the
-    /// present stage ends at the Metal presented time of the drawable that
-    /// first shows it).
-    func videoDecoded(_ pixelBuffer: CVPixelBuffer, unit: VideoDecoder.Unit, decodedAt: CFTimeInterval) {
-        screenModel.video.offer(VideoFrameQueue.Frame(pixelBuffer: pixelBuffer,
-                                                      rect: unit.rect,
-                                                      screenSize: unit.screenSize,
-                                                      matrix: unit.matrix,
-                                                      seq: unit.seq),
-                                generation: unit.generation)
-        let seq = unit.seq
+    /// Main: the overlay of generation `gen` was hidden. Drop its picture
+    /// unless a newer motion period already started on the layer.
+    func videoOverlayHidden(generation gen: Int) {
         queue.async { [weak self] in
-            guard let self, !self.halted else { return }
-            let ageUs = Int64((max(0, CACurrentMediaTime() - decodedAt) * 1_000_000).rounded())
-            self.screen.latencyVideoDecoded(seq: seq, decodedAgeUs: ageUs)
+            guard let self, !self.videoActive, self.videoGen == gen else { return }
+            self.screenModel.video.clear()
         }
     }
 
-    /// VideoToolbox thread: decoding a unit failed. Never a silent black
-    /// region: drop a dead session and ask the host for recovery.
-    func videoDecodeFailed(_ status: OSStatus) {
-        Log.render.error("video: decode error \(status, privacy: .public)")
-        queue.async { [weak self] in
-            guard let self, !self.halted else { return }
-            self.videoDecoder.sessionFailed(status)
-            self.screen.requestVideoIdr()
+    /// Session queue: forget the video stream (new attempt, teardown) and
+    /// take the overlay down.
+    func resetVideoOnQueue() {
+        videoActive = false
+        pendingHideGen = nil
+        videoPlacement = nil
+        videoSamples.reset()
+        let overlay = screenModel.video
+        overlay.clear()
+        let gen = videoGen
+        DispatchQueue.main.async {
+            overlay.hide(generation: gen)
         }
     }
 
@@ -247,6 +261,10 @@ extension SessionController {
             model.frameTick &+= 1
             if model.frameSize != frame.size { model.frameSize = frame.size }
             markLiveIfNeeded()
+        }
+        if let gen = p.hideVideoGen {
+            // Hidden by the surface once this frame is on screen.
+            model.video.requestHide(generation: gen)
         }
         if let pos = p.cursorPos {
             model.cursorPos = pos

@@ -558,9 +558,8 @@ final class OvScreenBox {
     /// Install the video sink so our CAPS advertise CAP_H264 (and
     /// CAP_LTR) and a capable host streams high-motion regions as H.264
     /// instead of lossless tiles. Call before the first `feed` (CAPS go out
-    /// once), and only when VideoToolbox decodes H.264 in hardware and the
-    /// Metal compositor exists (`RemoteVideoCodec.h264.hardwareDecodable`,
-    /// `MetalContext.supportsVideo`).
+    /// once), and only when VideoToolbox decodes H.264 in hardware
+    /// (`RemoteVideoCodec.h264.hardwareDecodable`).
     func enableVideo() {
         let unmanaged = Unmanaged.passUnretained(self)
         ov_screen_set_video_sink(ptr, unmanaged.toOpaque(), { user, packet in
@@ -568,7 +567,6 @@ final class OvScreenBox {
             let me = Unmanaged<OvScreenBox>.fromOpaque(user).takeUnretainedValue()
             let p = packet.pointee
             let pkt = RemoteVideoPacket(
-                seq: p.seq,
                 ptsUs: p.pts_us,
                 isKeyframe: (p.flags & 1) != 0,
                 isEnd: (p.flags & 2) != 0,
@@ -598,18 +596,11 @@ final class OvScreenBox {
 
     /// With the video sink installed: also advertise CAP_HEVC (the host
     /// may then stream HEVC: `codec` 2 packets with a VPS). Keeps LTR
-    /// recovery on (VideoToolbox decodes the in-stream recovery
+    /// recovery on (the display layer decodes the in-stream recovery
     /// P-frames). Call after `enableVideo()`, before the first `feed`, and
     /// only when VideoToolbox decodes HEVC in hardware.
     func enableVideoHevc() {
         _ = ov_screen_set_video_caps(ptr, OV_VIDEO_CAP_HEVC | OV_VIDEO_CAP_LTR)
-    }
-
-    /// VideoToolbox returned the picture of video unit `seq`
-    /// `decodedAgeUs` ago (latency telemetry: the decode stage ends here).
-    /// Session queue only, never from inside a sink.
-    func latencyVideoDecoded(seq: UInt64, decodedAgeUs: Int64) {
-        _ = ov_screen_latency_video_decoded(ptr, seq, decodedAgeUs)
     }
 
     /// Rolling per-stage latency medians (CAP_TIMING hosts). Session

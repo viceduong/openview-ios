@@ -7,7 +7,7 @@ and documented in
 [docs/crates/ovffi.md](crates/ovffi.md). The Swift side does four things:
 
 - owns the sockets (UDP, WebSocket),
-- renders with Metal (tiles, plus H.264 / HEVC decoded by VideoToolbox and composited into the same frame),
+- renders tiles with Metal, with H.264 / HEVC video shown by an `AVSampleBufferDisplayLayer` over the frame,
 - turns touch, pointer and keyboard input into wire commands,
 - provides the UI.
 
@@ -40,7 +40,7 @@ paths below are relative to that folder unless noted.
 | **Session/** | |
 | `SessionController.swift` | Session engine: published state, phases and reconnects, app lifecycle; the threading model is documented at the top |
 | `SessionController+Transport.swift` | Dialing, relay / UDP / direct-path wiring, pumps, watchdog, error routing, teardown |
-| `SessionController+Screen.swift` | Screen-assembler sinks, video decode hand-off and recovery, coalesced screen flush to main |
+| `SessionController+Screen.swift` | Screen-assembler sinks, video sample hand-off and recovery, coalesced screen flush to main |
 | `SessionController+Commands.swift` | Outbound commands: input, quality, monitor, desktop effects, clipboard, chat |
 | `SessionController+Files.swift` | Sending and receiving files |
 | `SessionModels.swift` | `SessionPhase`, `SessionError`, `LogLine`, `ChatMessage`, `ReceivedFile`, `IdentityMismatch` |
@@ -61,9 +61,8 @@ paths below are relative to that folder unless noted.
 | `ViewportMath.swift` | Pure zoom-scale math (fit / fill / 1:1 / open default, clamp, snap) |
 | `ScreenModel.swift` | `ScreenModel`, `LivenessModel`, `PendingScreen` |
 | `FrameImage.swift` | CGImage builders (fallback path, cursor sprites) |
-| `MetalScreenRenderer.swift`, `RemoteScreen.metal` | `MetalContext`, `FrameUploadQueue`, `MetalScreenRenderer`; scaling, sharpening and YUV video compositing shaders |
-| `RemoteVideo.swift` | `RemoteVideoPacket`, `VideoFormat`, `VideoFrameQueue`, `VideoDecoder` (VTDecompressionSession, H.264 / HEVC) |
-| `VideoPacing.swift` | `VideoFramePacer` (newest-wins slot), `YUVToRGB` (matrix selection); pure, unit-tested |
+| `MetalScreenRenderer.swift`, `RemoteScreen.metal` | `MetalContext`, `FrameUploadQueue`, `MetalScreenRenderer`; scaling and sharpening shaders |
+| `RemoteVideo.swift` | `RemoteVideoPacket`, `VideoFormat`, `VideoSampleBuilder`, `VideoOverlay` (AVSampleBufferDisplayLayer, H.264 / HEVC) |
 | **Input/** | |
 | `RemoteInput.swift` | `InputWire` encoders, `KeyStroke`, `ZoomPreset`, `RemoteInputController`, `PowerGovernor`, `FrameTicker` |
 | `TrackpadTouchRecognizer.swift`, `FlingTracker.swift` | One-finger touch source; scroll inertia (touch and trackpad) |
@@ -496,79 +495,69 @@ on `ScreenModel.image`.
   (`CADisableMinimumFrameDurationOnPhone`), or 60 Hz when the governor is
   constrained.
 
-### 5.3 Hardware video (VideoToolbox decode, composited in Metal)
+### 5.3 Hardware video (AVSampleBufferDisplayLayer overlay)
 
-Video is enabled only on the Metal path (`MetalContext.supportsVideo`: the
-`ov_yuv_composite` shader compiled) and when
-`VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)`
-(`RemoteVideoCodec.h264.hardwareDecodable`). Then `enableVideo()` advertises
-`CAP_H264` (and `CAP_LTR`); when the user enabled Settings > Display > HEVC
-video (experimental, default off) and the device decodes HEVC in hardware,
+Video is enabled when `VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)`
+(`RemoteVideoCodec.h264.hardwareDecodable`), on both frame paths (Metal and
+the CGImage fallback). Then `enableVideo()` advertises `CAP_H264` (and
+`CAP_LTR`); when the user enabled Settings > Display > HEVC video
+(experimental, default off) and the device decodes HEVC in hardware,
 `enableVideoHevc()` calls `ov_screen_set_video_caps(OV_VIDEO_CAP_HEVC |
 OV_VIDEO_CAP_LTR)` so `CAP_HEVC` goes out too. The host streams high-motion
 regions as H.264 or HEVC (`ov_video_packet.codec` 1 / 2).
 
+**Why a display layer.** Each picture is decoded and shown by the system:
+the app enqueues compressed samples from the session queue, VideoToolbox
+decodes inside the layer and the system compositor puts the picture on
+screen as soon as it is decoded (`DisplayImmediately`, Apple's low-latency
+path). Main does no work per picture: no hop, no Metal redraw, no
+drawable to wait for, so a busy main thread (gestures, SwiftUI) or a busy
+GPU cannot delay or drop a video frame. Metal draws the tiles only.
+
 1. `OvScreenBox` copies the `ov_video_packet` into a `RemoteVideoPacket`
    (codec, VPS for HEVC, SPS, PPS, length-prefixed body, colour code points).
-2. Session queue, `VideoDecoder`: a keyframe with new parameter sets, codec
-   or range builds a `CMVideoFormatDescription`
+2. Session queue, `VideoSampleBuilder`: a keyframe with new parameter sets,
+   codec or range builds a `CMVideoFormatDescription`
    (`CMVideoFormatDescriptionCreateFromH264ParameterSets` /
-   `...FromHEVCParameterSets`, re-created with colour tags) and a fresh
-   `VTDecompressionSession` (`kVTDecompressionPropertyKey_RealTime`, output
-   `420YpCbCr8BiPlanarVideoRange` or `FullRange` to match the stream,
-   IOSurface-backed, Metal-compatible). Each unit is decoded
-   asynchronously (`_EnableAsynchronousDecompression`). A unit flagged
+   `...FromHEVCParameterSets`), re-created with the stream's colour tags
+   (YCbCr matrix, primaries, transfer, full range), which the layer
+   converts with. Each unit becomes a `CMSampleBuffer` marked
+   `DisplayImmediately` (P-frames also `NotSync`). A unit flagged
    `OV_VIDEO_SUPERSEDED` (a newer one of the same burst follows: frames
-   released together after a repaired loss) is decoded with
-   `_DoNotOutputFrame` too: it keeps the reference chain intact, but only
-   the burst's newest picture reaches the screen, so a short stall resumes
-   at the live picture instead of fast-forwarding through the backlog.
-3. VideoToolbox thread: the decoded `CVPixelBuffer` goes into
-   `VideoFrameQueue`, a newest-wins slot (`VideoFramePacer`): at most one
-   picture waits, a newer one replaces it (counted as dropped). A picture
-   landing in the empty slot asks the surface for a redraw; the decode time
-   goes to Rust (`ov_screen_latency_video_decoded`).
-4. Main, next `CADisplayLink` tick (`FrameTicker`, up to 120 Hz on
-   ProMotion, 60 Hz when constrained): `MetalScreenRenderer.render` blits
-   the staged tile uploads, then takes the newest picture, wraps its two
-   planes as `r8Unorm` / `rg8Unorm` textures (`CVMetalTextureCache`, no
-   copy) and draws `ov_yuv_composite` into the frame texture at the video
-   rect: YCbCr -> R'G'B' with the stream's matrix (`YUVToRGB`: BT.709
-   default, BT.601 / BT.2020 / SMPTE 240M from the VUI code point, video or
-   full range). The area downscale / bilinear + sharpen passes then read
-   the frame texture, so video is scaled and sharpened exactly like tiles,
-   in the same command buffer. The picture is held while its motion period
-   runs and re-composited whenever uploads land (a full re-stage would
-   otherwise put pre-motion tiles back over it). The tile frame texture is
-   shader-read only (as in 0.1.x builds); only when a picture is first
-   composited is it swapped, by a GPU copy, for a render-target texture
-   with GPU optimisation (lossless compression) off, and it goes back to
-   the plain one 2 s after the last picture. A tiles-only session therefore
-   renders and presents exactly like the pre-video-decode builds.
-5. `OV_VIDEO_END` ends the motion period (`VideoFrameQueue.end`): pictures
-   still in the decoder or the slot are refused. The last composited
-   picture stays in the frame texture until the lossless refresh (the next
-   frame) overwrites it, so there is no overlay to hide and no stale flash.
-6. Recovery: a unit that cannot be decoded (no session / keyframe yet,
-   unusable parameter sets, unknown codec), a synchronous
-   `VTDecompressionSessionDecodeFrame` error, or an asynchronous decode
-   error calls `ov_screen_request_video_idr` (deferred to the session
-   queue; Rust rate-limits it, drops P-frames until recovery, and asks for
-   an IDR). `kVTInvalidSessionErr` (app backgrounded) drops the session;
-   the next keyframe creates a new one. Losses in transit are handled by
-   Rust (`VIDEO_RECOVER` with `CAP_LTR`); the recovery P-frames are ordinary
-   in-stream syntax for VideoToolbox.
-7. Latency: video's decode stage ends at the VideoToolbox output callback,
-   its present stage at the `presentedTime` of the first drawable drawn
-   after that callback (the drawable that contains the picture).
+   released together after a repaired loss) is marked `DoNotDisplay`: it
+   is decoded, so the reference chain stays intact, but only the burst's
+   newest picture is shown, so a short stall resumes at the live picture
+   instead of fast-forwarding through the backlog.
+3. Session queue, `VideoOverlay.enqueue`: the sample goes straight onto
+   the `AVSampleBufferDisplayLayer` (flushed first when the parameter sets
+   changed). Main only places and shows the layer, at the first sample of
+   a motion period and when the region moves.
+4. The layer lives in the surface's zoom container above the frame, at the
+   region's rect in frame pixels, so it zooms and pans with the tiles
+   (layout without implicit animations).
+5. `OV_VIDEO_END` marks the motion period's generation. The overlay is
+   hidden once the next frame (the lossless refresh) is on screen: Metal
+   when the drawable holding it was presented, the CGImage path in the same
+   Core Animation commit (`requestHide` / `takePendingHide`, with a 0.5 s
+   safety timer), so neither the pre-motion tiles nor a stale picture
+   flash. The hidden layer is then emptied (`flushAndRemoveImage`) unless
+   a newer motion period already started; a new connection or teardown
+   empties and hides it too.
+6. Recovery: a unit that cannot be built (no keyframe yet, unusable
+   parameter sets, unknown codec) or a layer whose decoder failed
+   (`status == .failed`, e.g. after backgrounding: flushed, the P-frame
+   dropped) calls `ov_screen_request_video_idr` (deferred to the session
+   queue; Rust rate-limits it, drops P-frames until the IDR). Losses in
+   transit are handled by Rust (`VIDEO_RECOVER` with `CAP_LTR`); the
+   recovery P-frames are ordinary in-stream syntax for the layer's decoder
+   and are enqueued like any other unit.
+7. Latency: a video unit counts as presented when it is enqueued (the
+   layer has no presented callback), so its present stage is an
+   approximation.
 
-**Fallbacks.** No Metal (CGImage path) or no YUV compositor: `CAP_H264` is
-not advertised; the host sends lossless tiles only. VideoToolbox session
-creation failing at runtime: the unit is answered with a recovery request
-(retried on every keyframe, logged with a failure count); meanwhile the
-region keeps its last framebuffer content until motion ends and the
-lossless refresh arrives (CAPS go out once per connection, so the app
-cannot switch to tiles mid-session).
+**Fallbacks.** No hardware H.264 decoder: `CAP_H264` is not advertised;
+the host sends lossless tiles only (CAPS go out once per connection, so
+the app cannot switch to tiles mid-session).
 
 ### 5.4 Cursor
 
@@ -958,8 +947,7 @@ auto-connect and the Bonjour browse.
   (`RelayAddress`), direct-path candidate parsing and LAN classification
   (`DirectPathSet.parse` / `classify`), the zoom math (`ViewportMath`) and
   the hosts' TXT records (`LanTxtRecord`) and the LAN / relay transport
-  plan (`TransportPlan`), and the video frame pacer / YCbCr matrices
-  (`VideoFramePacer`, `YUVToRGB`).
+  plan (`TransportPlan`).
   These source files are compiled into the test bundle directly, so the
   tests need neither the app host nor the Rust library.
 - The Rust side is covered by `cargo test -p ovffi`, including the check that

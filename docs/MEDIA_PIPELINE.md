@@ -415,7 +415,7 @@ starts with a keyframe), never inside one.
    confirmed reference. Marked pictures go out with `VIDEO_LTR`.
 2. The viewer sends `VIDEO_LTR_ACK(seq)` for every `VIDEO_LTR` unit it
    decoded (desktop: after the MF decoder returned; iOS: when the unit is
-   handed to VideoToolbox — a later VT failure calls
+   enqueued on the display layer — a later layer failure calls
    `ov_screen_request_video_idr`, which forgets every LTR).
 3. On a **loss** (seq gap, torn unit, media channel `VideoLost`) the viewer
    drops P-frames as before but sends `VIDEO_RECOVER(newest LTR it
@@ -620,22 +620,18 @@ pictures within one motion period. Both are recorded in `VideoRxStats`.
 
 **iOS.** `ovffi` runs the same `VideoRx` continuity / LTR logic and hands
 each unit (parameter sets + 4-byte length-prefixed body, `codec` 1 / 2) to
-the Swift sink; the app decodes it with a `VTDecompressionSession` (real
-time, asynchronous, output NV12 in the stream's range, IOSurface-backed /
-Metal-compatible). The decoded picture goes into a one-deep newest-wins
-slot; at the next `CADisplayLink` tick (up to 120 Hz on ProMotion) the Metal
-renderer wraps its planes as textures (`CVMetalTextureCache`), converts
-YCbCr -> R'G'B' with the VUI matrix (BT.709 by default) and writes it into
-the framebuffer texture at `header.rect`, in the same command buffer as the
-tile blits — so the area-downscale + sharpen passes (5.4) apply to video
-too. After `VIDEO_END` late pictures are refused and the lossless refresh
-overwrites the last one. Any decode failure (no session, unusable
-parameter sets, a VideoToolbox error, `kVTInvalidSessionErr` after
-backgrounding) calls `ov_screen_request_video_idr`, so the region never
-goes silently black. Telemetry: the decode stage ends at the VideoToolbox
-callback (`ov_screen_latency_video_decoded`), the present stage at the
-`presentedTime` of the first drawable drawn after it. CAPS: `CAP_H264` only
-with Metal + hardware H.264 decode; `CAP_HEVC` (via
+the Swift sink; the app wraps it in a `CMSampleBuffer` (format description
+from the parameter sets, tagged with the VUI colour; `DisplayImmediately`,
+`DoNotDisplay` for `OV_VIDEO_SUPERSEDED` units) and enqueues it, from the
+session queue, on an `AVSampleBufferDisplayLayer` laid over the tile frame
+at `header.rect`. VideoToolbox decodes inside the layer and the system
+compositor shows each picture as soon as it is decoded, off the app's main
+thread; the Metal renderer draws tiles only. After `VIDEO_END` the overlay
+is hidden once the lossless refresh is on screen. A unit that cannot be
+built (no keyframe yet, unusable parameter sets) or a failed layer (e.g.
+after backgrounding) calls `ov_screen_request_video_idr`, so the region
+never stays frozen. Telemetry: a unit counts as presented when it is
+enqueued. CAPS: `CAP_H264` only with hardware H.264 decode; `CAP_HEVC` (via
 `ov_screen_set_video_caps`) only when `VTIsHardwareDecodeSupported(HEVC)`.
 See `docs/IOS_APP.md` 5.3.
 

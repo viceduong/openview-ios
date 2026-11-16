@@ -14,7 +14,7 @@ pub const OV_VIDEO_KEYFRAME: u32 = 1;
 pub const OV_VIDEO_END: u32 = 2;
 /// [`OvVideoPacket::flags`]: a newer picture of the same burst follows —
 /// decode this unit (the reference chain needs it) without presenting it
-/// (VideoToolbox `kVTDecodeFrame_DoNotOutputFrame`).
+/// (iOS: `kCMSampleAttachmentKey_DoNotDisplay`).
 pub const OV_VIDEO_SUPERSEDED: u32 = 4;
 
 /// One H.264 access unit for the shell, laid out for C (`ov_video_packet`

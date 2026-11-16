@@ -648,7 +648,7 @@ it.
 | Field | Meaning |
 |---|---|
 | `seq`, `pts_us` | Unit sequence. Host capture time in µs since the UNIX epoch. |
-| `flags` | `OV_VIDEO_KEYFRAME (1)`: IDR, so `sps`/`pps` are set. `OV_VIDEO_END (2)`: motion is over and there is no picture. The next frame-sink delivery is the lossless refresh, after which the overlay should be removed. `OV_VIDEO_SUPERSEDED (4)`: a newer picture of the same burst follows; decode the unit (the reference chain needs it) without outputting it (`kVTDecodeFrame_DoNotOutputFrame`). |
+| `flags` | `OV_VIDEO_KEYFRAME (1)`: IDR, so `sps`/`pps` are set. `OV_VIDEO_END (2)`: motion is over and there is no picture. The next frame-sink delivery is the lossless refresh, after which the overlay should be removed. `OV_VIDEO_SUPERSEDED (4)`: a newer picture of the same burst follows; decode the unit (the reference chain needs it) without showing it (iOS: `kCMSampleAttachmentKey_DoNotDisplay`). |
 | `x, y, w, h` | Where the (even-sized) picture sits inside the `screen_w × screen_h` framebuffer |
 | `sps/sps_len`, `pps/pps_len` | Raw parameter-set NAL units (no start code) on keyframes. NULL/0 otherwise. |
 | `data/data_len` | **AVCC**: each NAL has a 4-byte big-endian length prefix. Parameter sets and AUDs are removed. Ready for a `CMSampleBuffer` with `nalUnitHeaderLength` 4. |
@@ -729,8 +729,8 @@ int32_t ov_screen_latency_presented(OvScreen*, int64_t drawn_age_us,
   with the presents the shell reports; see [ovapp.md](ovapp.md) §6.1 for
   the stages. `network` and `total` need the clock offset
   (`clock_valid`). `decode` is reassembled → handed to the shell (tiles are
-  decoded in Rust; H.264 is handed to VideoToolbox, whose decode counts
-  toward `present`).
+  decoded in Rust; H.264 / HEVC is handed to the shell's decoder, whose
+  decode counts toward `present`).
 - `latency_stats` fills rolling p50 / p95 over the last 120 updates per
   stage (`samples` 0 = no data yet). The app reads it twice a second on the
   session queue: the stats chip shows the total, the session sheet the
