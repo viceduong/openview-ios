@@ -46,14 +46,14 @@ Always-on pure-Rust dependencies: `flate2` (miniz_oxide backend, DEFLATE),
 | `screen` | `src/screen.rs` | all | `Frame`, `PixelFormat` (BGRA=0, RGB=1), `synthetic_frame` |
 | `codec` | `src/codec.rs` | all | `Compressor` (zstd L1 / DEFLATE / LZ4 / Packed) and `Decompressor` for every `FrameCodec` |
 | `tiles` | `src/tiles/mod.rs` (+ `tests.rs`) | all | 64x64 tile maps, `diff_tiles`, `rects_from_map`, `gather`/`scatter`, `ScreenDecoder` (the viewer framebuffer) |
-| `bands` | `src/bands/mod.rs` (+ `tests.rs`) | all | `FrameCodec::Packed` band container: parallel per-band compression, MOVE records, CACHE/LOSSY sections, `MAX_RAW_TOTAL` |
+| `bands` | `src/bands/mod.rs` (+ `tests.rs`), `src/bands/palette.rs` (+ `palette/tests.rs`) | all | `FrameCodec::Packed` band container: parallel per-band compression, MOVE records, CACHE/LOSSY sections, `MAX_RAW_TOTAL`; palette bands (`CAP_PALETTE`) |
 | `lossy` | `src/lossy/mod.rs` (+ `tests.rs`) | all | Tile classifier (photo vs UI), JPEG atlases, 128-bit tile hash, host `TileCache` (LRU), viewer `SlotStore` |
 | `scroll` | `src/scroll.rs` | all | Vertical scroll detection (`detect_vertical`) and OS move-rect verification (`verify_move`) |
 | `zstd_par` | `src/zstd_par.rs` | all | Parallel decode of multi-frame zstd payloads |
-| `sendq` | `src/sendq/mod.rs` | all | Host send side: `UpdateEncoder` (full vs delta decision, `encoder.rs`; lossy/cache settings and the refinement lane, `refine.rs`), `FrameMailbox` (latest-wins slot plus video FIFO, `mailbox.rs`), `PrioritySender` (control-first scheduler, `sender.rs`), `DrainMeter`; tests in `tests/` |
+| `sendq` | `src/sendq/mod.rs` | all | Host send side: `UpdateEncoder` (full vs delta decision, `encoder.rs`; lossy/cache settings and the refinement lane, `refine.rs`; viewport priority, `viewport.rs`), `FrameMailbox` (latest-wins slot plus video FIFO, `mailbox.rs`), `PrioritySender` (control-first scheduler, `sender.rs`), `DrainMeter`; tests in `tests/` |
 | `pacing` | `src/pacing.rs` | all | `LinkPacer`: delivery rate and min RTT from tagged PING/PONG probes, window gating, queue-delay signal |
 | `adapt` | `src/adapt.rs` | all | Change detection, `RateGovernor` (idle ease-out), `AutoQuality` (queue-delay-driven fps and bitrate scale) |
-| `video` | `src/video/mod.rs` | all | H.264 header/wire and `VideoRx` (`mod.rs`), Annex-B/AVCC helpers (`annexb.rs`), BGRA<->NV12 BT.709 limited (`convert.rs`), `MotionDetector` (`motion.rs`), `VideoSession` (`session.rs`), SPS VUI rewrite (`pub mod sps`), synthetic content (`synth.rs`), `tests.rs` |
+| `video` | `src/video/mod.rs` | all | Video header/wire, codec traits and `VideoRx` (`mod.rs`), `VideoCodec` / LTR control types (`codec.rs`), `LtrTracker` / `VideoFeedback` (`ltr.rs`), Annex-B/AVCC/HVCC helpers (`annexb.rs`), BGRA<->NV12 BT.709 limited (`convert.rs`), `MotionDetector` (`motion.rs`), `VideoSession` (`session.rs`), SPS VUI rewrite (`pub mod sps`), synthetic content (`synth.rs`), `tests.rs`, `recovery_tests.rs` |
 | `mfcodec` | `src/mfcodec/mod.rs` | Windows + `mf` | `H264Encoder` (HW MFT first, SW fallback; CPU or D3D11 input; `encoder.rs`), `H264Decoder` (`decoder.rs`), `MfVideoEncoder`, `GpuFrame` (`gpu.rs`), shared MFT plumbing (`mft.rs`), `tests.rs` |
 | `audio` | `src/audio/mod.rs` | all | AUDIO payload format, `AudioEncoder`/`AudioDecoder` (Opus via feature); `JitterBuffer`, `AudioBus`, `AudioRingBuffer` (`buffer.rs`); `TickClock`, `MicSource`, `SynthMic`, `run_mic_loop`, `SineGen` (`source.rs`); `tests.rs` |
 | `winaudio` | `src/winaudio.rs` | Windows | Event-driven WinMM `WinmmMic` / `WinmmSpeaker` / `spawn_playback` |
@@ -124,9 +124,11 @@ the pump from the media channel).
 | `0x22` | FRAME_END | H->V | `u64 seq` | exactly 8 B |
 | `0x23` | TILES_BEGIN | H->V | 36 B + 8 B/rect, see 3.3 | exact length, every rect must fit |
 | `0x24` | KEYFRAME_REQUEST | V->H | `u64 have_seq` (optional) | < 8 B means `have_seq = 0` |
-| `0x25` | VIDEO_BEGIN | H->V | 38 B `VideoHeader`, see 3.3 | exactly 38 B, codec 1, rect fits |
+| `0x25` | VIDEO_BEGIN | H->V | 38 B `VideoHeader`, see 3.3 | exactly 38 B, codec 1 or 2, rect fits |
 | `0x26` | VIDEO_IDR_REQUEST | V->H | `u64 have_seq` (optional) | as KEYFRAME_REQUEST |
 | `0x27` | VIDEO_UNIT | local | 38 B `VideoHeader` + Annex-B | declared length must equal body |
+| `0x28` | VIDEO_LTR_ACK | V->H | `u64 seq` (`CAP_LTR`: the `VIDEO_LTR` unit was decoded) | >= 8 B |
+| `0x29` | VIDEO_RECOVER | V->H | `u64 ltr_seq` (`CAP_LTR`: recover from that long-term reference) | >= 8 B |
 | `0x30` | POINTER | V->H | `u8 kind` (0 move, 1 down, 2 up; left button), `u32 x`, `u32 y` (normalised 0..=65535) | exactly 9 B |
 | `0x31` | KEY | V->H | `u16 vk`, `u8 down` | exactly 3 B |
 | `0x32` | CURSOR | H->V | `i32 x` **LE**, `i32 y` **LE** (capture-region-relative pixels) | exactly 8 B |
@@ -140,6 +142,7 @@ the pump from the media channel).
 | `0x3A` | TEXT | V->H (`CAP_INPUT2`) | UTF-8 text typed as Unicode | must be UTF-8 |
 | `0x3B` | RELEASE_ALL | V->H (`CAP_INPUT2`) | empty | |
 | `0x3C` | SAS | V->H (`CAP_INPUT2`) | empty (Ctrl+Alt+Del) | |
+| `0x3D` | VIEWPORT | V->H (only to a host with `CAP_VIEWPORT`) | `u16 x`, `u16 y`, `u16 w`, `u16 h` (the visible part of the remote frame, remote pixels; `w`/`h` 0 = none), `u16 scale_milli` (device pixels per remote pixel x 1000) | exactly 10 B |
 | `0x40` | AUDIO | both | see section 7 | opaque to the decoder; parsed by `audio::parse_audio_frame` |
 | `0x50` | CLIPBOARD | both | `u8 kind` (0 = UTF-8 text), text | >= 1 B; kind != 0 is rejected |
 | `0x60` | CAPS | both | `u32 flags`, 4 reserved zero bytes | >= 4 B; extra bytes and unknown bits are ignored |
@@ -223,8 +226,8 @@ On receive, the stride of a delta is implied as `width * bpp`.
 | Off | Size | Field |
 |---|---|---|
 | 0 | 8 | `seq` u64 (consecutive per host session, END markers included) |
-| 8 | 1 | `flags`: `VIDEO_KEYFRAME = 1`, `VIDEO_END = 2` |
-| 9 | 1 | `codec` (`CODEC_H264 = 1`; anything else is rejected) |
+| 8 | 1 | `flags`: `VIDEO_KEYFRAME = 1`, `VIDEO_END = 2`, `VIDEO_LTR = 4` (marked long-term reference, `CAP_LTR`), `VIDEO_RECOVERY = 8` (predicted only from the LTR named in `VIDEO_RECOVER`); unknown bits ignored |
+| 9 | 1 | `codec` (`CODEC_H264 = 1`, `CODEC_HEVC = 2` only to a `CAP_HEVC` viewer; anything else is rejected) |
 | 10 | 8 | rect `u16 x, y, w, h` (coded picture placement) |
 | 18 | 4 | `screen_w` u32 |
 | 22 | 4 | `screen_h` u32 |
@@ -277,17 +280,22 @@ largest DEFLATE expansion), so a small payload cannot claim a huge allocation.
 | 16 | `CAP_BYE` | acts on BYE (every `TerminalSession`; part of `LOCAL_CAPS`) |
 | 17 | `CAP_TIMING` | latency telemetry: timed PONGs, TIMING records, clock-probe PINGs (every `TerminalSession` and the iOS assembler; part of `LOCAL_CAPS`; used when both set it) |
 | 18 | `CAP_STEREO` | decodes stereo Opus AUDIO (needs `CAP_OPUS`; builds with `opus`, the iOS shell when AVAudioConverter decodes 2-channel Opus); a stereo source is sent stereo only to such a peer |
+| 19 | `CAP_HEVC` | decodes HEVC VIDEO_BEGIN units (viewer; needs `CAP_H264`; desktop: `set_video_decoder` with a decoder whose `hevc()` is true; iOS: `ov_screen_set_video_caps(OV_VIDEO_CAP_HEVC)`); the host then streams HEVC when its HEVC MFT opens |
+| 20 | `CAP_LTR` | long-term-reference loss recovery: viewer sends VIDEO_LTR_ACK / VIDEO_RECOVER, host marks LTRs and answers with a `VIDEO_RECOVERY` P-frame (or an IDR); part of `LOCAL_CAPS`, used when both set it |
+| 21 | `CAP_PALETTE` | decodes palette bands (band codec 4 in a Packed container, see 4.3); every build (pure Rust), part of `LOCAL_CAPS` |
+| 22 | `CAP_VIEWPORT` | host: acts on VIEWPORT (visible tiles first, the rest deferred); a viewer sends VIEWPORT only to a host that set it; part of `LOCAL_CAPS` |
 
 The caps sets are built up as follows:
 
 - `LOCAL_CAPS = TILES | ZSTD | KEYFRAME | RUDP | INPUT2 | LZ4 | BANDS | MOVE |
-  BYE | TIMING`.
+  BYE | TIMING | LTR | PALETTE | VIEWPORT`.
 - `VIEWER_W2_CAPS = LOSSY | CACHE`.
 - `audio::audio_caps()` returns `OPUS | AUDIO10` with the `opus` feature, and
   `0` otherwise.
 - A new `TerminalSession` advertises `LOCAL_CAPS | VIEWER_W2_CAPS |
   audio_caps()`. `set_local_caps` overrides this (for example in tests, or on
-  `--lossless` hosts). `set_video_decoder` adds `CAP_H264`, and
+  `--lossless` hosts). `set_video_decoder` adds `CAP_H264` (plus `CAP_HEVC`
+  when the decoder's `VideoDecode::hevc()` is true), and
   `enable_direct` adds `CAP_DIRECT | CAP_MEDIA`.
 
 **Handshake order** (`TerminalSession::pump`, `Command::Caps` arm):
@@ -376,11 +384,20 @@ completion event.
 3. Otherwise `video::VideoRx::accept` returns one of:
    - `Deliver`: decode and `ScreenDecoder::blit` over the framebuffer.
    - `End`: clear the stall clock.
-   - `Drop`: request an IDR.
+   - `Drop`: ask for a way back in (`request_video_idr`: `VIDEO_RECOVER`
+     from the newest decoded LTR when both peers set `CAP_LTR`, else
+     `VIDEO_IDR_REQUEST`; a recover that did not resync by the next request
+     escalates to an IDR request).
    - `Stale`: silently dropped. This is a unit that lost the race between the
      media and reliable channels.
 
-IDR requests use the same 300 ms rate limit. `VideoRxStats` records:
+After a successful decode of a `VIDEO_LTR` unit the viewer sends
+`VIDEO_LTR_ACK(seq)`. A decoder error calls `VideoRx::mark_corrupt` (every
+LTR forgotten, IDR request); a loss (gap, torn unit, MEDIA_GAP) only
+`mark_broken` (LTR recovery stays possible). A `VIDEO_RECOVERY` unit
+resyncs a viewer waiting on its `VIDEO_RECOVER`. Requests use the same
+300 ms rate limit. `VideoRxStats` records (besides `idr_requests`,
+`recover_requests`, `ltr_acks`):
 
 - capture-to-paint latency, computed as `unix_micros() - pts_us` and kept
   only when under 10 s; up to `MAX_LATENCY_SAMPLES = 200_000` samples are
@@ -508,9 +525,32 @@ u8  flags   bit0 MOVES, bit1 CACHE, bit2 LOSSY (other bits must be 0)
          u8 kind (0 = baseline JPEG), u16 atlas_cols, u16 tile_count (1..=64),
          tile_count x (u16 col, u16 row), u32 jpeg_len, jpeg bytes
 u16 band_count (0..=64)
-band_count x 9 B: u8 codec (0 raw,1 DEFLATE,2 zstd,3 LZ4), u32 raw_len, u32 wire_len
+band_count x 9 B: u8 codec (0 raw,1 DEFLATE,2 zstd,3 LZ4,4 palette), u32 raw_len, u32 wire_len
 band payloads, back to back
 ```
+
+**Palette bands** (codec 4, `CAP_PALETTE`, `src/bands/palette.rs`): the band
+(4-byte pixels, `raw_len % 4 == 0`) is cut into chunks of `1 << chunk_log2`
+pixels (the host uses 64). A chunk with at most 16 distinct colours becomes
+its palette plus packed indices (1 bit for <= 2 colours, 2 bits for <= 4,
+4 bits for <= 16, MSB first); a chunk whose colours are all in the previous
+chunk's palette reuses it (no palette bytes); any other chunk stays raw. The
+resulting stream T is zstd-compressed:
+
+```
+u8  chunk_log2 (4..=12)
+u32 t_len            (<= raw_len + chunks x 65)
+zstd frame of T      (exactly t_len bytes)
+T, per chunk: u8 tag  0 = raw (n x 4 B) | 1..=16 = new palette (tag x 4 B) | 0x80 = reuse
+              then ceil(n x bits / 8) index bytes; every index < palette size
+```
+
+Decode validates the header bound, the exact zstd length, every tag, index
+and the reuse of an existing palette, and that T is consumed exactly. The
+host tries a palette band for every non-photo band of a `CAP_PALETTE` viewer
+(with `zstd-encode`) and keeps it when T is at most half the band
+(`PALETTE_MAX_RATIO`; the transform gives up early past that), else plain
+zstd.
 
 The parser is strict:
 
@@ -542,6 +582,8 @@ Band encoding (`encode_packed_ex`):
   - It is "photo" if `policy.lz4 && (!policy.zstd || lz4_ratio_estimate <
     LZ4_MAX_RATIO (1.6))`. The ratio is estimated from three 16 KB samples.
     Photo bands go out as LZ4.
+  - Else a palette band (`policy.palette`, `CAP_PALETTE` + zstd) when the
+    transform shrinks the band to at most half.
   - Else zstd level 1, when the policy allows and the build has
     `zstd-encode`.
   - Else LZ4, if allowed.
@@ -649,7 +691,8 @@ These are the decision rules in `submit_ex` (the full narrative is in
 - **Codec:**
   - `CAP_BANDS` -> Packed container. Its policy is: zstd if `CAP_ZSTD` and the
     build has `zstd-encode`; LZ4 only if `CAP_LZ4` **and**
-    `link_rate >= LZ4_MIN_LINK_RATE = 4_000_000 B/s`.
+    `link_rate >= LZ4_MIN_LINK_RATE = 4_000_000 B/s`; palette bands if
+    `CAP_PALETTE`.
   - Without `CAP_BANDS`: zstd (`CAP_ZSTD`). A payload of at least 192 KiB goes
     out as concatenated zstd bands.
   - Otherwise DEFLATE.
@@ -664,6 +707,16 @@ These are the decision rules in `submit_ex` (the full narrative is in
   - `submit_refine()` sends a refinement-only update when the link is idle.
 - **Row trimming:** for chained deltas, `trim_rows` drops rows of a changed
   tile that did not change. Tiles owed a refinement are always sent whole.
+- **Viewport priority** (`set_viewport`, `src/sendq/viewport.rs`; the host
+  feeds it the viewer's VIEWPORT; used when the viewer's CAPS carry
+  `CAP_VIEWPORT`, part of `LOCAL_CAPS`): in a plain delta (no full frame, no MOVE)
+  changed tiles outside the viewport are deferred into the refinement
+  `backlog` (`EncoderStats::deferred_tiles`) and the update carries only the
+  visible ones; an update with only off-screen changes is not sent at all.
+  Deferred tiles go out through the refinement lane once settled (300 ms),
+  visible backlog tiles first (`take_chunk`), and never wait longer than
+  `OFFVIEW_MAX_DEFER = 500 ms`: the first update after that carries every
+  changed tile again. Tiles that pan into view are due at once.
 - `set_lossy(false)` / `set_cache(false)` turn lossy tiles and the tile cache off on the host.
   `ovhost`'s `--lossless` flag maps to the `NO_LOSSY` switch.
 
@@ -696,7 +749,26 @@ These are the decision rules in `submit_ex` (the full narrative is in
 - On `Exit` it queues a `VIDEO_END` marker in the mailbox's video FIFO and
   hands the region back through `take_refresh()`.
 - Encoder sizes are rounded up to `ENCODER_BUCKET = 128` px, so the encoder
-  is reused while the motion rect grows.
+  is reused while the motion rect grows. A `Grow` that still fits keeps the
+  reference chain (no keyframe). With the stable surface
+  (`set_fixed_surface`, default on), a growth past the encoder inside one
+  motion period re-opens it once at the full screen, and that encoder is
+  kept until the period ends: at most one re-open + keyframe per period
+  instead of one per bucket step. A coded rect of unchanged size stays put
+  while it covers the motion.
+- Codec: HEVC when `set_peer_caps(hevc = CAP_HEVC, ltr = CAP_LTR)` allows it
+  and the factory opens an HEVC encoder; an HEVC failure falls back to
+  H.264 for the rest of the session (`wanted_codec()`). The factory gets an
+  `EncoderSpec { w, h, fps, bitrate, codec, ltr_slots }`.
+- LTR (`video/ltr.rs`, `LtrTracker`): with `CAP_LTR` the encoder is asked
+  for `LTR_SLOTS = 2`. A keyframe resets the slots (H.264 MFTs auto-mark the
+  keyframe and the next picture; HEVC gets an explicit mark right away);
+  then one mark per `fps` pictures into the slot that does not hold the
+  newest confirmed reference. `apply_feedback(VideoFeedback::take())`
+  feeds acks / recover / IDR requests from the command thread; a recover
+  plans `use_ltr = 1 << slot` (header flag `VIDEO_RECOVERY`) or a keyframe
+  when no slot holds the named seq. `VideoStats` counts `encoders`,
+  `ltr_marks`, `recoveries`, `recover_idrs`, `idr_requests`.
 - It skips encoding when `MAX_VIDEO_QUEUE = 3` units are already queued.
 - After an encoder failure it stays on tiles for 5 s.
 - Bitrate comes from `target_bitrate_bpp`:
@@ -722,6 +794,17 @@ These are the decision rules in `submit_ex` (the full narrative is in
   mark / use LTR frame (`ltr()` = all three), `ltr_slots`, gradual intra
   refresh, temporal layers, max reference frames, force keyframe. NVENC
   (RTX 4090) and the Microsoft software MFT report all of them.
+- `EncodeParams { codec, ltr_slots, .. }`: HEVC (`MFVideoFormat_HEVC`, Main
+  profile) enumerates hardware HEVC MFTs only (no software fallback);
+  `ltr_slots > 0` sets `CODECAPI_AVEncVideoLTRBufferControl = n | 1 << 16`
+  (trust-until) before the media types; `ltr_slots()` reports the slots in
+  effect (0 when the MFT lacks mark/use/buffer control). `set_frame_refs`
+  applies `MarkLTRFrame` / `UseLTRFrame (mask | 1 << 16)` to the next
+  picture; each output's `EncodedAu::ltr` comes from
+  `MFSampleExtension_LongTermReferenceFrameInfo` (NVENC H.264/HEVC and the
+  Microsoft MFT report it), or what was asked when the MFT does not.
+  `MfVideoEncoder::with_spec(&EncoderSpec, pref)` is the host factory's
+  entry.
 - The input media type is NV12 BT.709 with 16-235 nominal range.
   - On the CPU path the conversion is `video::bgra_to_nv12`.
   - On the GPU path (`new_gpu` / `encode_texture`) it is a D3D11 video
@@ -738,8 +821,8 @@ These are the decision rules in `submit_ex` (the full narrative is in
 
 - It uses the Microsoft software MFT in low-latency mode.
 - NV12 is converted to BGRA by `video::nv12_to_bgra`.
-- The iOS shell instead uses `AccessUnit::from_annexb`, which produces AVCC
-  plus SPS/PPS, for VideoToolbox.
+- The iOS shell instead uses `AccessUnit::from_annexb_codec`, which produces
+  AVCC / HVCC plus VPS (HEVC) / SPS / PPS, for VideoToolbox.
 
 ### 4.8 Send queue and scheduler (`src/sendq/mailbox.rs`, `src/sendq/sender.rs`)
 

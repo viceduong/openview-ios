@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_MAP_
 /// D3D11 device. Skips when no device exists.
 #[test]
 fn d2d_hq_cubic_downscale_offscreen() {
-    let Ok((device, driver)) = create_device() else {
+    let Ok((device, driver, _)) = create_device() else {
         eprintln!("skipping: no D3D11 device");
         return;
     };
@@ -143,7 +143,7 @@ fn present_mode_follows_vsync_and_tearing_support() {
 /// Prints whether this machine supports tearing presents.
 #[test]
 fn tearing_support_probe() {
-    let Ok((device, _)) = create_device() else {
+    let Ok((device, ..)) = create_device() else {
         eprintln!("skipping: no D3D11 device");
         return;
     };

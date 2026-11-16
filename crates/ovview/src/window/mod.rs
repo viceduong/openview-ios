@@ -6,6 +6,9 @@
 //! - presents the latest [`Frame`] letterboxed by aspect ratio into the
 //!   client area — with Direct2D ([`d2d`]) or, as the fallback, GDI
 //!   `StretchDIBits` ([`paint`]) — plus the remote cursor and the HUD;
+//! - with Direct2D, draws the video decoder's GPU picture over the frame
+//!   (zero-copy video: [`RenderWindow::video_target`] hands the decoder the
+//!   renderer's D3D11 device and the picture slot);
 //! - queues local mouse/keyboard events as [`LocalEvent`]s for the viewer
 //!   loop to turn into POINTER/KEY commands ([`wndproc`]);
 //! - sets a quit flag on `WM_CLOSE` so the loop can tear down cleanly.
@@ -139,6 +142,8 @@ struct WindowState {
     /// GDI path: the CPU-scaled (area + sharpen) picture and its
     /// key `(frame seq, overlay, dst w, dst h)`.
     scaled: Mutex<Option<ScaledCache>>,
+    /// The zero-copy video decoder's GPU picture (Direct2D draws it).
+    video: ovapp::mfcodec::GpuPictureSlot,
 }
 
 #[cfg(windows)]
@@ -156,6 +161,7 @@ impl WindowState {
             d2d: Mutex::new(None),
             repaint_pending: AtomicBool::new(false),
             scaled: Mutex::new(None),
+            video: ovapp::mfcodec::GpuPictureSlot::new(),
         }
     }
 
@@ -222,6 +228,44 @@ impl RenderWindow {
         {
             Some(frame)
         }
+    }
+
+    /// Where a zero-copy video decoder presents: the Direct2D renderer's
+    /// D3D11 device (when it has video support) and the window's picture
+    /// slot. `None` on the GDI path, WARP, or off-Windows.
+    #[cfg(windows)]
+    pub(crate) fn video_target(&self) -> Option<ovapp::mfcodec::GpuTarget> {
+        let device = self
+            .state
+            .d2d
+            .lock()
+            .ok()?
+            .as_ref()?
+            .video_device()?
+            .clone();
+        Some(ovapp::mfcodec::GpuTarget {
+            device,
+            slot: self.state.video.clone(),
+        })
+    }
+
+    /// Let the video decoder present on the GPU (`true`, the default) or
+    /// make it paint CPU frames — for consumers of every frame's pixels
+    /// (recording, the latency probe). Never enabled without Direct2D.
+    pub(crate) fn allow_gpu_video(&self, on: bool) {
+        #[cfg(windows)]
+        {
+            let d2d = self.state.d2d.lock().is_ok_and(|g| g.is_some());
+            self.state.video.set_enabled(on && d2d);
+        }
+        #[cfg(not(windows))]
+        let _ = on;
+    }
+
+    /// A GPU video picture changed: repaint. No-op off-Windows.
+    pub(crate) fn repaint(&self) {
+        #[cfg(windows)]
+        self.state.invalidate();
     }
 
     /// Update the remote cursor position (frame pixel space) and repaint.

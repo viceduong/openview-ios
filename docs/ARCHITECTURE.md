@@ -135,8 +135,8 @@ undrained — see KNOWN_ISSUES BUG-2).
 ### iOS
 Session and Swift bridges (`NwUdpBridge`, `RelayWebSocket`) are confined to
 the main queue; a timer / wake sink drives `ov_session_pump`; frames are
-handed to Metal as dirty rects; H.264 goes to an `AVSampleBufferDisplayLayer`
-overlay. See [`IOS_APP.md`](IOS_APP.md).
+handed to Metal as dirty rects; H.264 / HEVC is decoded by a
+`VTDecompressionSession` and composited into the same Metal frame. See [`IOS_APP.md`](IOS_APP.md).
 
 ### GUI (`OpenView.exe`)
 Slint event loop on the UI thread; worker threads read child stdout/stderr

@@ -426,7 +426,7 @@ final class OvScreenBox {
     /// packet and its decoded sample count (960 per 20 ms tick). Only
     /// after `enableOpus()` — which advertises CAP_OPUS to the host.
     var onOpus: ((Data, UInt32) -> Void)?
-    /// Fired on an H.264 access unit, only after `enableVideo()`,
+    /// Fired on an H.264 / HEVC access unit, only after `enableVideo()`,
     /// which advertises CAP_H264 to the host. Fires inside `feed` on the
     /// session queue: never call back into this box synchronously from it.
     var onVideo: ((RemoteVideoPacket) -> Void)?
@@ -536,10 +536,12 @@ final class OvScreenBox {
         ov_screen_set_opus_stereo(ptr, 1)
     }
 
-    /// Install the H.264 video sink so our CAPS advertise CAP_H264
-    /// and a capable host streams high-motion regions as H.264 instead of
-    /// lossless tiles. Call before the first `feed` (CAPS go out once), and
-    /// only when VideoToolbox can decode H.264 (`H264SampleBuilder.available`).
+    /// Install the video sink so our CAPS advertise CAP_H264 (and
+    /// CAP_LTR) and a capable host streams high-motion regions as H.264
+    /// instead of lossless tiles. Call before the first `feed` (CAPS go out
+    /// once), and only when VideoToolbox decodes H.264 in hardware and the
+    /// Metal compositor exists (`RemoteVideoCodec.h264.hardwareDecodable`,
+    /// `MetalContext.supportsVideo`).
     func enableVideo() {
         let unmanaged = Unmanaged.passUnretained(self)
         ov_screen_set_video_sink(ptr, unmanaged.toOpaque(), { user, packet in
@@ -551,9 +553,11 @@ final class OvScreenBox {
                 ptsUs: p.pts_us,
                 isKeyframe: (p.flags & 1) != 0,
                 isEnd: (p.flags & 2) != 0,
+                codec: RemoteVideoCodec.from(wire: p.codec),
                 rect: CGRect(x: CGFloat(p.x), y: CGFloat(p.y),
                              width: CGFloat(p.w), height: CGFloat(p.h)),
                 screenSize: CGSize(width: CGFloat(p.screen_w), height: CGFloat(p.screen_h)),
+                vps: RemoteVideoPacket.copy(p.vps, p.vps_len),
                 sps: RemoteVideoPacket.copy(p.sps, p.sps_len),
                 pps: RemoteVideoPacket.copy(p.pps, p.pps_len),
                 avcc: RemoteVideoPacket.copy(p.data, p.data_len),
@@ -570,6 +574,22 @@ final class OvScreenBox {
     /// Session queue only, and never from inside a sink.
     func requestVideoIdr() {
         ov_screen_request_video_idr(ptr)
+    }
+
+    /// With the video sink installed: also advertise CAP_HEVC (the host
+    /// may then stream HEVC: `codec` 2 packets with a VPS). Keeps LTR
+    /// recovery on (VideoToolbox decodes the in-stream recovery
+    /// P-frames). Call after `enableVideo()`, before the first `feed`, and
+    /// only when VideoToolbox decodes HEVC in hardware.
+    func enableVideoHevc() {
+        _ = ov_screen_set_video_caps(ptr, OV_VIDEO_CAP_HEVC | OV_VIDEO_CAP_LTR)
+    }
+
+    /// VideoToolbox returned the picture of video unit `seq`
+    /// `decodedAgeUs` ago (latency telemetry: the decode stage ends here).
+    /// Session queue only, never from inside a sink.
+    func latencyVideoDecoded(seq: UInt64, decodedAgeUs: Int64) {
+        _ = ov_screen_latency_video_decoded(ptr, seq, decodedAgeUs)
     }
 
     /// Rolling per-stage latency medians (CAP_TIMING hosts). Session

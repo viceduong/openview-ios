@@ -1,5 +1,9 @@
-//! The H.264 encoder MFT (hardware first, software fallback).
+//! The H.264 / HEVC encoder MFT (hardware first; H.264 falls back to
+//! Microsoft's software MFT). Optional long-term-reference control
+//! ([`EncodeParams::ltr_slots`], [`FrameRefs`]) for loss recovery without
+//! an IDR.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID};
@@ -13,7 +17,9 @@ use super::mft::{
 };
 use super::{err, pack, startup, EncoderPref};
 use crate::error::AppError;
-use crate::video::{annexb_is_idr, bgra_to_nv12, EncodedAu, ParamSetCache, VideoEncode};
+use crate::video::{
+    bgra_to_nv12, EncodedAu, FrameRefs, LtrInfo, ParamSetCache, VideoCodec, VideoEncode,
+};
 
 /// The rate-control buffer (VBV, bits) for `bitrate` at `fps`: one
 /// frame's worth (floor 64 kbit, so tiny bitrates still fit an I-macroblock
@@ -64,10 +70,14 @@ pub(super) struct EncodeParams {
     /// Constant-QP rate control (quality mode) instead of CBR, for
     /// equal-quality size comparisons in benchmarks.
     pub qp: Option<u32>,
+    /// H.264 or HEVC (HEVC: hardware MFTs only, Main profile).
+    pub codec: VideoCodec,
+    /// Application-controlled long-term reference slots (0 = off).
+    pub ltr_slots: u8,
 }
 
 impl EncodeParams {
-    /// The production setup: CBR at `bitrate`, High profile.
+    /// The production setup: H.264 CBR at `bitrate`, High profile, no LTR.
     pub fn new(w: u32, h: u32, fps: u32, bitrate: u32) -> Self {
         Self {
             w,
@@ -76,6 +86,16 @@ impl EncodeParams {
             bitrate,
             profile: H264Profile::High,
             qp: None,
+            codec: VideoCodec::H264,
+            ltr_slots: 0,
+        }
+    }
+
+    /// The `MF_MT_SUBTYPE` of the encoder's output.
+    pub(super) fn subtype(&self) -> GUID {
+        match self.codec {
+            VideoCodec::H264 => MFVideoFormat_H264,
+            VideoCodec::Hevc => MFVideoFormat_HEVC,
         }
     }
 }
@@ -155,12 +175,16 @@ pub(super) fn check_size(w: u32, h: u32) -> Result<(), AppError> {
 unsafe fn set_output_type(mft: &IMFTransform, p: &EncodeParams) -> Result<H264Profile, AppError> {
     let mut first = None;
     for profile in [p.profile, H264Profile::Main] {
+        let mf_profile = match p.codec {
+            VideoCodec::H264 => profile.mf(),
+            VideoCodec::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
+        };
         // SAFETY: MF calls on a media type created here and on the caller's
         // live transform (see the function contract).
         let r = unsafe {
-            video_type(&MFVideoFormat_H264, p.w, p.h, p.fps).and_then(|out| {
+            video_type(&p.subtype(), p.w, p.h, p.fps).and_then(|out| {
                 out.SetUINT32(&MF_MT_AVG_BITRATE, p.bitrate)?;
-                out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile.mf())?;
+                out.SetUINT32(&MF_MT_MPEG2_PROFILE, mf_profile)?;
                 mft.SetOutputType(0, &out, 0)
             })
         };
@@ -171,7 +195,7 @@ unsafe fn set_output_type(mft: &IMFTransform, p: &EncodeParams) -> Result<H264Pr
                 first.get_or_insert(e);
             }
         }
-        if p.profile == H264Profile::Main {
+        if p.profile == H264Profile::Main || p.codec == VideoCodec::Hevc {
             break;
         }
     }
@@ -179,7 +203,8 @@ unsafe fn set_output_type(mft: &IMFTransform, p: &EncodeParams) -> Result<H264Pr
     Err(err("SetOutputType", e))
 }
 
-/// Hardware-or-software H.264 encoder MFT (see the module docs).
+/// Hardware-or-software H.264 (or hardware HEVC) encoder MFT (see the
+/// module docs).
 pub struct H264Encoder {
     mft: IMFTransform,
     activate: Option<IMFActivate>,
@@ -189,6 +214,17 @@ pub struct H264Encoder {
     hardware: bool,
     profile: H264Profile,
     caps: EncoderCaps,
+    codec: VideoCodec,
+    /// LTR slots in effect (0 = LTR control off / unsupported).
+    ltr_slots: u8,
+    /// Reference control for the next submitted picture.
+    next_refs: FrameRefs,
+    /// What was asked per submitted sample time (for MFTs that do not
+    /// report `MFSampleExtension_LongTermReferenceFrameInfo`).
+    asked: VecDeque<(i64, FrameRefs)>,
+    /// LTR slots the MFT auto-marks after a keyframe that are still free
+    /// (emulation for MFTs that do not report LTR info).
+    auto_marks: u8,
     pub(super) w: u32,
     pub(super) h: u32,
     fps: u32,
@@ -227,7 +263,7 @@ impl H264Encoder {
         // function owns; MF + COM were initialised by `startup` above.
         unsafe {
             if pref != EncoderPref::Software {
-                for a in hardware_encoders() {
+                for a in hardware_encoders(&p.subtype()) {
                     let name = friendly_name(&a);
                     match a.ActivateObject::<IMFTransform>() {
                         Ok(mft) => match Self::configure(
@@ -248,10 +284,10 @@ impl H264Encoder {
                     }
                 }
                 if why.is_empty() {
-                    why.push("no hardware H.264 encoder registered".into());
+                    why.push(format!("no hardware {} encoder registered", p.codec));
                 }
             }
-            if pref != EncoderPref::Hardware {
+            if pref != EncoderPref::Hardware && p.codec == VideoCodec::H264 {
                 let mft: IMFTransform =
                     CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
                         .map_err(|e| err("software H.264 encoder", e))?;
@@ -328,6 +364,15 @@ impl H264Encoder {
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 // Long GOP (an IDR every ~60 s as a safety net); IDRs on demand.
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps.max(1) * 60));
+                if p.ltr_slots > 0 {
+                    // N application-controlled slots, trust mode 1 ("trust
+                    // until" invalidated by UseLTRFrame). A static setting:
+                    // before the media types.
+                    set(
+                        &CODECAPI_AVEncVideoLTRBufferControl,
+                        VARIANT::from(u32::from(p.ltr_slots) | (1 << 16)),
+                    );
+                }
             }
             let profile = set_output_type(&mft, p)?;
             let inp =
@@ -370,7 +415,22 @@ impl H264Encoder {
                 .GetOutputStreamInfo(0)
                 .map_err(|e| err("output stream info", e))?;
             let caps = EncoderCaps::probe(api.as_ref());
-            tracing::debug!(encoder = %name, ?profile, ?caps, "H.264 encoder created");
+            // LTR control only when the MFT supports all three knobs and
+            // took the slot count.
+            let ltr_slots = if p.ltr_slots > 0 && caps.ltr() {
+                match caps.ltr_slots {
+                    Some(n) if n > 0 => n.min(u32::from(p.ltr_slots)) as u8,
+                    // Not readable: trust the set.
+                    None => p.ltr_slots,
+                    Some(_) => 0,
+                }
+            } else {
+                0
+            };
+            tracing::debug!(
+                encoder = %name, codec = %p.codec, ?profile, ?caps, ltr_slots,
+                "video encoder created"
+            );
             Ok(Self {
                 mft,
                 activate,
@@ -380,6 +440,11 @@ impl H264Encoder {
                 hardware,
                 profile,
                 caps,
+                codec: p.codec,
+                ltr_slots,
+                next_refs: FrameRefs::default(),
+                asked: VecDeque::new(),
+                auto_marks: 0,
                 w,
                 h,
                 fps: fps.max(1),
@@ -387,7 +452,7 @@ impl H264Encoder {
                 out_info,
                 need_input: 0,
                 outputs: 0,
-                ps: ParamSetCache::default(),
+                ps: ParamSetCache::new(p.codec),
                 scratch: Vec::new(),
                 last_time: i64::MIN,
                 gpu: None,
@@ -413,6 +478,111 @@ impl H264Encoder {
     /// The picture size `(w, h)` the encoder was created for.
     pub fn size(&self) -> (u32, u32) {
         (self.w, self.h)
+    }
+
+    /// The codec this encoder produces.
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
+    /// LTR slots under application control (0 = off / unsupported).
+    pub fn ltr_slots(&self) -> u8 {
+        self.ltr_slots
+    }
+
+    /// Reference control for the next picture (see [`FrameRefs`]).
+    pub fn set_frame_refs(&mut self, refs: FrameRefs) {
+        if self.ltr_slots > 0 {
+            self.next_refs = refs;
+        }
+    }
+
+    /// Apply the pending [`FrameRefs`] to the next picture (submitted with
+    /// sample time `t`).
+    ///
+    /// # Safety
+    /// Calls the encoder's own live codec API.
+    unsafe fn apply_refs(&mut self, t: i64, force_idr: bool) {
+        let refs = std::mem::take(&mut self.next_refs);
+        let Some(api) = &self.api else {
+            return;
+        };
+        if self.ltr_slots == 0 {
+            return;
+        }
+        let n = self.ltr_slots;
+        let mark = refs.mark_ltr.filter(|&k| k < n);
+        let use_mask = refs.use_ltr & ((1u16 << n) - 1);
+        // SAFETY: best-effort ICodecAPI calls on the encoder's own
+        // interface with valid VARIANT references (function contract).
+        unsafe {
+            if let Some(k) = mark {
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncVideoMarkLTRFrame,
+                    &VARIANT::from(u32::from(k)),
+                );
+            }
+            if use_mask != 0 && !force_idr {
+                // Bits 16..31 = 1: later pictures use nothing older.
+                let v = u32::from(use_mask) | (1 << 16);
+                let _ = api.SetValue(&CODECAPI_AVEncVideoUseLTRFrame, &VARIANT::from(v));
+            }
+        }
+        let asked = FrameRefs {
+            mark_ltr: mark,
+            use_ltr: if force_idr { 0 } else { use_mask },
+        };
+        self.asked.push_back((t, asked));
+        while self.asked.len() > 16 {
+            self.asked.pop_front();
+        }
+    }
+
+    /// The LTR info of output picture `s` (sample time `t`): what the MFT
+    /// reports, or else what was asked for plus the documented auto-marking
+    /// of the first `ltr_slots` pictures from a keyframe.
+    ///
+    /// # Safety
+    /// `s` must be a live sample the encoder just produced.
+    unsafe fn ltr_info(&mut self, s: &IMFSample, t: i64, keyframe: bool) -> LtrInfo {
+        if self.ltr_slots == 0 {
+            return LtrInfo::default();
+        }
+        let asked = self
+            .asked
+            .iter()
+            .position(|&(at, _)| at == t)
+            .and_then(|i| self.asked.remove(i))
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        // SAFETY: an attribute read on the live output sample.
+        let reported = unsafe { s.GetUINT32(&MFSampleExtension_LongTermReferenceFrameInfo) };
+        if let Ok(v) = reported {
+            let idx = (v & 0xFFFF) as u16;
+            return LtrInfo {
+                marked: (idx != 0xFFFF && idx < u16::from(self.ltr_slots)).then_some(idx as u8),
+                used: (v >> 16) as u16,
+            };
+        }
+        // Emulation: a keyframe drops every LTR; the MFT then marks the
+        // keyframe and the following pictures into the free slots.
+        if keyframe {
+            self.auto_marks = 0;
+        }
+        let marked = asked.mark_ltr.or_else(|| {
+            (self.auto_marks < self.ltr_slots).then(|| {
+                let k = self.auto_marks;
+                self.auto_marks += 1;
+                k
+            })
+        });
+        if let Some(k) = asked.mark_ltr {
+            self.auto_marks = self.auto_marks.max(k + 1);
+        }
+        LtrInfo {
+            marked,
+            used: asked.use_ltr,
+        }
     }
 
     /// Encode one NV12 picture already in `nv12` (see [`encode`](VideoEncode::encode)).
@@ -457,6 +627,7 @@ impl H264Encoder {
                     let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
                 }
             }
+            self.apply_refs(t, force_idr);
             let mut out = Vec::new();
             match self.events.clone() {
                 Some(ev) => self.encode_async(&ev, &sample, &mut out)?,
@@ -525,12 +696,14 @@ impl H264Encoder {
                         let data = self.ps.fix(std::mem::take(&mut self.scratch));
                         // The bitstream is the truth (MFSampleExtension_CleanPoint
                         // is not set by every MFT).
-                        let keyframe = annexb_is_idr(&data);
+                        let keyframe = self.codec.annexb_is_keyframe(&data);
+                        let ltr = self.ltr_info(&s, t, keyframe);
                         self.outputs += 1;
                         return Ok(Some(EncodedAu {
                             data,
                             keyframe,
                             pts_us: (t / 10).max(0) as u64,
+                            ltr,
                         }));
                     }
                 }
@@ -645,6 +818,18 @@ impl VideoEncode for H264Encoder {
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
+    fn ltr_slots(&self) -> u8 {
+        self.ltr_slots
+    }
+
+    fn set_frame_refs(&mut self, refs: FrameRefs) {
+        H264Encoder::set_frame_refs(self, refs);
     }
 }
 

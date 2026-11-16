@@ -1,5 +1,5 @@
-//! Media Foundation H.264 encoder / decoder MFTs (Windows, `mf` feature —
-//! `ovhost` encodes, `ovview` decodes).
+//! Media Foundation H.264 / HEVC encoder / decoder MFTs (Windows, `mf`
+//! feature — `ovhost` encodes, `ovview` decodes).
 //!
 //! **Encoder** ([`H264Encoder`]): a hardware MFT first (NVENC / AMF / Quick
 //! Sync through `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE)`, driven with the async
@@ -8,9 +8,14 @@
 //! at run time from the link pacer), High profile ([`H264Profile`]; Main if
 //! the MFT refuses it), a long GOP and IDR on demand
 //! (`CODECAPI_AVEncVideoForceKeyFrame`). Optional features (LTR, intra
-//! refresh) are probed once into [`EncoderCaps`]. Input is system-memory NV12
+//! refresh) are probed once into [`EncoderCaps`]; with LTR slots requested
+//! (`EncoderSpec::ltr_slots`) the encoder marks / predicts from long-term
+//! references on demand ([`crate::video::FrameRefs`]) for loss recovery
+//! without an IDR. HEVC ([`crate::video::VideoCodec::Hevc`], Main profile)
+//! uses hardware MFTs only, same settings. Input is system-memory NV12
 //! converted from the captured BGRA on the CPU ([`crate::video::bgra_to_nv12`]).
-//! Output is Annex-B; every IDR is made self-contained (SPS/PPS) by
+//! Output is Annex-B; every keyframe is made self-contained (SPS/PPS, HEVC
+//! also VPS) by
 //! [`ParamSetCache`](crate::video::ParamSetCache).
 //!
 //! **GPU input** ([`H264Encoder::new_gpu`], [`MfVideoEncoder`]): a hardware
@@ -18,22 +23,33 @@
 //! texture by the D3D11 video processor, skipping the CPU conversion and the
 //! system-memory upload.
 //!
-//! **Decoder** ([`H264Decoder`]): Microsoft's H.264 decoder MFT (software,
-//! low-latency mode: one access unit in, one picture out), NV12 converted to
-//! BGRA on the CPU.
+//! **Decoder** ([`MfVideoDecoder`]): Microsoft's H.264 decoder MFT, or an
+//! HEVC decoder MFT when one is installed (low-latency mode: one access unit
+//! in, one picture out). In software it yields system-memory NV12 converted
+//! to BGRA on the CPU. Given a [`GpuTarget`] (the viewer's Direct2D device and
+//! picture slot) it decodes through DXVA into D3D11 surfaces and presents
+//! zero-copy: the D3D11 video processor converts each picture to a BGRA
+//! texture that the renderer draws directly ([`GpuPictureSlot`]).
 //!
-//! Layout: `encoder` (the encoder MFT), `decoder` (the decoder MFT),
-//! `gpu` (D3D11 input), `mft` (shared MFT plumbing), and here the
+//! Layout: `encoder` (the encoder MFT), `decoder` (the decoder MFT), `dxva`
+//! (decoder-side D3D11: picture slot, NV12 -> BGRA conversion), `gpu`
+//! (D3D11 input), `mft` (shared MFT plumbing), and here the
 //! availability probe, start-up and the host-facing [`MfVideoEncoder`].
 
 mod decoder;
+#[cfg(test)]
+mod decoder_tests;
+mod dxva;
 mod encoder;
 mod gpu;
+#[cfg(test)]
+mod ltr_tests;
 mod mft;
 #[cfg(test)]
 mod tests;
 
-pub use decoder::H264Decoder;
+pub use decoder::{H264Decoder, MfVideoDecoder};
+pub use dxva::{GpuPicture, GpuPictureSlot, GpuTarget};
 pub use encoder::{EncoderCaps, H264Encoder, H264Profile};
 pub use gpu::{gpu_device, GpuFrame};
 
@@ -44,7 +60,8 @@ use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_LITE, MF_VERSI
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use crate::error::AppError;
-use crate::video::{EncodedAu, VideoEncode};
+use crate::video::{EncodedAu, EncoderSpec, FrameRefs, VideoCodec, VideoEncode};
+use encoder::EncodeParams;
 
 /// Why [`available`] is false, for logs and errors.
 pub const UNAVAILABLE: &str =
@@ -120,10 +137,7 @@ fn pack(hi: u32, lo: u32) -> u64 {
 /// input; any GPU failure falls back to the CPU path for good.
 pub struct MfVideoEncoder {
     enc: H264Encoder,
-    w: u32,
-    h: u32,
-    fps: u32,
-    bitrate: u32,
+    params: EncodeParams,
     pref: EncoderPref,
     gpu_failed: bool,
     /// Why the GPU input path was abandoned (set once it fell back to CPU).
@@ -131,9 +145,9 @@ pub struct MfVideoEncoder {
 }
 
 impl MfVideoEncoder {
-    /// A CPU-input encoder for `w x h` at `fps` and `bitrate` bits/s; GPU
-    /// input is tried on the first [`VideoEncode::encode_gpu`] call (never
-    /// with [`EncoderPref::Software`]).
+    /// A CPU-input H.264 encoder for `w x h` at `fps` and `bitrate` bits/s;
+    /// GPU input is tried on the first [`VideoEncode::encode_gpu`] call
+    /// (never with [`EncoderPref::Software`]).
     pub fn new(
         w: u32,
         h: u32,
@@ -141,16 +155,34 @@ impl MfVideoEncoder {
         bitrate: u32,
         pref: EncoderPref,
     ) -> Result<Self, AppError> {
+        Self::with_params(EncodeParams::new(w, h, fps, bitrate), pref)
+    }
+
+    /// An encoder for a session's [`EncoderSpec`] (codec, LTR slots). HEVC
+    /// needs a hardware MFT; the error then lets the caller fall back to
+    /// H.264.
+    pub fn with_spec(spec: &EncoderSpec, pref: EncoderPref) -> Result<Self, AppError> {
+        let params = EncodeParams {
+            codec: spec.codec,
+            ltr_slots: spec.ltr_slots,
+            ..EncodeParams::new(spec.w, spec.h, spec.fps, spec.bitrate)
+        };
+        Self::with_params(params, pref)
+    }
+
+    fn with_params(params: EncodeParams, pref: EncoderPref) -> Result<Self, AppError> {
         Ok(Self {
-            enc: H264Encoder::new(w, h, fps, bitrate, pref)?,
-            w,
-            h,
-            fps,
-            bitrate,
+            enc: H264Encoder::with_params(&params, pref)?,
+            params,
             pref,
             gpu_failed: pref == EncoderPref::Software,
             gpu_error: None,
         })
+    }
+
+    /// A fresh CPU-input encoder with the current parameters.
+    fn cpu_encoder(&self) -> Result<H264Encoder, AppError> {
+        H264Encoder::with_params(&self.params, self.pref)
     }
 }
 
@@ -165,7 +197,7 @@ impl VideoEncode for MfVideoEncoder {
         if self.enc.is_gpu() {
             // A GPU encoder fed from memory (no GPU frame this time): the
             // texture path is unavailable for this capture; back to CPU.
-            self.enc = H264Encoder::new(self.w, self.h, self.fps, self.bitrate, self.pref)?;
+            self.enc = self.cpu_encoder()?;
             self.gpu_failed = true;
         }
         self.enc.encode(bgra, stride, force_idr, pts_us)
@@ -183,7 +215,7 @@ impl VideoEncode for MfVideoEncoder {
         }
         let f = frame.downcast_ref::<GpuFrame>()?;
         if !self.enc.is_gpu() {
-            match H264Encoder::new_gpu(&f.device, self.w, self.h, self.fps, self.bitrate) {
+            match H264Encoder::new_gpu_with(&f.device, &self.params) {
                 Ok(e) => self.enc = e,
                 Err(e) => {
                     self.gpu_failed = true;
@@ -198,7 +230,7 @@ impl VideoEncode for MfVideoEncoder {
                 // Fall back to the CPU encoder (a fresh IDR follows).
                 self.gpu_failed = true;
                 self.gpu_error = Some(e.to_string());
-                match H264Encoder::new(self.w, self.h, self.fps, self.bitrate, self.pref) {
+                match self.cpu_encoder() {
                     Ok(c) => {
                         self.enc = c;
                         None
@@ -210,11 +242,23 @@ impl VideoEncode for MfVideoEncoder {
     }
 
     fn set_bitrate(&mut self, bps: u32) {
-        self.bitrate = bps;
+        self.params.bitrate = bps;
         self.enc.set_bitrate(bps);
     }
 
     fn name(&self) -> String {
         self.enc.name()
+    }
+
+    fn codec(&self) -> VideoCodec {
+        self.enc.codec()
+    }
+
+    fn ltr_slots(&self) -> u8 {
+        self.enc.ltr_slots()
+    }
+
+    fn set_frame_refs(&mut self, refs: FrameRefs) {
+        self.enc.set_frame_refs(refs);
     }
 }

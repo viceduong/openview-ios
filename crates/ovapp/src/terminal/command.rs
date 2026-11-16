@@ -56,6 +56,9 @@ pub enum OpCode {
     ReleaseAll = 0x3B,
     /// Input v2: secure attention sequence (Ctrl+Alt+Del).
     Sas = 0x3C,
+    /// The viewer's visible rect + scale (viewer -> host;
+    /// [`CAP_VIEWPORT`](super::CAP_VIEWPORT)).
+    Viewport = 0x3D,
     /// Remote cursor shape (host -> viewer): bitmap + hotspot.
     CursorShape = 0x33,
     /// Quality request (viewer -> host): the viewer's target capture rate in fps.
@@ -80,6 +83,12 @@ pub enum OpCode {
     VideoBegin = 0x25,
     /// Ask the host for an H.264 IDR (viewer -> host).
     VideoIdrRequest = 0x26,
+    /// The viewer decoded a long-term-reference picture (viewer -> host;
+    /// [`CAP_LTR`](super::CAP_LTR)): `8B seq` BE.
+    VideoLtrAck = 0x28,
+    /// Recover the video chain from a long-term reference (viewer -> host;
+    /// [`CAP_LTR`](super::CAP_LTR)): `8B ltr_seq` BE.
+    VideoRecover = 0x29,
     /// Direct-path candidates (host -> viewer; CAPS-gated by
     /// [`CAP_DIRECT`]).
     DirectCandidates = 0x61,
@@ -132,6 +141,7 @@ impl OpCode {
             0x3A => Self::Text,
             0x3B => Self::ReleaseAll,
             0x3C => Self::Sas,
+            0x3D => Self::Viewport,
             0x33 => Self::CursorShape,
             0x36 => Self::QualitySet,
             0x37 => Self::CaptureRegion,
@@ -143,6 +153,8 @@ impl OpCode {
             0x60 => Self::Caps,
             0x25 => Self::VideoBegin,
             0x26 => Self::VideoIdrRequest,
+            0x28 => Self::VideoLtrAck,
+            0x29 => Self::VideoRecover,
             0x61 => Self::DirectCandidates,
             0x62 => Self::SessionOption,
             0x27 => Self::VideoUnit,
@@ -477,6 +489,24 @@ pub enum Command {
         /// Requested capture rate in fps (`0` = AUTO).
         target_fps: u16,
     },
+    /// VIEWPORT (viewer -> host, only to a host with
+    /// [`CAP_VIEWPORT`](super::CAP_VIEWPORT)): the part of the remote
+    /// screen the viewer shows, in remote (captured-frame) pixels, and its
+    /// display scale. The host sends tiles inside it first and defers the
+    /// rest. `w == 0 || h == 0` = no viewport (everything equal).
+    Viewport {
+        /// Left edge (remote pixels).
+        x: u16,
+        /// Top edge (remote pixels).
+        y: u16,
+        /// Width (remote pixels).
+        w: u16,
+        /// Height (remote pixels).
+        h: u16,
+        /// Display scale x 1000 (on-screen points per remote pixel; 1000 =
+        /// 1:1, 500 = zoomed out to half).
+        scale_milli: u16,
+    },
     /// CAPTURE_REGION (viewer -> host): the rect the host should
     /// capture — `(x, y, w, h)` in virtual-desktop coordinates, typically a
     /// whole monitor's rect from the last `MonitorsInfo`. The host validates
@@ -566,6 +596,22 @@ pub enum Command {
     VideoIdrRequest {
         /// Last video sequence number received (informational).
         have_seq: u64,
+    },
+    /// VIDEO_LTR_ACK (viewer -> host, [`CAP_LTR`](super::CAP_LTR)): the
+    /// viewer decoded the [`VIDEO_LTR`](crate::video::VIDEO_LTR) picture
+    /// `seq`; the host may now recover from it.
+    VideoLtrAck {
+        /// The acknowledged unit's video seq.
+        seq: u64,
+    },
+    /// VIDEO_RECOVER (viewer -> host, [`CAP_LTR`](super::CAP_LTR)): the
+    /// chain broke through loss; the viewer still holds the long-term
+    /// reference `ltr_seq` and asks for a
+    /// [`VIDEO_RECOVERY`](crate::video::VIDEO_RECOVERY) picture predicted
+    /// from it (the host sends an IDR when it cannot).
+    VideoRecover {
+        /// The newest LTR picture the viewer decoded.
+        ltr_seq: u64,
     },
     /// DIRECT_CANDIDATES (host -> viewer): `(kind, addr)` pairs
     /// ([`CAND_LAN`], ...) the viewer probes for a direct UDP path. Wire:

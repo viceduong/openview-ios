@@ -7,7 +7,7 @@ and documented in
 [docs/crates/ovffi.md](crates/ovffi.md). The Swift side does four things:
 
 - owns the sockets (UDP, WebSocket),
-- renders with Metal or VideoToolbox,
+- renders with Metal (tiles, plus H.264 / HEVC decoded by VideoToolbox and composited into the same frame),
 - turns touch, pointer and keyboard input into wire commands,
 - provides the UI.
 
@@ -40,7 +40,7 @@ paths below are relative to that folder unless noted.
 | **Session/** | |
 | `SessionController.swift` | Session engine: published state, phases and reconnects, app lifecycle; the threading model is documented at the top |
 | `SessionController+Transport.swift` | Dialing, relay / UDP / direct-path wiring, pumps, watchdog, error routing, teardown |
-| `SessionController+Screen.swift` | Screen-assembler sinks, H.264 hand-off, coalesced screen flush to main |
+| `SessionController+Screen.swift` | Screen-assembler sinks, video decode hand-off and recovery, coalesced screen flush to main |
 | `SessionController+Commands.swift` | Outbound commands: input, quality, monitor, desktop effects, clipboard, chat |
 | `SessionController+Files.swift` | Sending and receiving files |
 | `SessionModels.swift` | `SessionPhase`, `SessionError`, `LogLine`, `ChatMessage`, `ReceivedFile`, `IdentityMismatch` |
@@ -53,7 +53,6 @@ paths below are relative to that folder unless noted.
 | `SessionController+Latency.swift`, `LatencyBreakdown.swift` | Latency telemetry: presents reported to `ov_screen_latency_presented`, the breakdown read twice a second (`ov_screen_latency_stats`) into `LivenessModel.latency`; `LatencyRows` for the session sheet |
 | `SessionSheets.swift` | Session menu, chat, files, session log, `DocumentPicker`, `ShareSheet` |
 | `FloatingToolbar.swift` | Collapsible toolbar pill and drag handle |
-| `KeyBarToolbarLink.swift` | Shares toolbar state and actions with the key bar (keyboard-up handle) |
 | **Screen/** | |
 | `RemoteScreenSurface.swift` | `RemoteScreenSurface` (SwiftUI wrapper) and `RemoteSurfaceView`: layers, rendering, cursor, keyboard |
 | `RemoteSurfaceView+Viewport.swift` | Safe area / keyboard geometry, zoom presets, cursor-following viewport |
@@ -62,8 +61,9 @@ paths below are relative to that folder unless noted.
 | `ViewportMath.swift` | Pure zoom-scale math (fit / fill / 1:1 / open default, clamp, snap) |
 | `ScreenModel.swift` | `ScreenModel`, `LivenessModel`, `PendingScreen` |
 | `FrameImage.swift` | CGImage builders (fallback path, cursor sprites) |
-| `MetalScreenRenderer.swift`, `RemoteScreen.metal` | `MetalContext`, `FrameUploadQueue`, `MetalScreenRenderer`; scaling and sharpening shaders |
-| `RemoteVideo.swift` | `RemoteVideoPacket`, `H264SampleBuilder`, `VideoOverlay` |
+| `MetalScreenRenderer.swift`, `RemoteScreen.metal` | `MetalContext`, `FrameUploadQueue`, `MetalScreenRenderer`; scaling, sharpening and YUV video compositing shaders |
+| `RemoteVideo.swift` | `RemoteVideoPacket`, `VideoFormat`, `VideoFrameQueue`, `VideoDecoder` (VTDecompressionSession, H.264 / HEVC) |
+| `VideoPacing.swift` | `VideoFramePacer` (newest-wins slot), `YUVToRGB` (matrix selection); pure, unit-tested |
 | **Input/** | |
 | `RemoteInput.swift` | `InputWire` encoders, `KeyStroke`, `ZoomPreset`, `RemoteInputController`, `PowerGovernor`, `FrameTicker` |
 | `TrackpadTouchRecognizer.swift`, `FlingTracker.swift` | One-finger touch source; scroll inertia (touch and trackpad) |
@@ -161,7 +161,7 @@ dialing(transport) ─► authenticating ─► waitingForFirstFrame ─► live
 
 | Trigger | Effect |
 |---|---|
-| `start()` (from `SessionContainer.onAppear`) | Wires clipboard, input and video failure, then `beginAttempt()` |
+| `start()` (from `SessionContainer.onAppear`) | Wires clipboard, input and latency reporting, then `beginAttempt()` |
 | `beginAttempt()` | Plans the attempt's legs (`TransportPlan`, see 4.3.1), then `launchAttempt()` |
 | `launchAttempt()` | Increments the `generation`, resets per-attempt UI, arms the **15 s handshake timeout** (and the **3 s LAN probe** on a LAN leg with a relay behind it), runs `startOnQueue` |
 | `startOnQueue` | Resets attempt state, installs screen sinks on a fresh `OvScreenBox`, calls `SessionDialer.dial`, wires the transport, first `pump()`, starts a 50 ms `DispatchSourceTimer` (`tick`) |
@@ -486,27 +486,70 @@ on `ScreenModel.image`.
   (`CADisableMinimumFrameDurationOnPhone`), or 60 Hz when the governor is
   constrained.
 
-### 5.3 H.264 overlay (VideoToolbox)
+### 5.3 Hardware video (VideoToolbox decode, composited in Metal)
 
-This is enabled only if `VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)`
-(`H264SampleBuilder.available`). When enabled, `enableVideo()` advertises
-`CAP_H264`, and the host streams high-motion regions as H.264.
+Video is enabled only on the Metal path (`MetalContext.supportsVideo`: the
+`ov_yuv_composite` shader compiled) and when
+`VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)`
+(`RemoteVideoCodec.h264.hardwareDecodable`). Then `enableVideo()` advertises
+`CAP_H264` (and `CAP_LTR`); when the user enabled Settings > Display > HEVC
+video (experimental, default off) and the device decodes HEVC in hardware,
+`enableVideoHevc()` calls `ov_screen_set_video_caps(OV_VIDEO_CAP_HEVC |
+OV_VIDEO_CAP_LTR)` so `CAP_HEVC` goes out too. The host streams high-motion
+regions as H.264 or HEVC (`ov_video_packet.codec` 1 / 2).
 
-1. `OvScreenBox` copies the `ov_video_packet` into a `RemoteVideoPacket`.
-2. `H264SampleBuilder` builds a `CMVideoFormatDescription` from SPS and PPS.
-   It re-creates it with colour tags (YCbCr matrix, primaries, transfer,
-   full range) from the packet's VUI code points.
-3. It wraps the AVCC data in a `CMSampleBuffer` marked `DisplayImmediately`
-   (P-frames are also marked `NotSync`).
-4. `VideoOverlay` enqueues the sample on an `AVSampleBufferDisplayLayer`
-   positioned at the region's rect over the frame. Decoding happens inside
-   the layer.
-5. If a unit cannot be built, or the layer reports `.failed`, the app calls
-   `ov_screen_request_video_idr`, deferred to the session queue.
-6. `OV_VIDEO_END` marks the current video generation. The overlay is hidden
-   when the next (lossless refresh) frame is **presented**
-   (`requestHide` / `takePendingHide`), with a 0.5 s safety timer. This
-   avoids a stale flash.
+1. `OvScreenBox` copies the `ov_video_packet` into a `RemoteVideoPacket`
+   (codec, VPS for HEVC, SPS, PPS, length-prefixed body, colour code points).
+2. Session queue, `VideoDecoder`: a keyframe with new parameter sets, codec
+   or range builds a `CMVideoFormatDescription`
+   (`CMVideoFormatDescriptionCreateFromH264ParameterSets` /
+   `...FromHEVCParameterSets`, re-created with colour tags) and a fresh
+   `VTDecompressionSession` (`kVTDecompressionPropertyKey_RealTime`, output
+   `420YpCbCr8BiPlanarVideoRange` or `FullRange` to match the stream,
+   IOSurface-backed, Metal-compatible). Each unit is decoded
+   asynchronously (`_EnableAsynchronousDecompression`).
+3. VideoToolbox thread: the decoded `CVPixelBuffer` goes into
+   `VideoFrameQueue`, a newest-wins slot (`VideoFramePacer`): at most one
+   picture waits, a newer one replaces it (counted as dropped). A picture
+   landing in the empty slot asks the surface for a redraw; the decode time
+   goes to Rust (`ov_screen_latency_video_decoded`).
+4. Main, next `CADisplayLink` tick (`FrameTicker`, up to 120 Hz on
+   ProMotion, 60 Hz when constrained): `MetalScreenRenderer.render` blits
+   the staged tile uploads, then takes the newest picture, wraps its two
+   planes as `r8Unorm` / `rg8Unorm` textures (`CVMetalTextureCache`, no
+   copy) and draws `ov_yuv_composite` into the frame texture at the video
+   rect: YCbCr -> R'G'B' with the stream's matrix (`YUVToRGB`: BT.709
+   default, BT.601 / BT.2020 / SMPTE 240M from the VUI code point, video or
+   full range). The area downscale / bilinear + sharpen passes then read
+   the frame texture, so video is scaled and sharpened exactly like tiles,
+   in the same command buffer. The picture is held while its motion period
+   runs and re-composited whenever uploads land (a full re-stage would
+   otherwise put pre-motion tiles back over it).
+5. `OV_VIDEO_END` ends the motion period (`VideoFrameQueue.end`): pictures
+   still in the decoder or the slot are refused. The last composited
+   picture stays in the frame texture until the lossless refresh (the next
+   frame) overwrites it, so there is no overlay to hide and no stale flash.
+6. Recovery: a unit that cannot be decoded (no session / keyframe yet,
+   unusable parameter sets, unknown codec), a synchronous
+   `VTDecompressionSessionDecodeFrame` error, or an asynchronous decode
+   error calls `ov_screen_request_video_idr` (deferred to the session
+   queue; Rust rate-limits it, drops P-frames until recovery, and asks for
+   an IDR). `kVTInvalidSessionErr` (app backgrounded) drops the session;
+   the next keyframe creates a new one. Losses in transit are handled by
+   Rust (`VIDEO_RECOVER` with `CAP_LTR`); the recovery P-frames are ordinary
+   in-stream syntax for VideoToolbox.
+7. Latency: video's decode stage ends at the VideoToolbox output callback,
+   its present stage at the `presentedTime` of the first drawable drawn
+   after that callback (the drawable that contains the picture).
+
+**Fallbacks.** No Metal (CGImage path) or no YUV compositor: `CAP_H264` is
+not advertised; the host sends lossless tiles only. VideoToolbox session
+creation failing at runtime: the unit is answered with a recovery request
+(retried on every keyframe, logged with a failure count); meanwhile the
+region keeps its last framebuffer content until motion ends and the
+lossless refresh arrives. (The old `AVSampleBufferDisplayLayer` overlay is
+gone: CAPS go out once per connection, so the app cannot switch to tiles
+mid-session.)
 
 ### 5.4 Cursor
 
@@ -606,8 +649,6 @@ Touch always behaves as a trackpad:
   - With a sticky non-Shift modifier active, a single ASCII letter or digit
     is sent as that key, so Ctrl+C works.
   - Otherwise text is sent as TEXT, or as per-character KEYs for old hosts.
-- `KeyAccessoryBar` draws the collapsed toolbar handle above its top-right
-  corner; it disappears at once when the keyboard hides.
 - `KeyAccessoryBar` is a horizontally scrolling ribbon:
   ⊞ Shift Ctrl Alt | ScrLk Fn | Esc Tab PrtScn Pause Ins Del Home End PgUp
   PgDn | ← ↑ → ↓.
@@ -638,12 +679,8 @@ Touch always behaves as a trackpad:
 - It collapses to a handle that can be dragged anywhere. The handle snaps to
   the nearest side edge and its position is persisted.
 - With "Fade toolbar when idle" on, it fades to 70% after 3 s.
-- It auto-collapses while the keyboard is up. The collapsed handle then sits
-  on the key bar (above its top-right corner), so it moves with the key row;
-  tapping it expands the toolbar over the keyboard.
-
-**`SessionContainer`** overlays, by phase:
-
+- It is hidden while the keyboard (or the key bar alone) is up and comes
+  back as soon as the keyboard starts hiding.
 - **Connecting**: dimmed last frame, spinner, step text, Cancel.
 - **Live**:
   - Stats chip (RTT colour dot, end-to-end latency "e2e" with a
@@ -902,7 +939,8 @@ auto-connect and the Bonjour browse.
   (`RelayAddress`), direct-path candidate parsing and LAN classification
   (`DirectPathSet.parse` / `classify`), the zoom math (`ViewportMath`) and
   the hosts' TXT records (`LanTxtRecord`) and the LAN / relay transport
-  plan (`TransportPlan`).
+  plan (`TransportPlan`), and the video frame pacer / YCbCr matrices
+  (`VideoFramePacer`, `YUVToRGB`).
   These source files are compiled into the test bundle directly, so the
   tests need neither the app host nor the Rust library.
 - The Rust side is covered by `cargo test -p ovffi`, including the check that

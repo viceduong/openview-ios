@@ -17,12 +17,13 @@ below comes from `crates/ovview/`. Paths are relative to the repository root.
 | `crates/ovview/src/session/keys.rs` | Local hotkeys (F1–F8, H, M), recording toggle |
 | `crates/ovview/src/session/stats.rs` | End-of-session summary, `wave2:` and `metrics:` lines |
 | `crates/ovview/src/session/probe.rs` | `--latency-probe N`: timed presses against `ovhost --latency-probe` |
+| `crates/ovview/src/session/viewport.rs` | `VIEWPORT` to a `CAP_VIEWPORT` host: the whole frame at the window's scale, sent when it changes |
 | `crates/ovview/src/window/mod.rs` | `RenderWindow`: a plain Win32 window through the `windows` crate, frame / cursor / HUD state |
 | `crates/ovview/src/window/wndproc.rs` | Window class and creation, message pump, the `WndProc` that paints and queues input |
 | `crates/ovview/src/window/paint.rs` | `WM_PAINT`: Direct2D, or the GDI `StretchDIBits` fallback (CPU-scaled downscale, `SRCCOPY`) |
 | `crates/ovview/src/window/overlay.rs` | GDI HUD overlay and dead-peer banner (`TextOutW`) |
 | `crates/ovview/src/window/cursor.rs` (+ `cursor/tests.rs`) | GDI-path cursor compositing into a cached frame copy (pure) |
-| `crates/ovview/src/window/d2d.rs` (+ `d2d/tests.rs`) | Direct2D presenter: flip-model swap chain, high-quality cubic scaling, cursor layer, DirectWrite HUD |
+| `crates/ovview/src/window/d2d.rs` (+ `d2d/tests.rs`) | Direct2D presenter: flip-model swap chain, high-quality cubic scaling, the decoder's GPU video picture, cursor layer, DirectWrite HUD |
 | `crates/ovview/src/localinput.rs` (+ `localinput/tests.rs`) | Pure math: client pixels → letterboxed content rect → 0..=65535; the `LocalEvent` type |
 | `crates/ovview/src/hud.rs` (+ `hud/tests.rs`) | HUD line formatting (pure) |
 | `crates/ovview/src/audio.rs` | Speaker playback thread over a jitter buffer |
@@ -122,21 +123,28 @@ After the handshake:
 2. **Direct path**: unless `--no-direct` is set, it binds
    `DirectSockets::bind(0)` and calls `term.enable_direct(..)`. The host offers
    candidates and the relay stays the fallback.
-3. **H.264** (Windows): unless `--no-h264` is set, it installs
-   `ovapp::mfcodec::H264Decoder`, which adds `CAP_H264` to the CAPS. On
-   failure, including a missing Media Foundation (`mfcodec::available()`
-   false on Windows N/KN without the Media Feature Pack; `mfplat.dll` is
-   delay-loaded so the exe still starts), it logs `no H.264 decoder (...);
-   lossless tiles only`.
-4. `announce_caps()`: advertises tile/zstd decoding, keyframe requests and the
-   other capabilities.
-5. Optional (hidden) `--send-file`.
-6. Installs the Ctrl-C handler (`SetConsoleCtrlHandler`, which sets a flag).
-7. Creates the render window (`open_window` → `RenderWindow::new`) unless
+3. Creates the render window (`open_window` → `RenderWindow::new`) unless
    `--no-window` is set (then no window exists at all). If creation fails, the
    viewer warns and continues headless. The renderer is chosen by
    `--renderer d2d|gdi` (`RendererPref::Direct2D { vsync }`, `vsync` from
-   `--vsync`).
+   `--vsync`). The window comes first because its Direct2D device is also
+   the video decoder's.
+4. **Video** (Windows): unless `--no-h264` is set, it installs
+   `ovapp::mfcodec::MfVideoDecoder` (`install_video_decoder`), which adds
+   `CAP_H264` to the CAPS, plus `CAP_HEVC` when an HEVC decoder MFT can be
+   created. With the Direct2D renderer it is opened on the renderer's D3D11
+   device (`RenderWindow::video_target`): DXVA decoding with zero-copy
+   present (see "Zero-copy video" below). Otherwise, or when the MFT refuses
+   the device, it decodes in software. The log line is `video decoder: H.264
+   (D3D11 / DXVA, zero-copy present)` or `... (software)`. On failure,
+   including a missing Media Foundation (`mfcodec::available()` false on
+   Windows N/KN without the Media Feature Pack; `mfplat.dll` is delay-loaded
+   so the exe still starts), it logs `no H.264 decoder (...); lossless tiles
+   only`.
+5. `announce_caps()`: advertises tile/zstd decoding, keyframe requests and the
+   other capabilities.
+6. Optional (hidden) `--send-file`.
+7. Installs the Ctrl-C handler (`SetConsoleCtrlHandler`, which sets a flag).
 8. Starts the speaker thread. It always runs, so F2 can enable playback later.
    It also starts the mic thread if `--mic` or `--audio-synth` was given.
 9. Installs the command hook (`session/hooks.rs`). The hook handles `MONITORS_INFO`, `AUDIO` (with
@@ -213,8 +221,21 @@ and emits a `peer_disconnected` status event:
 
 | `RendererPref` | How |
 |---|---|
-| `Direct2D` (default) | A D3D11 device (hardware, then WARP) with a flip-model DXGI swap chain. The frame is drawn with `D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC`. The remote cursor is a separate premultiplied layer, not baked into the frame. The HUD is drawn with DirectWrite. `SetMaximumFrameLatency(1)`. Present mode (`PresentMode`): by default `Present(0, DO_NOT_WAIT \| ALLOW_TEARING)` on a swap chain created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` when `DXGI_FEATURE_PRESENT_ALLOW_TEARING` is supported (else `Present(0, DO_NOT_WAIT)`); `--vsync` uses `Present(1, DO_NOT_WAIT)`. A refused present is retried on the next loop turn (`repaint_pending`). **Any failure** (no device, device removed) switches the window to GDI permanently. |
+| `Direct2D` (default) | A D3D11 device (hardware with video support, shared with the video decoder; then plain hardware; then WARP) with a flip-model DXGI swap chain. The frame is drawn with `D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC`. The remote cursor is a separate premultiplied layer, not baked into the frame. The HUD is drawn with DirectWrite. `SetMaximumFrameLatency(1)`. Present mode (`PresentMode`): by default `Present(0, DO_NOT_WAIT \| ALLOW_TEARING)` on a swap chain created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` when `DXGI_FEATURE_PRESENT_ALLOW_TEARING` is supported (else `Present(0, DO_NOT_WAIT)`); `--vsync` uses `Present(1, DO_NOT_WAIT)`. A refused present is retried on the next loop turn (`repaint_pending`). **Any failure** (no device, device removed) switches the window to GDI permanently. |
 | `Gdi` | `StretchDIBits` with `SRCCOPY` (`window/paint.rs`; the unit test `gdi_blit_copies_pixels` checks the blit really copies pixels). A real downscale first goes through the CPU scaler `ovapp::scale` (area + sharpen 0.5) and is then blitted 1:1. Other cases use `COLORONCOLOR`, or `HALFTONE` for a strong downscale. On this path the cursor is composited into a cached copy of the frame: a cursor move restores only the old cursor rect and blends the new one (`window/cursor.rs`). The HUD is drawn with `TextOutW` (`window/overlay.rs`). |
+
+**Zero-copy video.** With Direct2D on a hardware device that has video
+support, the D3D11 device is shared with the video decoder. Each decoded
+picture stays on the GPU: the decoder converts it to a BGRA texture with the
+D3D11 video processor and publishes it in the window's `GpuPictureSlot`. On
+every paint the renderer draws the frame bitmap, then that texture (a
+Direct2D bitmap on its DXGI surface, cached per texture) at the video rect,
+scaled like the frame, then the cursor and the HUD. No NV12 reaches the CPU
+and no framebuffer copy is made per video picture. The loop disables the
+slot (`RenderWindow::allow_gpu_video(false)`) while F6 records or
+`--latency-probe` runs, because both read every frame's pixels; the decoder
+then paints the framebuffer on the CPU again. GDI never draws GPU pictures,
+and a Direct2D failure disables the slot. The GDI path is CPU-only.
 
 The active renderer is logged as `renderer: <name>`. `ovgui` decides that a
 connection succeeded from the `peer_connected` status event on stdout, and

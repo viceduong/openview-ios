@@ -155,6 +155,7 @@ impl VideoEncode for FakeEnc {
         Ok(vec![EncodedAu {
             data: vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, bgra[0]],
             keyframe: key,
+            ltr: Default::default(),
             pts_us,
         }])
     }
@@ -176,7 +177,7 @@ impl VideoDecode for FakeDec {
     }
 }
 fn fake_factory() -> EncoderFactory {
-    Box::new(|_, _, _, _| Ok(Box::new(FakeEnc { first: true }) as Box<dyn VideoEncode>))
+    Box::new(|_| Ok(Box::new(FakeEnc { first: true }) as Box<dyn VideoEncode>))
 }
 
 /// CAPS negotiation: only a viewer with a decoder advertises CAP_H264,

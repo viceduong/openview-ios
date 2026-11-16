@@ -313,15 +313,19 @@ impl H264Encoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<Self, AppError> {
-        check_size(w, h)?;
-        let p = EncodeParams::new(w, h, fps, bitrate);
+        Self::new_gpu_with(device, &EncodeParams::new(w, h, fps, bitrate))
+    }
+
+    /// [`new_gpu`](Self::new_gpu) with explicit [`EncodeParams`] (codec, LTR).
+    pub(super) fn new_gpu_with(device: &ID3D11Device, p: &EncodeParams) -> Result<Self, AppError> {
+        check_size(p.w, p.h)?;
         startup()?;
         let mut why = Vec::new();
         // SAFETY: COM/MF calls on activation objects and transforms this
         // function owns and on the caller's live `device`; MF + COM were
         // initialised by `startup` above.
         unsafe {
-            for a in hardware_encoders() {
+            for a in hardware_encoders(&p.subtype()) {
                 let name = friendly_name(&a);
                 let (gpu, mgr) = GpuState::new(device)?;
                 match a.ActivateObject::<IMFTransform>() {
@@ -331,7 +335,7 @@ impl H264Encoder {
                             Some(a.clone()),
                             format!("{name} (hw, GPU input)"),
                             true,
-                            &p,
+                            p,
                             Some(&mgr),
                         ) {
                             Ok(mut e) => {
@@ -349,7 +353,7 @@ impl H264Encoder {
             }
         }
         if why.is_empty() {
-            why.push("no hardware H.264 encoder registered".into());
+            why.push(format!("no hardware {} encoder registered", p.codec));
         }
         Err(AppError::platform(why.join("; ")))
     }

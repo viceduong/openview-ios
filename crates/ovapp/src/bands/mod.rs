@@ -31,7 +31,8 @@
 //!                      u16 tile_count (1..=64), tile_count x (u16 col,
 //!                      u16 row), u32 jpeg_len, jpeg_len bytes
 //! u16 band_count       0..=MAX_BANDS
-//! band_count x 9 B:    u8 codec (0 raw, 1 DEFLATE, 2 zstd, 3 LZ4 block),
+//! band_count x 9 B:    u8 codec (0 raw, 1 DEFLATE, 2 zstd, 3 LZ4 block,
+//!                      4 palette + zstd: CAP_PALETTE, see [`palette`]),
 //!                      u32 raw_len, u32 wire_len
 //! band payloads back to back (wire_len bytes each)
 //! ```
@@ -39,7 +40,9 @@
 //! The bands decode independently (in parallel) and concatenate to the
 //! update's `total` uncompressed bytes (sum of `raw_len`); the container is
 //! exactly `compressed_len` bytes (header + sum of `wire_len`). The host
-//! picks LZ4 for low-ratio (photo-like) bands and zstd for the rest.
+//! picks LZ4 for low-ratio (photo-like) bands and zstd for the rest — as a
+//! palette band (few-colour text / UI chunks as palette + 1/2/4-bit
+//! indices before zstd) for a `CAP_PALETTE` viewer when that pays.
 //!
 //! # MOVE records (`CAP_MOVE`, deltas only)
 //!
@@ -75,8 +78,11 @@ use std::cell::RefCell;
 use rayon::prelude::*;
 
 use crate::error::AppError;
+#[cfg(any(doc, test))]
 use crate::terminal::FrameCodec;
 use crate::tiles::TileRect;
+
+pub(crate) mod palette;
 
 /// Container version byte.
 pub(crate) const VERSION: u8 = 1;
@@ -272,11 +278,28 @@ pub(crate) struct Extras<'a> {
     pub images: &'a [crate::lossy::OwnedImage],
 }
 
+/// How one band of a container is coded (its wire byte is the
+/// discriminant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BandCodec {
+    /// The raw bytes (`wire_len == raw_len`).
+    Raw = 0,
+    /// A raw-DEFLATE stream.
+    Deflate = 1,
+    /// One zstd frame.
+    Zstd = 2,
+    /// One LZ4 block.
+    Lz4 = 3,
+    /// Palette transform + zstd (`CAP_PALETTE`, see [`palette`]).
+    Palette = palette::PALETTE_CODEC,
+}
+
 /// One band of a parsed container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandRef<'a> {
     /// Band codec.
-    pub codec: FrameCodec,
+    pub codec: BandCodec,
     /// Decoded size in bytes.
     pub raw_len: usize,
     /// The band's wire bytes.
@@ -312,12 +335,13 @@ impl Packed<'_> {
     }
 }
 
-fn band_codec(b: u8) -> Option<FrameCodec> {
+fn band_codec(b: u8) -> Option<BandCodec> {
     Some(match b {
-        0 => FrameCodec::Raw,
-        1 => FrameCodec::Deflate,
-        2 => FrameCodec::Zstd,
-        3 => FrameCodec::Lz4,
+        0 => BandCodec::Raw,
+        1 => BandCodec::Deflate,
+        2 => BandCodec::Zstd,
+        3 => BandCodec::Lz4,
+        palette::PALETTE_CODEC => BandCodec::Palette,
         _ => return None,
     })
 }
@@ -457,7 +481,7 @@ pub fn parse_bounded(data: &[u8], max_raw: usize) -> Result<Packed<'_>, AppError
                     .ok_or_else(|| AppError::malformed("band length overflow"))?,
             )
             .ok_or_else(|| AppError::malformed("band container truncated"))?;
-        if codec == FrameCodec::Raw && wire != raw_len {
+        if codec == BandCodec::Raw && wire != raw_len {
             return Err(AppError::malformed(format!(
                 "raw band is {wire} bytes, declares {raw_len}"
             )));
@@ -495,7 +519,7 @@ fn decode_band(b: &BandRef<'_>, out: &mut [u8]) -> Result<(), AppError> {
         return Err(AppError::malformed("band output slot size mismatch"));
     }
     match b.codec {
-        FrameCodec::Raw => {
+        BandCodec::Raw => {
             if b.data.len() != out.len() {
                 return Err(AppError::malformed(format!(
                     "raw band is {} bytes, declares {}",
@@ -506,7 +530,7 @@ fn decode_band(b: &BandRef<'_>, out: &mut [u8]) -> Result<(), AppError> {
             out.copy_from_slice(b.data);
             Ok(())
         }
-        FrameCodec::Lz4 => {
+        BandCodec::Lz4 => {
             let n = lz4_flex::block::decompress_into(b.data, out)
                 .map_err(|e| AppError::malformed(format!("lz4 band corrupt: {e}")))?;
             if n != out.len() {
@@ -517,32 +541,9 @@ fn decode_band(b: &BandRef<'_>, out: &mut [u8]) -> Result<(), AppError> {
             }
             Ok(())
         }
-        FrameCodec::Zstd => {
-            if out.is_empty() {
-                return if b.data.is_empty() {
-                    Ok(())
-                } else {
-                    Err(AppError::malformed("zstd band for 0 bytes"))
-                };
-            }
-            let r = ZSTD_DEC.with(|d| {
-                let mut d = d.borrow_mut();
-                let dec = d.get_or_insert_with(ruzstd::decoding::FrameDecoder::new);
-                dec.decode_all(b.data, out)
-            });
-            match r {
-                Ok(n) if n == out.len() => Ok(()),
-                Ok(n) => Err(AppError::malformed(format!(
-                    "zstd band decoded {n} bytes, declared {}",
-                    out.len()
-                ))),
-                Err(e) => {
-                    ZSTD_DEC.with(|d| *d.borrow_mut() = None);
-                    Err(AppError::malformed(format!("zstd band corrupt: {e}")))
-                }
-            }
-        }
-        FrameCodec::Deflate => {
+        BandCodec::Zstd => zstd_decode_exact(b.data, out),
+        BandCodec::Palette => palette::decode(b.data, out),
+        BandCodec::Deflate => {
             let mut v = Vec::new();
             crate::terminal::decompress_into(b.data, out.len(), &mut v)?;
             if v.len() != out.len() {
@@ -555,7 +556,34 @@ fn decode_band(b: &BandRef<'_>, out: &mut [u8]) -> Result<(), AppError> {
             out.copy_from_slice(&v);
             Ok(())
         }
-        FrameCodec::Packed => Err(AppError::malformed("nested band container")),
+    }
+}
+
+/// Decode one zstd frame into exactly `out` (an empty `out` takes an empty
+/// frame only).
+pub(crate) fn zstd_decode_exact(data: &[u8], out: &mut [u8]) -> Result<(), AppError> {
+    if out.is_empty() {
+        return if data.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::malformed("zstd band for 0 bytes"))
+        };
+    }
+    let r = ZSTD_DEC.with(|d| {
+        let mut d = d.borrow_mut();
+        let dec = d.get_or_insert_with(ruzstd::decoding::FrameDecoder::new);
+        dec.decode_all(data, out)
+    });
+    match r {
+        Ok(n) if n == out.len() => Ok(()),
+        Ok(n) => Err(AppError::malformed(format!(
+            "zstd band decoded {n} bytes, declared {}",
+            out.len()
+        ))),
+        Err(e) => {
+            ZSTD_DEC.with(|d| *d.borrow_mut() = None);
+            Err(AppError::malformed(format!("zstd band corrupt: {e}")))
+        }
     }
 }
 
@@ -611,6 +639,8 @@ pub(crate) struct BandPolicy {
     pub bands: usize,
     /// See [`LZ4_MAX_RATIO`].
     pub lz4_max_ratio: f32,
+    /// Palette bands for few-colour content (CAP_PALETTE; needs `zstd`).
+    pub palette: bool,
 }
 
 impl Default for BandPolicy {
@@ -620,6 +650,7 @@ impl Default for BandPolicy {
             lz4: true,
             bands: TARGET_BANDS,
             lz4_max_ratio: LZ4_MAX_RATIO,
+            palette: false,
         }
     }
 }
@@ -631,6 +662,7 @@ pub(crate) struct PackStats {
     pub lz4_bands: usize,
     pub zstd_bands: usize,
     pub raw_bands: usize,
+    pub palette_bands: usize,
 }
 
 /// Split `len` bytes into band lengths (4-byte aligned, all but the last
@@ -690,20 +722,32 @@ fn zstd_band(_band: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// A palette band is only used when the transform alone shrinks the band
+/// to at most this fraction (mostly few-colour chunks); otherwise plain
+/// zstd does as well.
+pub(crate) const PALETTE_MAX_RATIO: f32 = 0.5;
+
 /// Compress one band per the policy: (codec, wire bytes).
-fn pack_band(band: &[u8], policy: &BandPolicy) -> (FrameCodec, Vec<u8>) {
+fn pack_band(band: &[u8], policy: &BandPolicy) -> (BandCodec, Vec<u8>) {
     let photo = policy.lz4 && (!policy.zstd || lz4_ratio_estimate(band) < policy.lz4_max_ratio);
+    let palette = || {
+        (policy.palette && policy.zstd)
+            .then(|| palette::encode(band, PALETTE_MAX_RATIO))
+            .flatten()
+    };
     let (codec, wire) = if photo {
-        (FrameCodec::Lz4, lz4_flex::block::compress(band))
+        (BandCodec::Lz4, lz4_flex::block::compress(band))
+    } else if let Some(p) = palette() {
+        (BandCodec::Palette, p)
     } else if let Some(z) = policy.zstd.then(|| zstd_band(band)).flatten() {
-        (FrameCodec::Zstd, z)
+        (BandCodec::Zstd, z)
     } else if policy.lz4 {
-        (FrameCodec::Lz4, lz4_flex::block::compress(band))
+        (BandCodec::Lz4, lz4_flex::block::compress(band))
     } else {
-        (FrameCodec::Deflate, crate::terminal::compress_frame(band))
+        (BandCodec::Deflate, crate::terminal::compress_frame(band))
     };
     if wire.len() >= band.len() {
-        return (FrameCodec::Raw, band.to_vec());
+        return (BandCodec::Raw, band.to_vec());
     }
     (codec, wire)
 }
@@ -739,7 +783,7 @@ pub(crate) fn encode_packed_ex(
         pieces.push(&data[at..at + l]);
         at += l;
     }
-    let packed: Vec<(FrameCodec, Vec<u8>)> = if pieces.len() > 1 {
+    let packed: Vec<(BandCodec, Vec<u8>)> = if pieces.len() > 1 {
         pieces.par_iter().map(|b| pack_band(b, policy)).collect()
     } else {
         pieces.iter().map(|b| pack_band(b, policy)).collect()
@@ -790,10 +834,11 @@ pub(crate) fn encode_packed_ex(
         out.extend_from_slice(&(*raw as u32).to_be_bytes());
         out.extend_from_slice(&(wire.len() as u32).to_be_bytes());
         match codec {
-            FrameCodec::Lz4 => st.lz4_bands += 1,
-            FrameCodec::Zstd => st.zstd_bands += 1,
-            FrameCodec::Raw => st.raw_bands += 1,
-            _ => {}
+            BandCodec::Lz4 => st.lz4_bands += 1,
+            BandCodec::Zstd => st.zstd_bands += 1,
+            BandCodec::Raw => st.raw_bands += 1,
+            BandCodec::Palette => st.palette_bands += 1,
+            BandCodec::Deflate => {}
         }
     }
     for (_, wire) in &packed {

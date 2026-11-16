@@ -37,7 +37,7 @@ flowchart LR
   subgraph Viewer["ovview / iOS ovffi"]
     NET --> PUMP["TerminalSession::pump"]
     PUMP --> SD["ScreenDecoder<br/>(ovapp/src/tiles/)"]
-    PUMP --> VD["VideoRx + H264Decoder<br/>blit over framebuffer"]
+    PUMP --> VD["VideoRx + MfVideoDecoder<br/>GPU picture or blit"]
     PUMP -->|"on_cmd hook"| ADEC["AudioDecoder -> AudioBus/JitterBuffer"]
     SD --> TAKE["take_latest_frame()"]
     VD --> TAKE
@@ -79,9 +79,13 @@ own (see `TerminalSession::pump`, `Command::Caps` arm in
 | `CAP_MOVE` + `CAP_BANDS` | copy-rect MOVE records (scroll) |
 | `CAP_LOSSY` + `CAP_BANDS` | JPEG atlases for photo-like tiles |
 | `CAP_CACHE` + `CAP_BANDS` | tile-cache REF / STORE records |
+| `CAP_PALETTE` + `CAP_BANDS` | palette bands: few-colour chunks as palette + 1/2/4-bit indices, then zstd |
+| `CAP_VIEWPORT` (host) | the viewer may send `VIEWPORT`; visible tiles go first |
 | `CAP_H264` | `VIDEO_BEGIN` H.264 access units (needs a working decoder) |
 | `CAP_OPUS` (+`CAP_AUDIO10`) | Opus audio, in 20 ms (or 10 ms) packets |
 | `CAP_STEREO` + `CAP_OPUS` | stereo Opus system audio (mono down-mix otherwise) |
+| `CAP_HEVC` + `CAP_H264` | HEVC `VIDEO_BEGIN` units instead of H.264 (host with a hardware HEVC MFT; see 3.7) |
+| `CAP_LTR` (both) | loss recovery from a long-term reference instead of an IDR (`VIDEO_LTR_ACK` / `VIDEO_RECOVER`, see 3.7) |
 | `CAP_RUDP` | the UDP carrier switches to reliable framing |
 | `CAP_DIRECT` + `CAP_MEDIA` (both sides) | direct UDP path, delay-based congestion control, unreliable media channel |
 
@@ -109,8 +113,27 @@ The capture interval is chosen as follows:
 - `RateGovernor` (`ovapp/src/adapt.rs`) snaps to the base fps on any change
   and eases toward `IDLE_FPS = 4` while the screen is static. Each idle step
   multiplies the interval by 1.5.
+- **Input wake** (`ovhost/src/session/wake.rs`): every input event the
+  host injects (pointer, wheel, key, text) notifies the capture thread. Its
+  next capture is pulled in to one active frame interval after the previous
+  one (at once when that is past), and for `INPUT_BOOST = 750 ms` after the
+  last input the governor stays at the full rate (an unchanged capture does
+  not ease it down), so the reaction is captured within a frame instead of
+  at the next idle tick (up to 250 ms). GDI / test-pattern sleeps end on the
+  input; DXGI waits end on the screen change it causes and use 4 ms slices
+  while boosted. Measured with the input-to-photon probe (`--test-pattern
+  video`, loopback relay, 200 presses): p95 141 -> 38-67 ms, p99 174 ->
+  97-155 ms (USAGE §2.11).
 - The base fps comes from `AutoQuality`, or from a manual `QUALITY_SET`
   (section 6).
+- **Viewport priority** (`CAP_VIEWPORT`): the viewer reports the part of
+  the remote screen it shows (`VIEWPORT`: rect in remote pixels + zoom; the
+  iOS shell on every pan / zoom, throttled to 100 ms; the desktop viewer the
+  whole frame at its window scale). In a plain tile delta the encoder sends
+  the visible changed tiles and defers the rest into the refinement backlog
+  (sent once settled, visible ones first, never later than
+  `OFFVIEW_MAX_DEFER = 500 ms`). Downsampling the H.264 region for a
+  zoomed-out viewer is not done (it would need a scaled encode surface).
 
 ### 3.2 Change detection and tiling
 
@@ -159,7 +182,7 @@ When a move is found:
 A 24 px scroll of a 1305x595 window becomes one MOVE plus a 1305x24 strip
 (about 1 KB instead of about 78 KB, per the `bands/mod.rs` docs).
 
-### 3.4 The H.264 region
+### 3.4 The video (H.264 / HEVC) region
 
 After `submit_ex`, the host calls `VideoSession::on_capture` with the
 encoder's `fresh` map (`ovhost/src/session/capture_loop.rs`). The `MotionDetector`
@@ -189,10 +212,24 @@ While in motion:
 1. **Masking.** `UpdateEncoder` subtracts the motion rect (`mask`) from every
    delta, so the viewer shows video there. If every change is inside the
    mask, no tile update is sent at all.
-2. **Encoder rect.** The coded rect is the motion rect rounded up to
-   `ENCODER_BUCKET = 128` px, kept even, placed tile-aligned, and reused while
-   the region grows inside it. The coded rect becomes the mask.
+2. **Encoder rect (stable encode surface).** The coded rect is the motion
+   rect rounded up to `ENCODER_BUCKET = 128` px, kept even, placed
+   tile-aligned, and reused while the region grows inside it (a `Grow` that
+   fits costs no keyframe). When the motion grows past the encoder within
+   one motion period, the encoder is re-opened once at the **full screen**
+   and kept until the period ends, so a growing region costs at most one
+   re-open + keyframe per period (an NVENC open took 89 ms at 640x512 in a
+   live session, 270-290 ms for a first 1080p open, plus the keyframe).
+   Static macroblocks of the larger surface code as skips. Only a new
+   motion period, a resolution / monitor change or the 2x-area rule at the
+   start of a period picks a new size.
+   The coded rect becomes the mask. (`VideoSession::set_fixed_surface(false)`
+   restores per-bucket re-opens.)
 3. **Encoding.** `mfcodec::MfVideoEncoder`:
+   - Codec: HEVC (Main, hardware MFT only) when the viewer set `CAP_HEVC`
+     and the HEVC MFT opens; H.264 otherwise (see 3.7).
+   - Long-term references: with `CAP_LTR`, 2 LTR slots for loss recovery
+     without an IDR (see 3.7).
    - Uses hardware NVENC/AMF/QSV MFTs, falling back to the Microsoft software
      MFT.
    - Runs in low-latency mode: CBR, no B-frames, GOP of `fps*60`, High
@@ -267,6 +304,7 @@ if viewer has CAP_BANDS:
     Packed container (bands/mod.rs):
       split into ~96 KiB bands (≤ 8, 4-byte aligned), compress in parallel:
         photo-like band (LZ4 ratio estimate < 1.6) and LZ4 allowed -> LZ4
+        else palette band (CAP_PALETTE + zstd) if the transform halves it
         else zstd level 1 (CAP_ZSTD and zstd-encode build)
         else LZ4 (if allowed) else DEFLATE
         if not smaller than raw -> raw
@@ -303,6 +341,122 @@ without a new capture. It polls every 4 ms while refinement is pending, and
 every 20 ms otherwise.
 
 ---
+
+### 3.7 Video wire format, codecs and loss recovery
+
+**`VIDEO_BEGIN` (opcode `0x25`, host -> viewer).** Payload = a 38-byte
+`VideoHeader`, all integers big-endian:
+
+| Offset | Size | Field | Meaning |
+|---|---|---|---|
+| 0 | 8 | `seq` | consecutive per host session (END markers included) |
+| 8 | 1 | `flags` | bit 0 `VIDEO_KEYFRAME`, bit 1 `VIDEO_END`, bit 2 `VIDEO_LTR`, bit 3 `VIDEO_RECOVERY`; other bits reserved (ignore) |
+| 9 | 1 | `codec` | `1` = H.264 (`CODEC_H264`), `2` = HEVC (`CODEC_HEVC`); anything else is malformed |
+| 10 | 2+2+2+2 | `x, y, w, h` | where the picture goes in the screen; `w x h` = coded size, always even |
+| 18 | 4+4 | `screen_w, screen_h` | the framebuffer `rect` refers to |
+| 26 | 8 | `pts_us` | host capture time, us since the UNIX epoch |
+| 34 | 4 | `compressed_len` | bytes of the access unit (`0` = END marker) |
+
+The access unit follows as `FRAME_DATA` chunks closed by `FRAME_END(seq)`
+(reliable path), or as one media-channel unit `VideoHeader || access unit`
+(direct path, `VIDEO_UNIT` locally). The header length and layout did not
+change: the `codec` byte always existed (it was always `1`), and the host
+sends `2` only to a viewer that advertised `CAP_HEVC`, so older viewers
+never see it.
+
+**Payload.** Annex-B byte stream (`00 00 00 01` / `00 00 01` start codes),
+one access unit per `VIDEO_BEGIN`, no B-frames (decode order = display
+order, one picture in, one out).
+
+- **H.264** (`codec 1`): High profile (Main when the MFT refuses High). Every
+  keyframe (IDR, NAL type 5) carries SPS (7) + PPS (8) in-band; the SPS VUI
+  signals BT.709 limited range.
+- **HEVC** (`codec 2`): Main profile (8-bit 4:2:0), hardware MFT only
+  (NVENC / AMF / QSV HEVC). Every keyframe (IRAP, NAL types 16..=21; the
+  encoder emits IDR_W_RADL = 19) carries VPS (32) + SPS (33) + PPS (34)
+  in-band, before the slice. NAL header = 2 bytes; `nal_unit_type =
+  (byte0 >> 1) & 0x3F`. Access unit delimiters (35) may appear — drop them.
+  Colour: BT.709 limited range (set on the MF media types; the VUI is
+  whatever the encoder writes — assume BT.709 / video range when it says
+  nothing).
+
+For VideoToolbox, `AccessUnit::from_annexb_codec(codec, data)` splits a unit
+into `vps` (HEVC only) / `sps` / `pps` (raw NAL units, header bytes
+included, no start code) and `avcc` = every other NAL unit prefixed with its
+4-byte BE length (the AVCC / HVCC sample layout, `nalUnitHeaderLength` 4).
+HEVC: `CMVideoFormatDescriptionCreateFromHEVCParameterSets([vps, sps, pps],
+nalUnitHeaderLength: 4)`. `ovffi` hands these to the shell in
+`ov_video_packet` (`codec` field, `vps`/`vps_len` appended at the end).
+
+**Negotiation.** The host streams HEVC only when the viewer set `CAP_HEVC`
+and `CAP_H264`, and the HEVC encoder MFT opens; otherwise (or after an HEVC
+encoder failure, for the rest of the session) H.264. Desktop viewers set
+`CAP_HEVC` when their decoder's `VideoDecode::hevc()` is true (the MF HEVC
+decoder from HEVC Video Extensions is present); the iOS shell opts in with
+`ov_screen_set_video_caps(OV_VIDEO_CAP_HEVC)` when VideoToolbox decodes HEVC
+in hardware. The codec can change between motion periods (every period
+starts with a keyframe), never inside one.
+
+**Loss recovery with long-term references (`CAP_LTR`, both peers).**
+
+| Opcode | Name | Dir | Payload | Meaning |
+|---|---|---|---|---|
+| `0x26` | `VIDEO_IDR_REQUEST` | V->H | `8B have_seq` | send a keyframe (unchanged) |
+| `0x28` | `VIDEO_LTR_ACK` | V->H | `8B seq` | "I decoded the `VIDEO_LTR` unit `seq`" |
+| `0x29` | `VIDEO_RECOVER` | V->H | `8B ltr_seq` | "my chain broke through loss; I hold LTR `ltr_seq`" |
+
+1. The host opens its encoder with 2 application-controlled LTR slots
+   (`CODECAPI_AVEncVideoLTRBufferControl = 2 | 1<<16`, trust-until mode)
+   when the MFT supports LTR (NVENC and the Microsoft software MFT do).
+   After a keyframe the MFT marks the keyframe and the next picture as LTR
+   slots 0 and 1; afterwards the host marks one picture per second
+   (`MarkLTRFrame`) into the slot that does **not** hold the newest
+   confirmed reference. Marked pictures go out with `VIDEO_LTR`.
+2. The viewer sends `VIDEO_LTR_ACK(seq)` for every `VIDEO_LTR` unit it
+   decoded (desktop: after the MF decoder returned; iOS: when the unit is
+   handed to VideoToolbox — a later VT failure calls
+   `ov_screen_request_video_idr`, which forgets every LTR).
+3. On a **loss** (seq gap, torn unit, media channel `VideoLost`) the viewer
+   drops P-frames as before but sends `VIDEO_RECOVER(newest LTR it
+   decoded)` instead of `VIDEO_IDR_REQUEST`. On a **decoder error** it sends
+   `VIDEO_IDR_REQUEST` (its references are not trustworthy). Requests stay
+   rate-limited to one per 300 ms; a recover that did not resync the stream
+   by the next request escalates to an IDR request.
+4. The host answers `VIDEO_RECOVER(s)` with a P-frame predicted only from
+   the slot holding `s` (`UseLTRFrame = 1<<slot | 1<<16`: later pictures
+   reference nothing older), flagged `VIDEO_RECOVERY`. When no slot holds
+   `s` (overwritten, encoder re-created, MFT without LTR) it sends an IDR.
+5. A viewer waiting after a `VIDEO_RECOVER` resumes at the first
+   `VIDEO_RECOVERY` unit, whatever seqs were lost. Every other rule
+   (keyframes resync, `Stale`, `VIDEO_END`) is unchanged; a keyframe or
+   `VIDEO_END` forgets every LTR on both sides.
+
+LTR pictures are ordinary in-stream H.264 / HEVC syntax (long-term
+reference marking), so any standard decoder decodes the stream; a viewer
+without `CAP_LTR` simply never gets `VIDEO_LTR` / `VIDEO_RECOVERY` flags and
+recovers with IDRs.
+
+**Measured (RTX 4090, NVENC MFTs; `mfcodec::ltr_tests`).** A 5-picture
+loss, resync after 15 pictures from an LTR, moving 1080p content
+(desktop + 640x360 video, CBR 8 Mbps): the H.264 IDR resync is 146 KB
+(+126 ms of queueing at 8 Mbit/s over a 20 KB P-frame), the LTR recovery
+P-frame 63 KB (+43 ms, 43 % of the IDR); HEVC: IDR 196 KB (+178 ms),
+recovery 19 KB (+1 ms, 10 %). 640x384 full-motion content: NVENC H.264 IDR
+61 KB vs recovery 17.5 KB, Microsoft software MFT 41 KB vs 34 KB; the
+Microsoft H.264 decoder decodes the recovery picture and everything after
+it without errors (35.8 dB vs 34.5 dB after an IDR). Both H.264 MFTs and
+NVENC HEVC report `MFSampleExtension_LongTermReferenceFrameInfo`; the H.264
+MFTs auto-mark the keyframe + next picture, NVENC HEVC does not (the host
+marks right away).
+
+**H.264 High vs HEVC Main (NVENC, 1080p, 60 pictures, Y-PSNR via ffmpeg,
+`bench_hevc_vs_h264`).** No consistent win for HEVC on the synthetic bench
+content at equal CBR targets: scrolling page 4 Mbps 83 % of the bytes /
++0.6 dB, 8 Mbps 97 % / -2.6 dB; desktop + video region 103 % / -5.7 dB
+and 102 % / -3.1 dB; full-screen video 113 % / +1.5 dB and 102 % /
+-1.7 dB. HEVC keyframes are larger (196 KB vs 146 KB above), its recovery
+pictures much smaller. HEVC therefore stays a viewer opt-in; evaluate on
+real content before advertising it by default.
 
 ## 4. Host: from the mailbox to the wire
 
@@ -388,26 +542,87 @@ Plain zstd payloads made of several frames are decoded in parallel by
 `zstd_par::decode_parallel`. This matters most on iOS, where the pure-Rust
 `ruzstd` is about 3-4x slower than C zstd.
 
-### 5.3 H.264 on the viewer
+### 5.3 Video (H.264 / HEVC) on the viewer
 
 `VideoRx::accept` enforces continuity:
 
 - A keyframe re-syncs the chain.
 - An in-order P-frame is delivered.
-- A gap -> drop the unit and send `VIDEO_IDR_REQUEST` (rate-limited to one
-  per 300 ms).
+- A gap -> drop the unit and ask for a way back in: `VIDEO_RECOVER` naming
+  the newest long-term reference decoded (both peers `CAP_LTR`), else
+  `VIDEO_IDR_REQUEST` (rate-limited to one per 300 ms; an unanswered
+  recover escalates to an IDR request). A decoder error always asks for an
+  IDR.
+- A `VIDEO_RECOVERY` unit after a `VIDEO_RECOVER` re-syncs the chain.
+- A decoded `VIDEO_LTR` unit is acknowledged with `VIDEO_LTR_ACK`.
 - A unit older than one already seen -> `Stale`. It lost the race between
   the media and reliable channels and is dropped silently.
 - `VIDEO_END` -> clears sync. The lossless refresh that follows overwrites
   the video pixels.
 
-`H264Decoder` (Media Foundation, low-latency) produces NV12. `nv12_to_bgra`
-converts it, and `ScreenDecoder::blit` paints it at `header.rect`. The tiles
-it covers are marked lossy until exact pixels replace them.
+`MfVideoDecoder` (`ovapp/src/mfcodec/decoder.rs`, Media Foundation,
+low-latency) decodes H.264 with Microsoft's MFT, and HEVC with an HEVC
+decoder MFT when one can be created (hardware DXVA or the Store "HEVC Video
+Extensions"; only then does `VideoDecode::hevc` advertise `CAP_HEVC`). The
+decoder switches MFT when the header's codec changes. The unit is decoded
+by `VideoDecode::decode_unit`, which has two outcomes:
+
+- **Zero-copy (Windows, Direct2D).** The viewer gives the decoder a
+  `GpuTarget`: the Direct2D renderer's D3D11 device (created with video
+  support by `mfcodec::gpu_device`) and the window's `GpuPictureSlot`. The
+  MFT gets that device through an `IMFDXGIDeviceManager`
+  (`MFT_MESSAGE_SET_D3D_MANAGER`; the MFT must report `MF_SA_D3D11_AWARE`)
+  and decodes into NV12 texture-array slices (`IMFDXGIBuffer`). An
+  `ID3D11VideoProcessor` (`mfcodec/dxva.rs`) converts the slice to one BGRA
+  texture (BT.709 limited range in, full-range sRGB out, the same maths as
+  `nv12_to_bgra`), which is published in the slot (`DecodedTo::Gpu`). The
+  renderer draws it as a Direct2D bitmap on the texture's DXGI surface over
+  the frame bitmap at `header.rect`, scaled like the frame. The CPU never
+  touches the pixels and no framebuffer snapshot is made. The session
+  reports the picture through `TerminalSession::take_gpu_video`, which
+  drives the repaint and the `dec`/`pres` telemetry.
+- **CPU.** Otherwise the picture comes back as tight BGRA (`DecodedTo::Cpu`:
+  a GPU conversion plus one staging readback on a D3D11 decoder, or
+  `nv12_to_bgra` on the software one), and `ScreenDecoder::blit` paints it at
+  `header.rect`. The tiles it covers are marked lossy until exact pixels
+  replace them.
+
+While a GPU picture is shown, the framebuffer under it is stale. On
+`VIDEO_END` (applied once the queued units are decoded) the session calls
+`VideoDecode::end_gpu`: the last picture is read back once and blitted, the
+slot is cleared, and the lossless refresh then replaces it. The CPU path is
+used whenever every frame's pixels are needed or the GPU cannot draw: an
+`on_frame` hook, F6 recording, `--latency-probe`, the GDI renderer, a
+Direct2D failure (the window disables the slot), or a GPU decode error (the
+decoder reopens in software for good and the session asks for a keyframe).
+A decoder that cannot take the D3D11 device at all falls back to software at
+creation (`MfVideoDecoder::open_best`, logged as `video decode: no D3D11
+acceleration (...)`).
 
 Latency is measured as `unix_micros() − pts_us`, which needs synchronised
 clocks or a single machine. Stalls are gaps of more than 100 ms between
 pictures within one motion period. Both are recorded in `VideoRxStats`.
+
+**iOS.** `ovffi` runs the same `VideoRx` continuity / LTR logic and hands
+each unit (parameter sets + 4-byte length-prefixed body, `codec` 1 / 2) to
+the Swift sink; the app decodes it with a `VTDecompressionSession` (real
+time, asynchronous, output NV12 in the stream's range, IOSurface-backed /
+Metal-compatible). The decoded picture goes into a one-deep newest-wins
+slot; at the next `CADisplayLink` tick (up to 120 Hz on ProMotion) the Metal
+renderer wraps its planes as textures (`CVMetalTextureCache`), converts
+YCbCr -> R'G'B' with the VUI matrix (BT.709 by default) and writes it into
+the framebuffer texture at `header.rect`, in the same command buffer as the
+tile blits — so the area-downscale + sharpen passes (5.4) apply to video
+too. After `VIDEO_END` late pictures are refused and the lossless refresh
+overwrites the last one. Any decode failure (no session, unusable
+parameter sets, a VideoToolbox error, `kVTInvalidSessionErr` after
+backgrounding) calls `ov_screen_request_video_idr`, so the region never
+goes silently black. Telemetry: the decode stage ends at the VideoToolbox
+callback (`ov_screen_latency_video_decoded`), the present stage at the
+`presentedTime` of the first drawable drawn after it. CAPS: `CAP_H264` only
+with Metal + hardware H.264 decode; `CAP_HEVC` (via
+`ov_screen_set_video_caps`) only when `VTIsHardwareDecodeSupported(HEVC)`.
+See `docs/IOS_APP.md` 5.3.
 
 ### 5.4 Display
 
@@ -546,6 +761,9 @@ The byte-level tables are in [`crates/ovapp.md` §3.3 and §4.3](crates/ovapp.md
 | Tile cache | `set_cache`, `set_cache_slots` | on, 4096 slots | Up to 64 MB viewer RAM; window switching |
 | Refinement timing | `REFINE_DELAY`, `REFINE_SLICE`, `REFRESH_CHUNK_BYTES` | 300 ms, 15 ms, 64 KiB | When and how fast lossy becomes exact |
 | LZ4 gate | `LZ4_MIN_LINK_RATE`, `LZ4_MAX_RATIO` | 4 MB/s, 1.6 | Decode speed vs bytes on fast links |
+| Palette bands | `bands::PALETTE_MAX_RATIO`, `palette::CHUNK_LOG2` | 0.5, 64 px | Text / UI bytes vs encode time |
+| Input boost | `ovhost` `INPUT_BOOST`, `BOOST_POLL` | 750 ms, 4 ms | Full capture rate after input |
+| Viewport deferral | `sendq::OFFVIEW_MAX_DEFER` | 500 ms | Longest an off-screen change waits |
 | Bands | `TARGET_BANDS`, `MIN_BAND` | 8, 96 KiB | Encode/decode parallelism |
 | Full-frame threshold | `FULL_FRAME_NUM/DEN` | 60 % | Delta vs full frame (ignored with the cache) |
 | Frame chunk | `sendq::DEFAULT_CHUNK` (`ovhost` `FRAME_CHUNK`) | 4 KiB | Max control wait behind frame data |

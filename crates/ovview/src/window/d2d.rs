@@ -14,6 +14,13 @@
 //! a capable driver; this also lets variable-refresh displays follow the
 //! stream). `ovview --vsync` keeps the classic `Present(1, ...)` path.
 //!
+//! Zero-copy video: the D3D11 device is created with video support
+//! ([`ovapp::mfcodec::gpu_device`]) and handed to the video decoder
+//! ([`D2dRenderer::video_device`]), which decodes on it (DXVA) and converts
+//! each picture to a BGRA texture on the GPU; the renderer draws that
+//! texture (a Direct2D bitmap on its DXGI surface, no copy) over the frame
+//! bitmap at the video rect, scaled like the frame.
+//!
 //! Any failure (no D3D11 device, device removed) makes the window drop the
 //! renderer and fall back to the GDI path for good.
 //!
@@ -37,7 +44,8 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -57,6 +65,7 @@ use windows::Win32::Graphics::Dxgi::{
 
 use super::{CursorBmp, CursorOverlay, HudState};
 use crate::localinput::Rect;
+use ovapp::mfcodec::GpuPicture;
 use ovapp::screen::Frame;
 
 #[cfg(test)]
@@ -147,6 +156,10 @@ pub(super) struct D2dRenderer {
     frame_bmp: Option<(ID2D1Bitmap1, u32, u32, u64)>,
     /// The cursor bitmap and the shape it was built from.
     cursor_bmp: Option<(ID2D1Bitmap1, CursorBmp)>,
+    /// The device, when it can decode video (hardware, video support).
+    video_device: Option<ID3D11Device>,
+    /// The bitmap over the decoder's last GPU picture texture.
+    video_bmp: Option<(ID3D11Texture2D, ID2D1Bitmap1)>,
     pub(super) name: String,
 }
 
@@ -156,6 +169,21 @@ fn hr(what: &str, e: windows::core::Error) -> String {
 
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
+}
+
+/// Where a GPU picture lands in the window: its rect in the `screen`-sized
+/// frame, mapped into the frame's letterboxed destination `rect`.
+pub(super) fn video_dest(rect: Rect, screen: (u32, u32), v: &GpuPicture) -> D2D_RECT_F {
+    let sx = rect.w as f32 / screen.0.max(1) as f32;
+    let sy = rect.h as f32 / screen.1.max(1) as f32;
+    let (x, y) = (f32::from(v.rect.x), f32::from(v.rect.y));
+    let (w, h) = (f32::from(v.rect.w), f32::from(v.rect.h));
+    D2D_RECT_F {
+        left: rect.x as f32 + x * sx,
+        top: rect.y as f32 + y * sy,
+        right: rect.x as f32 + (x + w) * sx,
+        bottom: rect.y as f32 + (y + h) * sy,
+    }
 }
 
 /// A D3D11 device of `driver_type` with BGRA support.
@@ -179,13 +207,17 @@ fn d3d11_device(driver_type: D3D_DRIVER_TYPE) -> windows::core::Result<Option<ID
     Ok(device)
 }
 
-/// A D3D11 device (hardware, else WARP) with BGRA support.
-fn create_device() -> Result<(ID3D11Device, &'static str), String> {
+/// A D3D11 device with BGRA support: hardware with video support (shared
+/// with the video decoder, `true`), else hardware, else WARP.
+fn create_device() -> Result<(ID3D11Device, &'static str, bool), String> {
+    if let Ok(device) = ovapp::mfcodec::gpu_device() {
+        return Ok((device, "hardware", true));
+    }
     if let Ok(Some(device)) = d3d11_device(D3D_DRIVER_TYPE_HARDWARE) {
-        return Ok((device, "hardware"));
+        return Ok((device, "hardware", false));
     }
     let device = d3d11_device(D3D_DRIVER_TYPE_WARP).map_err(|e| hr("D3D11CreateDevice", e))?;
-    Ok((device.ok_or("no D3D11 device")?, "WARP"))
+    Ok((device.ok_or("no D3D11 device")?, "WARP", false))
 }
 
 /// A D2D device context on `device`.
@@ -206,7 +238,7 @@ impl D2dRenderer {
     /// Bind a flip-model swap chain + D2D device context to `hwnd`,
     /// presenting on vsync or immediately (see [`PresentMode`]).
     pub(super) fn new(hwnd: HWND, vsync: bool) -> Result<Self, String> {
-        let (device, driver) = create_device()?;
+        let (device, driver, video) = create_device()?;
         // SAFETY: plain COM/D3D object creation on live interfaces; `hwnd` is
         // the caller's live window; every result is checked.
         unsafe {
@@ -279,12 +311,52 @@ impl D2dRenderer {
                 size: (0, 0),
                 frame_bmp: None,
                 cursor_bmp: None,
+                video_device: video.then(|| device.clone()),
+                video_bmp: None,
                 name: format!(
                     "Direct2D on {adapter_name} ({driver}), flip-model {}, high-quality cubic",
                     mode.label()
                 ),
             })
         }
+    }
+
+    /// The device a zero-copy video decoder may decode on (`None`: no
+    /// video support, e.g. WARP).
+    pub(super) fn video_device(&self) -> Option<&ID3D11Device> {
+        self.video_device.as_ref()
+    }
+
+    /// The bitmap over the decoder's picture `tex` (cached per texture: the
+    /// decoder reuses one output texture).
+    ///
+    /// # Safety
+    ///
+    /// Must run on the window thread that owns the single-threaded factory.
+    unsafe fn video_bitmap(&mut self, tex: &ID3D11Texture2D) -> Result<ID2D1Bitmap1, String> {
+        if let Some((t, b)) = &self.video_bmp {
+            if t == tex {
+                return Ok(b.clone());
+            }
+        }
+        let surface: IDXGISurface = tex.cast().map_err(|e| hr("IDXGISurface", e))?;
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        // SAFETY: the texture lives on this renderer's device (the decoder
+        // was given `video_device`); the device context is used on its
+        // owning thread (contract); `props` outlives the call.
+        let b = unsafe { self.dc.CreateBitmapFromDxgiSurface(&surface, Some(&props)) }
+            .map_err(|e| hr("CreateBitmapFromDxgiSurface(video)", e))?;
+        self.video_bmp = Some((tex.clone(), b.clone()));
+        Ok(b)
     }
 
     /// Bind the swap chain's back buffer (resized to the client area) as
@@ -441,6 +513,7 @@ impl D2dRenderer {
     pub(super) fn render(
         &mut self,
         frame: Option<&Frame>,
+        video: Option<&GpuPicture>,
         cursor: &CursorOverlay,
         hud: &HudState,
         rect: Rect,
@@ -480,6 +553,20 @@ impl D2dRenderer {
                     None,
                     None,
                 );
+                // The decoder's GPU picture over its rect, scaled like
+                // the frame (only while it refers to this screen size).
+                if let Some(v) = video.filter(|v| (v.screen_w, v.screen_h) == (f.width, f.height)) {
+                    let vb = self.video_bitmap(&v.texture)?;
+                    let vd = video_dest(rect, (f.width, f.height), v);
+                    self.dc.DrawBitmap(
+                        &vb,
+                        Some(&vd),
+                        if hud.dead { 0.5 } else { 1.0 },
+                        mode,
+                        None,
+                        None,
+                    );
+                }
             }
             // The remote cursor: its own layer, scaled with the frame.
             if let (Some((x, y)), Some(shape)) = (cursor.pos, cursor.shape.as_ref()) {

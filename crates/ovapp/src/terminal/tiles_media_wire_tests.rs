@@ -99,6 +99,8 @@ fn new_commands_round_trip() {
             flags: LOCAL_CAPS | CAP_H264,
         },
         Command::VideoIdrRequest { have_seq: 12 },
+        Command::VideoLtrAck { seq: 1 << 40 },
+        Command::VideoRecover { ltr_seq: 99 },
         Command::VideoBegin {
             header: crate::video::VideoHeader {
                 seq: 5,

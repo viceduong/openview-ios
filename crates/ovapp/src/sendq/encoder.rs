@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use crate::bands::{BandPolicy, MoveRect};
 use crate::codec::Compressor;
 use crate::screen::PixelFormat;
-use crate::terminal::{FrameCodec, CAP_BANDS, CAP_LZ4, CAP_MOVE, CAP_TILES, CAP_ZSTD};
+use crate::terminal::{
+    FrameCodec, CAP_BANDS, CAP_LZ4, CAP_MOVE, CAP_PALETTE, CAP_TILES, CAP_VIEWPORT, CAP_ZSTD,
+};
 use crate::tiles::{
     copy_rects, diff_tiles, gather, rects_from_map, Delta, TileMap, TileRect, MAX_TILE_FRAME_DIM,
     MAX_TILE_RECTS,
@@ -93,6 +95,16 @@ pub struct UpdateEncoder {
     /// `last_px` for refine-only updates.
     pub(super) blank_buf: Vec<u8>,
     pub(super) refine_buf: Vec<u8>,
+    // ---- Viewport priority (CAP_VIEWPORT, see `viewport.rs`) ----
+    /// The viewer's visible rect (frame pixels; `None` = everything).
+    pub(super) viewport: Option<TileRect>,
+    /// Scratch: tiles touching the viewport; this update's deferred
+    /// off-viewport tiles.
+    pub(super) view_map: TileMap,
+    pub(super) defer_map: TileMap,
+    /// Encoder ms since off-viewport tiles were first deferred (`None` =
+    /// nothing deferred since the last update that carried them all).
+    pub(super) defer_since: Option<u32>,
 }
 
 /// A lossy tile is refined to exact pixels once it stayed
@@ -132,6 +144,8 @@ pub struct EncoderStats {
     pub zstd_bands: u64,
     /// Bands sent raw.
     pub raw_bands: u64,
+    /// Bands sent as palette + zstd (`CAP_PALETTE`).
+    pub palette_bands: u64,
     /// Tiles sent as lossy JPEG.
     pub lossy_tiles: u64,
     /// JPEG bytes of those lossy tiles.
@@ -142,6 +156,9 @@ pub struct EncoderStats {
     pub cache_refs: u64,
     /// Cache slots filled by STORE records.
     pub cache_stores: u64,
+    /// Changed tiles outside the viewer's viewport held back
+    /// (`CAP_VIEWPORT`; sent later from the backlog).
+    pub deferred_tiles: u64,
 }
 
 impl Default for UpdateEncoder {
@@ -193,6 +210,10 @@ impl UpdateEncoder {
             cand_map: TileMap::default(),
             blank_buf: Vec::new(),
             refine_buf: Vec::new(),
+            viewport: None,
+            view_map: TileMap::default(),
+            defer_map: TileMap::default(),
+            defer_since: None,
         }
     }
 }
@@ -212,6 +233,7 @@ impl UpdateEncoder {
             let policy = BandPolicy {
                 zstd: self.peer_caps & CAP_ZSTD != 0 && crate::codec::zstd_encode_available(),
                 lz4: self.peer_caps & CAP_LZ4 != 0 && self.link_rate >= LZ4_MIN_LINK_RATE,
+                palette: self.peer_caps & CAP_PALETTE != 0,
                 ..BandPolicy::default()
             };
             let mut out = Vec::new();
@@ -219,6 +241,7 @@ impl UpdateEncoder {
             self.stats.lz4_bands += st.lz4_bands as u64;
             self.stats.zstd_bands += st.zstd_bands as u64;
             self.stats.raw_bands += st.raw_bands as u64;
+            self.stats.palette_bands += st.palette_bands as u64;
             return (FrameCodec::Packed, out);
         }
         debug_assert!(moves.is_empty(), "MOVEs need CAP_BANDS");
@@ -499,6 +522,25 @@ impl UpdateEncoder {
                     return SubmitOutcome::Unchanged;
                 }
             }
+            // Viewport priority: off-screen changes wait in the backlog
+            // (only for a plain delta: a full frame carries everything, and
+            // a MOVE update is sent whole, residual included).
+            self.defer_map.reset(w, h);
+            if !force
+                && moves.is_empty()
+                && tiles_ok
+                && base.is_some()
+                && (chained || !self.pending_full)
+                && self.peer_caps & CAP_VIEWPORT != 0
+            {
+                self.defer_offview(w, h, now);
+                if self.acc.count() == 0 && self.defer_map.count() > 0 {
+                    // Only off-screen changes: nothing to send now.
+                    self.backlog.union_with(&self.defer_map);
+                    self.advance_last_px(px, w, h, stride, new_dims);
+                    return SubmitOutcome::Unchanged;
+                }
+            }
             let full_needed = force
                 || !tiles_ok
                 || base.is_none()
@@ -652,6 +694,8 @@ impl UpdateEncoder {
                         refined.subtract(&self.ref_map);
                         self.stats.refined_tiles += (before - refined.count()) as u64;
                         refined.union_with(&self.img_map);
+                        // Deferred off-viewport tiles: owed exact pixels.
+                        refined.union_with(&self.defer_map);
                         self.backlog = refined;
                         self.stats.lossy_tiles += self.img_map.count() as u64;
                         self.stats.lossy_bytes +=

@@ -420,6 +420,8 @@ final class RemoteInputController: ObservableObject {
     static let lockLocalZoomDefaultsKey = "ov.lockLocalZoom"
     /// Sends one channel-0 command (SessionController.sendCommand).
     var send: ((Data) -> Void)?
+    /// VIEWPORT reports of the active surface (CAP_VIEWPORT hosts).
+    let viewportReporter = ViewportReporter()
     /// The host understands the CAP_INPUT2 commands (set from the session
     /// queue through a main hop).
     var input2 = false

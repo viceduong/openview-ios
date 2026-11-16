@@ -127,7 +127,10 @@ pub(super) fn serve_screen(
         peer_caps: Arc::clone(&hooks.peer_caps),
         keyframe: Arc::clone(&hooks.keyframe),
         video_idr: Arc::clone(&hooks.video_idr),
+        video_fb: Arc::clone(&hooks.video_fb),
         link_rate: AtomicU64::new(0),
+        input_wake: Arc::clone(&hooks.input_wake),
+        viewport: Arc::clone(&hooks.viewport),
     });
     // The GDI source lives on the capture thread (its DCs/DIB stay on the
     // thread that created them); init errors come back before streaming.

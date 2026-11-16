@@ -115,6 +115,20 @@ fn h264_caps_and_idr_requests_reach_the_capture_thread() {
         !hooks.keyframe.load(Ordering::Relaxed),
         "an IDR request is not a tile keyframe"
     );
+    // CAP_LTR feedback: acks and a recover request reach the capture
+    // thread's VideoFeedback.
+    view.send(&Command::VideoLtrAck { seq: 3 }).unwrap();
+    view.send(&Command::VideoRecover { ltr_seq: 3 }).unwrap();
+    let mut got = ovapp::video::FeedbackState::default();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.recover.is_none() && Instant::now() < deadline {
+        host.pump().unwrap();
+        view.pump().unwrap();
+        let fb = hooks.video_fb.take();
+        got.acks.extend(fb.acks);
+        got.recover = got.recover.or(fb.recover);
+    }
+    assert_eq!((got.acks, got.recover), (vec![3], Some(3)));
 }
 
 /// Input v2 end to end over a real session: the host answers CAPS with
@@ -271,4 +285,24 @@ fn quality_set_command_updates_the_target_atomic() {
 fn chat_payload_is_nul_trimmed_and_lossy() {
     assert_eq!(line_str(b"hi\0\0junk"), "hi");
     assert_eq!(line_str(b"a\xffb"), "a\u{fffd}b");
+}
+
+#[test]
+fn viewport_packs_into_one_word_and_empty_means_none() {
+    let v = pack_viewport(10, 20, 640, 360);
+    assert_eq!(
+        unpack_viewport(v),
+        Some(ovapp::tiles::TileRect {
+            x: 10,
+            y: 20,
+            w: 640,
+            h: 360
+        })
+    );
+    assert_eq!(pack_viewport(10, 20, 0, 360), 0);
+    assert_eq!(unpack_viewport(0), None);
+    assert_eq!(
+        unpack_viewport(pack_viewport(u16::MAX, u16::MAX, u16::MAX, u16::MAX)).map(|r| r.w),
+        Some(u16::MAX)
+    );
 }

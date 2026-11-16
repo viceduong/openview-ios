@@ -192,8 +192,11 @@ impl TerminalSession {
                 }
                 // KEYFRAME_REQUEST is viewer->host state for the capture
                 // loop: pure pass-through to the hook (so is
-                // VIDEO_IDR_REQUEST).
-                Command::KeyframeRequest { .. } | Command::VideoIdrRequest { .. } => {}
+                // VIDEO_IDR_REQUEST / VIDEO_LTR_ACK / VIDEO_RECOVER).
+                Command::KeyframeRequest { .. }
+                | Command::VideoIdrRequest { .. }
+                | Command::VideoLtrAck { .. }
+                | Command::VideoRecover { .. } => {}
                 Command::VideoBegin {
                     header,
                     compressed_len,
@@ -246,6 +249,8 @@ impl TerminalSession {
                 // QUALITY_SET is viewer->host state: pure pass-through to the
                 // hook (the host's capture loop reads it there).
                 | Command::QualitySet { .. }
+                // VIEWPORT likewise (the host's capture loop reads it).
+                | Command::Viewport { .. }
                 // CAPTURE_REGION is viewer->host state (the host's capture
                 // loop applies it on its next tick); MONITORS_INFO is
                 // host->viewer display state. Both are pure pass-through.

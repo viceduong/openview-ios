@@ -59,7 +59,7 @@ fn raw_len_is_bounded_before_any_allocation() {
 fn decode_bands_rejects_hand_built_lies() {
     let mut out = Vec::new();
     let lie = BandRef {
-        codec: FrameCodec::Raw,
+        codec: BandCodec::Raw,
         raw_len: 8,
         data: &[1, 2, 3],
     };
@@ -68,7 +68,7 @@ fn decode_bands_rejects_hand_built_lies() {
         "no copy_from_slice panic"
     );
     let huge = BandRef {
-        codec: FrameCodec::Lz4,
+        codec: BandCodec::Lz4,
         raw_len: usize::MAX,
         data: &[],
     };

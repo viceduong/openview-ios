@@ -45,8 +45,10 @@ pub struct OvVideoPacket {
     pub screen_w: u32,
     /// Framebuffer height the picture is placed on.
     pub screen_h: u32,
-    /// Always 0.
-    pub reserved: u32,
+    /// The codec: 1 = H.264 (`sps`/`pps`, AVCC `data`), 2 = HEVC
+    /// (`vps`/`sps`/`pps`, HVCC `data` with 4-byte lengths). Only 2 after
+    /// the shell opted in with [`ov_screen_set_video_caps`] (`OV_VIDEO_CAP_HEVC`).
+    pub codec: u32,
     /// Raw SPS NAL unit on a keyframe, else null.
     pub sps: *const u8,
     /// Length of `sps` (0 when null).
@@ -72,14 +74,32 @@ pub struct OvVideoPacket {
     pub matrix: u8,
     /// 1 = full range, 0 = video range (see `colour_primaries`).
     pub full_range: u8,
+    /// HEVC only: the raw VPS NAL unit on a keyframe, else null (for
+    /// `CMVideoFormatDescriptionCreateFromHEVCParameterSets` with `vps`,
+    /// `sps`, `pps`).
+    pub vps: *const u8,
+    /// Length of `vps` (0 when null).
+    pub vps_len: usize,
 }
+
+/// [`ov_screen_set_video_caps`] bit: the shell decodes HEVC (VideoToolbox
+/// hardware HEVC): advertise `CAP_HEVC`.
+pub const OV_VIDEO_CAP_HEVC: u32 = 1;
+/// [`ov_screen_set_video_caps`] bit: long-term-reference loss recovery
+/// (`CAP_LTR`; on by default). The shell's decoder must keep decoding
+/// after units were dropped before it (the next unit it gets is a
+/// recovery P-frame); clear it if VideoToolbox refuses those.
+pub const OV_VIDEO_CAP_LTR: u32 = 2;
 
 /// H.264 video sink, fired on the `ov_screen_feed` caller thread.
 pub type VideoSink = extern "C" fn(user: *mut c_void, packet: *const OvVideoPacket);
 
 impl OvScreen {
-    /// Queue a VIDEO_IDR_REQUEST (rate limited, at most one queued).
+    /// The chain broke: queue a `VIDEO_RECOVER` (both peers speak
+    /// `CAP_LTR` and we hold a long-term reference) or a
+    /// `VIDEO_IDR_REQUEST` — rate limited, at most one queued.
     pub(super) fn request_idr(&mut self) {
+        use ovapp::terminal::{Command, OpCode, CAP_LTR};
         let now = std::time::Instant::now();
         if self
             .last_idr_request
@@ -87,13 +107,19 @@ impl OvScreen {
         {
             return;
         }
-        let op = ovapp::terminal::OpCode::VideoIdrRequest as u8;
-        if self.outbox.iter().any(|r| r[0] == op) {
+        let ops = [OpCode::VideoIdrRequest as u8, OpCode::VideoRecover as u8];
+        if self.outbox.iter().any(|r| ops.contains(&r[0])) {
             return;
         }
         self.last_idr_request = Some(now);
-        let have_seq = self.last_video_seq;
-        self.queue_small(&ovapp::terminal::Command::VideoIdrRequest { have_seq });
+        let ltr = self.local_caps() & self.peer_caps & CAP_LTR != 0;
+        let cmd = match self.video_rx.request(ltr) {
+            ovapp::video::VideoRequest::Recover { ltr_seq } => Command::VideoRecover { ltr_seq },
+            ovapp::video::VideoRequest::Idr => Command::VideoIdrRequest {
+                have_seq: self.last_video_seq,
+            },
+        };
+        self.queue_small(&cmd);
     }
 
     /// A complete video unit: continuity check, then the sink.
@@ -112,34 +138,40 @@ impl OvScreen {
             self.request_idr();
             return;
         }
+        let codec = h.video_codec();
         let au = if verdict == VideoVerdict::End {
             ovapp::video::AccessUnit::default()
         } else {
-            ovapp::video::AccessUnit::from_annexb(data)
+            ovapp::video::AccessUnit::from_annexb_codec(codec, data)
         };
         let keyframe = verdict == VideoVerdict::Deliver && h.is_keyframe();
-        if keyframe && (au.sps.is_none() || au.pps.is_none()) {
+        if keyframe && !au.has_param_sets(codec) {
             // A keyframe the shell cannot build a format description from.
-            self.video_rx.mark_broken();
+            self.video_rx.mark_corrupt();
             self.request_idr();
             return;
         }
-        if let Some(c) = au.sps.as_deref().and_then(ovapp::video::sps::colour) {
-            self.video_colour = if c.colour_description_present {
-                [c.primaries, c.transfer, c.matrix, c.full_range as u8]
-            } else {
-                // Unspecified: what the host's converter produces.
-                [1, 1, 1, c.full_range as u8]
-            };
+        if codec == ovapp::video::VideoCodec::H264 {
+            if let Some(c) = au.sps.as_deref().and_then(ovapp::video::sps::colour) {
+                self.video_colour = if c.colour_description_present {
+                    [c.primaries, c.transfer, c.matrix, c.full_range as u8]
+                } else {
+                    // Unspecified: what the host's converter produces.
+                    [1, 1, 1, c.full_range as u8]
+                };
+            }
+        } else if keyframe {
+            // HEVC: the host converts BT.709 limited range.
+            self.video_colour = [1, 1, 1, 0];
         }
-        let (sps, sps_len) = au
-            .sps
-            .as_deref()
-            .map_or((std::ptr::null(), 0), |p| (p.as_ptr(), p.len()));
-        let (pps, pps_len) = au
-            .pps
-            .as_deref()
-            .map_or((std::ptr::null(), 0), |p| (p.as_ptr(), p.len()));
+        let raw = |p: &Option<Vec<u8>>| {
+            p.as_deref()
+                .filter(|_| keyframe)
+                .map_or((std::ptr::null(), 0), |p| (p.as_ptr(), p.len()))
+        };
+        let (vps, vps_len) = raw(&au.vps);
+        let (sps, sps_len) = raw(&au.sps);
+        let (pps, pps_len) = raw(&au.pps);
         let pkt = OvVideoPacket {
             seq: h.seq,
             pts_us: h.pts_us,
@@ -156,11 +188,11 @@ impl OvScreen {
             h: u32::from(h.rect.h),
             screen_w: h.screen_w,
             screen_h: h.screen_h,
-            reserved: 0,
-            sps: if keyframe { sps } else { std::ptr::null() },
-            sps_len: if keyframe { sps_len } else { 0 },
-            pps: if keyframe { pps } else { std::ptr::null() },
-            pps_len: if keyframe { pps_len } else { 0 },
+            codec: u32::from(codec.wire()),
+            sps,
+            sps_len,
+            pps,
+            pps_len,
             data: if au.avcc.is_empty() {
                 std::ptr::null()
             } else {
@@ -171,6 +203,8 @@ impl OvScreen {
             transfer: self.video_colour[1],
             matrix: self.video_colour[2],
             full_range: self.video_colour[3],
+            vps,
+            vps_len,
         };
         if verdict == VideoVerdict::Deliver {
             // Reassembled and handed to VideoToolbox now (its decode
@@ -178,13 +212,23 @@ impl OvScreen {
             self.latency_delivered(ovapp::latency::KIND_VIDEO, h.seq, std::time::Instant::now());
         }
         f(self.video_sink.user, &pkt);
+        if verdict == VideoVerdict::Deliver {
+            // Handed to the decoder: acknowledge a long-term reference (a
+            // later VideoToolbox failure calls ov_screen_request_video_idr,
+            // which forgets every LTR again).
+            if let Some(seq) = self.video_rx.decoded(&h) {
+                self.queue_small(&ovapp::terminal::Command::VideoLtrAck { seq });
+            }
+        }
     }
 }
 
 /// The shell's decoder failed (or it dropped a unit): skip
 /// P-frames until the next keyframe and queue a `VIDEO_IDR_REQUEST` for
 /// the host (sent through [`ov_screen_take_pong_reply`](crate::ov_screen_take_pong_reply);
-/// rate limited). Returns 0, or -1 on a null handle.
+/// rate limited). The decoder's references are treated as lost, so the
+/// recovery is always a keyframe (never `VIDEO_RECOVER`). Returns 0, or -1
+/// on a null handle.
 ///
 /// # Safety
 /// `s` must be null or a live handle from [`ov_screen_new`](crate::ov_screen_new).
@@ -199,8 +243,31 @@ pub unsafe extern "C" fn ov_screen_request_video_idr(s: *mut OvScreen) -> i32 {
         let Some(screen) = (unsafe { s.as_mut() }) else {
             return -1;
         };
-        screen.video_rx.mark_broken();
+        screen.video_rx.mark_corrupt();
         screen.request_idr();
+        0
+    })
+}
+
+/// Which optional video features the shell's decoder handles
+/// ([`OV_VIDEO_CAP_HEVC`] | [`OV_VIDEO_CAP_LTR`]; default
+/// `OV_VIDEO_CAP_LTR`). Call before the first `ov_screen_feed`, with the
+/// video sink installed: `OV_VIDEO_CAP_HEVC` advertises `CAP_HEVC` (the host
+/// may then send `codec == 2` packets), clearing `OV_VIDEO_CAP_LTR` stops
+/// advertising `CAP_LTR`. Returns 0, or -1 on a null handle.
+///
+/// # Safety
+/// `s` must be null or a live handle from [`ov_screen_new`](crate::ov_screen_new),
+/// not used concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn ov_screen_set_video_caps(s: *mut OvScreen, caps: u32) -> i32 {
+    ffi_guard!(OV_ERR_PANIC, {
+        // SAFETY: `s` is null or a live screen with no concurrent use
+        // (caller contract).
+        let Some(screen) = (unsafe { s.as_mut() }) else {
+            return -1;
+        };
+        screen.video_caps = caps & (OV_VIDEO_CAP_HEVC | OV_VIDEO_CAP_LTR);
         0
     })
 }

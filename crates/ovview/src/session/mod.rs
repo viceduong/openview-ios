@@ -42,6 +42,7 @@ mod input;
 mod keys;
 mod probe;
 mod stats;
+mod viewport;
 
 use hooks::AudioStats;
 use keys::Hotkeys;
@@ -124,17 +125,15 @@ pub(crate) fn viewer_loop(
             Err(e) => warn!("direct path unavailable ({e}); relay only"),
         }
     }
-    // H.264 for high-motion regions, when the Media Foundation decoder is
-    // available (installing it adds CAP_H264 to our CAPS).
+    // The window first: its Direct2D device is the video decoder's.
+    let win = open_window(options.no_window);
+    // H.264 (and HEVC, when its decoder MFT exists) for high-motion
+    // regions, when the Media Foundation decoder is available (installing
+    // it adds CAP_H264 / CAP_HEVC to our CAPS): D3D11-accelerated with
+    // zero-copy present on the window's device when possible.
     #[cfg(windows)]
     if options.h264 {
-        match ovapp::mfcodec::H264Decoder::new() {
-            Ok(d) => {
-                term.set_video_decoder(Box::new(d));
-                debug!("H.264 decoding available (Media Foundation)");
-            }
-            Err(e) => info!("no H.264 decoder ({e}); lossless tiles only"),
-        }
+        install_video_decoder(&mut term, win.as_deref());
     }
     // Advertise dirty-tile + zstd decoding and keyframe requests. A host
     // that supports them answers with its CAPS and switches to tile deltas;
@@ -156,7 +155,6 @@ pub(crate) fn viewer_loop(
 
     crate::ctrlc::install();
     let stdin_rx = spawn_stdin_reader();
-    let win = open_window(options.no_window);
 
     // Liveness: keepalive PINGs in both directions, RTT from the echoed
     // sequence, and a rolling FPS/bandwidth window for the HUD.
@@ -225,6 +223,7 @@ pub(crate) fn viewer_loop(
         probe: options.latency_probe.map(probe::LatencyProbe::new),
         hud_latency: (None, None),
         latency_logged: None,
+        last_viewport: None,
     };
     viewer.install_cmd_hook();
 
@@ -249,6 +248,7 @@ pub(crate) fn viewer_loop(
             save_received_file(&f.name, &f.data);
         }
         viewer.present_latest_frame();
+        viewer.report_viewport()?;
         viewer.update_hud();
         if let Some(reason) = viewer.exit_requested() {
             break reason;
@@ -322,6 +322,8 @@ struct Viewer {
     hud_latency: (Option<Instant>, Option<String>),
     /// When the latency line is next logged (debug).
     latency_logged: Option<Instant>,
+    /// The last VIEWPORT sent (`CAP_VIEWPORT` hosts).
+    last_viewport: Option<Command>,
 }
 
 impl Viewer {
@@ -435,7 +437,15 @@ impl Viewer {
     /// behind. Stale frames are never rendered while the peer is dead — the
     /// window keeps its last image, dimmed under the HUD's dead banner.
     fn present_latest_frame(&mut self) {
-        let Some(f) = self.term.take_latest_frame() else {
+        if let Some(w) = &self.win {
+            // Consumers of every frame's pixels need CPU video pictures.
+            w.allow_gpu_video(self.probe.is_none() && self.recorder.hud_status().is_none());
+        }
+        let latest = self.term.take_latest_frame();
+        if self.term.take_gpu_video() && latest.is_none() {
+            self.present_gpu_video();
+        }
+        let Some(f) = latest else {
             return;
         };
         if f.is_complete() {
@@ -463,6 +473,22 @@ impl Viewer {
         };
         if let Some(old) = spare {
             self.term.recycle_frame(old);
+        }
+    }
+
+    /// The video decoder presented a new picture on the GPU (no framebuffer
+    /// snapshot): count it and repaint.
+    fn present_gpu_video(&mut self) {
+        let now = Instant::now();
+        self.link_stats.frame_rx(now, 0);
+        self.frames_presented += 1;
+        if self.peer_dead {
+            return;
+        }
+        self.handed_over = Some(now);
+        match &self.win {
+            Some(w) => w.repaint(),
+            None => self.note_presented(),
         }
     }
 
@@ -652,6 +678,34 @@ fn spawn_stdin_reader() -> mpsc::Receiver<LocalEvent> {
         }
     });
     rx
+}
+
+/// Install the Media Foundation video decoder: D3D11-accelerated with
+/// zero-copy present on the window's device when that works, else
+/// software (CPU pixels).
+#[cfg(windows)]
+fn install_video_decoder(term: &mut TerminalSession, win: Option<&RenderWindow>) {
+    use ovapp::mfcodec::MfVideoDecoder;
+    use ovapp::video::VideoCodec;
+    let target = win.and_then(RenderWindow::video_target);
+    match MfVideoDecoder::open_best(VideoCodec::H264, target.as_ref()) {
+        Ok((d, why)) => {
+            if let Some(why) = why {
+                info!("video decode: no D3D11 acceleration ({why})");
+            }
+            info!(
+                "video decoder: {}{}",
+                d.name(),
+                if MfVideoDecoder::hevc_available() {
+                    "; HEVC available"
+                } else {
+                    ""
+                }
+            );
+            term.set_video_decoder(Box::new(d));
+        }
+        Err(e) => info!("no H.264 decoder ({e}); lossless tiles only"),
+    }
 }
 
 /// Open the render window unless headless; a failure warns and continues

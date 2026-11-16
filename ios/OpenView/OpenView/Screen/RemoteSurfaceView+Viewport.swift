@@ -1,3 +1,4 @@
+import OvFFI
 import UIKit
 
 // Viewport of RemoteSurfaceView: safe area / keyboard geometry, zoom
@@ -338,6 +339,26 @@ extension RemoteSurfaceView {
         CATransaction.commit()
         updateCursorLayer()
         setNeedsRender()
+        reportViewport()
+    }
+
+    /// The part of the remote screen on screen right now (remote pixels)
+    /// and the zoom in device pixels per remote pixel, for VIEWPORT.
+    var remoteViewport: ViewportReporter.Viewport? {
+        guard scale > 0, frameSize.width >= 1, frameSize.height >= 1 else { return nil }
+        let vis = visibleRect
+        let a = viewToFrame(CGPoint(x: vis.minX, y: vis.minY))
+        let b = viewToFrame(CGPoint(x: vis.maxX, y: vis.maxY))
+        return ViewportReporter.Viewport(
+            x: a.x, y: a.y, maxX: b.x + 1, maxY: b.y + 1,
+            pixelsPerRemotePixel: scale * displayScale)
+    }
+
+    /// Hand the current viewport to the (debounced) reporter; only the
+    /// active surface reports.
+    func reportViewport() {
+        guard input.activeSurface === self, let v = remoteViewport else { return }
+        input.viewportReporter.update(v)
     }
 
     /// Zoom by `factor` keeping the view point `pivot` fixed.
@@ -390,5 +411,87 @@ extension RemoteSurfaceView {
     /// Frame pixel -> view point.
     func frameToView(_ p: CGPoint) -> CGPoint {
         CGPoint(x: offset.x + p.x * scale, y: offset.y + p.y * scale)
+    }
+}
+
+/// VIEWPORT reports to a CAP_VIEWPORT host (it sends the tiles the user
+/// sees first): the latest viewport goes out at most every `interval`
+/// (~100 ms) while the user pans / zooms, and once more when it settles.
+/// Main thread only.
+final class ViewportReporter {
+    /// CAPS bit of hosts that act on VIEWPORT.
+    static let capViewport: UInt32 = 1 << 22
+    /// Shortest gap between two reports.
+    static let interval: TimeInterval = 0.1
+
+    /// One viewport in remote pixels (clamped to u16) plus the zoom.
+    struct Viewport: Equatable {
+        var x: UInt16
+        var y: UInt16
+        var w: UInt16
+        var h: UInt16
+        /// Device pixels per remote pixel x 1000.
+        var scaleMilli: UInt16
+
+        init(x: CGFloat, y: CGFloat, maxX: CGFloat, maxY: CGFloat, pixelsPerRemotePixel: CGFloat) {
+            func u16(_ v: CGFloat) -> UInt16 {
+                guard v.isFinite else { return 0 }
+                return UInt16(min(max(v.rounded(), 0), CGFloat(UInt16.max)))
+            }
+            let x0 = u16(floor(x)), x1 = u16(ceil(maxX))
+            let y0 = u16(floor(y)), y1 = u16(ceil(maxY))
+            self.x = x0
+            self.y = y0
+            self.w = x1 > x0 ? x1 - x0 : 0
+            self.h = y1 > y0 ? y1 - y0 : 0
+            self.scaleMilli = max(1, u16(pixelsPerRemotePixel * 1000))
+        }
+    }
+
+    /// Sends one channel-0 payload (SessionController.sendCommand).
+    var send: ((Data) -> Void)?
+    /// The host set CAP_VIEWPORT; turning it on reports the current
+    /// viewport (if any) right away.
+    var capable = false {
+        didSet {
+            guard capable != oldValue else { return }
+            lastSent = nil
+            if capable { schedule() }
+        }
+    }
+
+    private var latest: Viewport?
+    private var lastSent: Viewport?
+    private var scheduled = false
+
+    /// The viewport changed (cheap: called on every layout / pan step).
+    func update(_ v: Viewport) {
+        latest = v
+        schedule()
+    }
+
+    /// Session over: forget everything.
+    func reset() {
+        capable = false
+        latest = nil
+        lastSent = nil
+    }
+
+    private func schedule() {
+        guard capable, !scheduled, latest != nil, latest != lastSent else { return }
+        scheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.interval) { [weak self] in
+            self?.flush()
+        }
+    }
+
+    private func flush() {
+        scheduled = false
+        guard capable, let v = latest, v != lastSent, let send else { return }
+        var out = [UInt8](repeating: 0, count: 16)
+        let n = ov_viewport_record(v.x, v.y, v.w, v.h, v.scaleMilli, &out, out.count)
+        guard n > 0, Int(n) <= out.count else { return }
+        lastSent = v
+        send(Data(out[0..<Int(n)]))
     }
 }

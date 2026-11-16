@@ -219,7 +219,8 @@ extension SessionController {
         lastLiveness = (alive: true, rtt: -1, fpsTenths: 0)
         lastLatency = nil
         videoActive = false
-        pendingHideGen = nil
+        screenModel.video.end()
+        videoDecoder.reset()
         lastPeerCaps = 0
         sentDesktopFx = false
         relayMode = false
@@ -293,7 +294,8 @@ extension SessionController {
                     sentDesktopFx = true
                     try sendDesktopWishes(session)
                 }
-                onMain { $0.applyPeerCaps(input2: input2, desktopFx: fx) }
+                let viewport = caps & ViewportReporter.capViewport != 0
+                onMain { $0.applyPeerCaps(input2: input2, desktopFx: fx, viewport: viewport) }
             }
         } catch {
             handle(error)

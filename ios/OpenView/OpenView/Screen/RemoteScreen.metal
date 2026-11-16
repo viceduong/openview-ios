@@ -124,6 +124,38 @@ fragment float4 ov_bilinear(VOut in [[stage_in]],
     return src.sample(lin, s / size);
 }
 
+// Hardware video: one decoded NV12 picture (luma r8Unorm + interleaved
+// chroma rg8Unorm, CVMetalTextureCache views of the VideoToolbox
+// IOSurface) converted to R'G'B' and written into the remote framebuffer
+// texture at the video rect, before the scaling passes above read it.
+// Keep in sync with `YUVParams` in MetalScreenRenderer.swift (80 bytes:
+// three float4 rows, four float2s).
+struct YUVParams {
+    float4 rowR;       // rgb.r = dot(rowR, float4(y, cb, cr, 1))
+    float4 rowG;       //   (range expansion folded in: YUVToRGB.make)
+    float4 rowB;
+    float2 rectOrigin; // video rect in framebuffer pixels (unclipped)
+    float2 rectSize;
+    float2 uvOrigin;   // clean aperture in the planes (normalised)
+    float2 uvScale;
+};
+
+// Target = the framebuffer texture (load / store), viewport = the clipped
+// video rect; [[position]] is in framebuffer pixels, so the picture is
+// placed by the unclipped rect.
+fragment float4 ov_yuv_composite(VOut in [[stage_in]],
+                                 texture2d<float> luma [[texture(0)]],
+                                 texture2d<float> chroma [[texture(1)]],
+                                 constant YUVParams &p [[buffer(0)]]) {
+    constexpr sampler lin(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 t = saturate((in.pos.xy - p.rectOrigin) / max(p.rectSize, float2(1.0)));
+    float2 uv = p.uvOrigin + t * p.uvScale;
+    float y = luma.sample(lin, uv).r;
+    float2 c = chroma.sample(lin, uv).rg;
+    float4 v = float4(y, c.x, c.y, 1.0);
+    return float4(saturate(float3(dot(p.rowR, v), dot(p.rowG, v), dot(p.rowB, v))), 1.0);
+}
+
 // Final pass: unsharp mask into the drawable (viewport = visible rect).
 fragment float4 ov_sharpen(VOut in [[stage_in]],
                            texture2d<float, access::read> img [[texture(0)]],

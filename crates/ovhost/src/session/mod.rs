@@ -30,6 +30,7 @@ mod standby;
 #[cfg(test)]
 mod takeover_tests;
 mod terminal;
+mod wake;
 
 pub(crate) use standby::Handoff;
 use standby::Standby;

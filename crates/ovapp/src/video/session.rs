@@ -1,12 +1,13 @@
 //! The host video session: drives the motion detector, owns the encoder
-//! and queues access units in the frame mailbox.
+//! (codec choice, LTR loss recovery, stable encode surface) and queues
+//! access units in the frame mailbox.
 
 use std::time::{Duration, Instant};
 
 use super::{
-    coded_rect, tiles_in_rect, unix_micros, EncoderFactory, MotionConfig, MotionDetector,
-    MotionEvent, VideoEncode, VideoHeader, CODEC_H264, ENCODER_BUCKET, MAX_VIDEO_QUEUE, VIDEO_END,
-    VIDEO_KEYFRAME,
+    coded_rect, tiles_in_rect, unix_micros, EncoderFactory, EncoderSpec, FeedbackState, LtrTracker,
+    MotionConfig, MotionDetector, MotionEvent, VideoCodec, VideoEncode, VideoHeader,
+    ENCODER_BUCKET, LTR_SLOTS, MAX_VIDEO_QUEUE, VIDEO_END, VIDEO_KEYFRAME,
 };
 use crate::sendq::{EncodedFrame, FrameMailbox};
 use crate::tiles::{TileMap, TileRect, TILE};
@@ -16,7 +17,7 @@ use crate::tiles::{TileMap, TileRect, TILE};
 pub struct VideoStats {
     /// Access units queued.
     pub frames: u64,
-    /// Of which IDRs.
+    /// Of which keyframes (IDR / IRAP).
     pub keyframes: u64,
     /// Annex-B bytes queued.
     pub bytes: u64,
@@ -32,9 +33,25 @@ pub struct VideoStats {
     pub skipped: u64,
     /// Encoder creation / encode failures (each falls back to tiles).
     pub encoder_failures: u64,
+    /// Encoders created (each starts with a keyframe).
+    pub encoders: u64,
+    /// Pictures marked as long-term references.
+    pub ltr_marks: u64,
+    /// Recovery pictures sent in answer to `VIDEO_RECOVER` (no IDR).
+    pub recoveries: u64,
+    /// `VIDEO_RECOVER`s that had to be answered with an IDR.
+    pub recover_idrs: u64,
+    /// `VIDEO_IDR_REQUEST`s honoured.
+    pub idr_requests: u64,
 }
 
-/// Host-side H.264 state: drives the [`MotionDetector`], owns the encoder
+/// The cached encoder and what it was built for.
+pub(super) struct CachedEncoder {
+    pub(super) spec: EncoderSpec,
+    pub(super) enc: Box<dyn VideoEncode>,
+}
+
+/// Host-side video state: drives the [`MotionDetector`], owns the encoder
 /// (created lazily through the factory, cached across motion periods of
 /// the same size) and queues access units / END markers in the
 /// [`FrameMailbox`] video FIFO.
@@ -45,15 +62,24 @@ pub struct VideoStats {
 /// 3. when [`take_refresh`](Self::take_refresh) yields a rect, hand it to
 ///    `UpdateEncoder::queue_refresh` (a lossless backlog ordered after
 ///    `VIDEO_END`, drained by the following submits).
+///
+/// Viewer feedback (IDR requests, `VIDEO_RECOVER`, `VIDEO_LTR_ACK`) goes in
+/// through [`apply_feedback`](Self::apply_feedback) (or the single-event
+/// methods) before `on_capture`.
 pub struct VideoSession {
     detector: MotionDetector,
     pub(super) factory: EncoderFactory,
-    /// The cached encoder and its `(w, h)`.
-    pub(super) enc: Option<(u32, u32, Box<dyn VideoEncode>)>,
+    /// The cached encoder.
+    pub(super) enc: Option<CachedEncoder>,
+    /// LTR bookkeeping of the cached encoder.
+    ltr: LtrTracker,
     /// Tile-aligned motion rect (the mask), while in motion.
     active: Option<TileRect>,
     /// The screen size `active` refers to.
     active_screen: (u32, u32),
+    /// The encoder was used in the current motion period (growth past it
+    /// then jumps straight to the full screen, see `encoder_rect`).
+    episode_encoded: bool,
     seq: u64,
     want_idr: bool,
     refresh: Option<TileRect>,
@@ -69,6 +95,15 @@ pub struct VideoSession {
     gpu_frame: Option<Box<dyn std::any::Any>>,
     /// Bits per pixel per frame of the area-based bitrate (default 0.2).
     bpp: f64,
+    /// The viewer decodes HEVC (`CAP_HEVC`).
+    peer_hevc: bool,
+    /// The viewer speaks LTR recovery (`CAP_LTR`).
+    peer_ltr: bool,
+    /// An HEVC encoder could not be opened: H.264 for the session.
+    hevc_failed: bool,
+    /// Stable encode surface during motion (growth past the encoder jumps
+    /// to the full screen once); `false` = re-open per 128 px bucket.
+    fixed_surface: bool,
 }
 
 impl VideoSession {
@@ -83,8 +118,10 @@ impl VideoSession {
             detector: MotionDetector::new(cfg),
             factory,
             enc: None,
+            ltr: LtrTracker::new(0, fps),
             active: None,
             active_screen: (0, 0),
+            episode_encoded: false,
             seq: 0,
             want_idr: false,
             refresh: None,
@@ -96,6 +133,10 @@ impl VideoSession {
             last_error: None,
             gpu_frame: None,
             bpp: 0.2,
+            peer_hevc: false,
+            peer_ltr: false,
+            hevc_failed: false,
+            fixed_surface: true,
         }
     }
 
@@ -104,6 +145,31 @@ impl VideoSession {
     pub fn set_bits_per_pixel(&mut self, bpp: f64) {
         if bpp.is_finite() && bpp > 0.0 {
             self.bpp = bpp;
+        }
+    }
+
+    /// What the viewer's CAPS allow: HEVC (`CAP_HEVC`) and LTR recovery
+    /// (`CAP_LTR`). A change takes effect with the next encoder (the
+    /// cached one is dropped when it no longer matches).
+    pub fn set_peer_caps(&mut self, hevc: bool, ltr: bool) {
+        self.peer_hevc = hevc;
+        self.peer_ltr = ltr;
+    }
+
+    /// Stable encode surface during motion (default on): within a motion
+    /// period, a growth past the encoder re-opens it once at the full
+    /// screen (and the encoder is then kept until the period ends) instead
+    /// of one re-open + IDR per 128 px bucket.
+    pub fn set_fixed_surface(&mut self, on: bool) {
+        self.fixed_surface = on;
+    }
+
+    /// The codec new encoders are opened with.
+    pub fn wanted_codec(&self) -> VideoCodec {
+        if self.peer_hevc && !self.hevc_failed {
+            VideoCodec::Hevc
+        } else {
+            VideoCodec::H264
         }
     }
 
@@ -117,10 +183,42 @@ impl VideoSession {
         self.refresh.take()
     }
 
-    /// Next encoded picture is an IDR (keyframe / IDR request).
+    /// Next encoded picture is a keyframe (`VIDEO_IDR_REQUEST`).
     pub fn request_idr(&mut self) {
         if self.active.is_some() {
             self.want_idr = true;
+            self.stats.idr_requests += 1;
+        }
+    }
+
+    /// `VIDEO_RECOVER(ltr_seq)`: the next picture recovers from that
+    /// long-term reference, or is a keyframe when the encoder cannot.
+    pub fn request_recover(&mut self, ltr_seq: u64) {
+        if self.active.is_none() {
+            return;
+        }
+        if self.ltr.enabled() {
+            self.ltr.request_recover(ltr_seq);
+        } else {
+            self.want_idr = true;
+            self.stats.recover_idrs += 1;
+        }
+    }
+
+    /// `VIDEO_LTR_ACK(seq)`: the viewer holds that long-term reference.
+    pub fn ltr_ack(&mut self, seq: u64) {
+        self.ltr.ack(seq);
+    }
+
+    /// Apply everything a [`super::VideoFeedback`] collected.
+    pub fn apply_feedback(&mut self, fb: FeedbackState) {
+        for seq in fb.acks {
+            self.ltr_ack(seq);
+        }
+        if fb.idr {
+            self.request_idr();
+        } else if let Some(seq) = fb.recover {
+            self.request_recover(seq);
         }
     }
 
@@ -149,12 +247,22 @@ impl VideoSession {
 
     /// The counters so far.
     pub fn stats(&self) -> VideoStats {
-        self.stats
+        let mut s = self.stats;
+        s.recoveries += self.ltr.recoveries;
+        s.recover_idrs += self.ltr.recover_idrs;
+        s
     }
 
     /// The encoder in use (for logs).
     pub fn encoder_name(&self) -> Option<String> {
-        self.enc.as_ref().map(|(_, _, e)| e.name())
+        self.enc.as_ref().map(|c| {
+            let ltr = c.enc.ltr_slots();
+            if ltr > 0 {
+                format!("{} [{}, LTR x{ltr}]", c.enc.name(), c.enc.codec())
+            } else {
+                format!("{} [{}]", c.enc.name(), c.enc.codec())
+            }
+        })
     }
 
     /// The last encoder error (cleared when read).
@@ -174,10 +282,14 @@ impl VideoSession {
             return;
         };
         let (sw, sh) = self.active_screen;
+        let codec = self
+            .enc
+            .as_ref()
+            .map_or(VideoCodec::H264, |c| c.enc.codec());
         let header = VideoHeader {
             seq: self.seq,
             flags: VIDEO_END,
-            codec: CODEC_H264,
+            codec: codec.wire(),
             rect: r,
             screen_w: sw,
             screen_h: sh,
@@ -189,6 +301,9 @@ impl VideoSession {
             self.refresh = Some(r);
         }
         self.want_idr = false;
+        self.episode_encoded = false;
+        // The next period starts with a keyframe: every LTR is gone.
+        self.ltr.reset();
         self.stats.exits += 1;
     }
 
@@ -235,14 +350,22 @@ impl VideoSession {
                     // The encoder failed recently: stay on tiles.
                     self.detector.reset();
                 } else {
-                    if matches!(ev, MotionEvent::Enter(_)) {
+                    let enter = matches!(ev, MotionEvent::Enter(_));
+                    if enter {
                         self.stats.enters += 1;
+                        // A new period always starts with a keyframe.
+                        self.want_idr = true;
                     } else {
                         self.stats.grows += 1;
                     }
-                    self.active = Some(r);
+                    // A grow inside the current encoder keeps the reference
+                    // chain (the coded rect does not move); `encoder_rect`
+                    // decides below.
+                    self.active = Some(match (enter, self.active) {
+                        (false, Some(a)) => union(a, r),
+                        _ => r,
+                    });
                     self.active_screen = (w, h);
-                    self.want_idr = true;
                 }
             }
             MotionEvent::Exit(_) => self.end(mailbox, true),
@@ -252,7 +375,7 @@ impl VideoSession {
             return false;
         };
         let changed = !fresh_valid || tiles_in_rect(fresh, &rect) > 0;
-        if !changed && !self.want_idr {
+        if !changed && !self.want_idr && !self.ltr.recover_pending() {
             return false;
         }
         if mailbox.video_queued() >= MAX_VIDEO_QUEUE {
@@ -263,42 +386,33 @@ impl VideoSession {
         if need.w < 16 || need.h < 16 || px.len() < stride * h as usize {
             return false;
         }
-        // The encoder size comes in 128 px buckets and is kept while
-        // the motion rect grows inside it (no MF re-open + IDR per Grow);
-        // the coded rect is placed to contain the motion rect, and becomes
-        // the mask (the margin streams as video too, not as tiles).
+        // The coded rect contains the motion rect and becomes the mask (the
+        // margin streams as video too, not as tiles).
         let cr = self.encoder_rect(need, w, h);
-        if self.active != Some(cr) {
-            self.active = Some(cr);
-        }
+        // A moved coded rect of the same size needs no keyframe (the
+        // P-frame still decodes exactly; only its prediction is worse); a
+        // new size means a new encoder, which starts with one.
+        self.active = Some(cr);
         let (cw, ch) = (u32::from(cr.w), u32::from(cr.h));
         let b = target_bitrate_bpp(cw, ch, self.fps, self.link_rate, self.bpp);
-        if self
-            .enc
-            .as_ref()
-            .is_none_or(|(ew, eh, _)| (*ew, *eh) != (cw, ch))
-        {
-            self.enc = None;
-            match (self.factory)(cw, ch, self.fps, b) {
-                Ok(e) => {
-                    self.enc = Some((cw, ch, e));
-                    self.applied_bitrate = b;
-                    self.want_idr = true;
-                }
-                Err(e) => return self.fail(now, mailbox, e),
-            }
+        if let Err(e) = self.ensure_encoder(cw, ch, b) {
+            return self.fail(now, mailbox, e);
         }
-        let Some((_, _, enc)) = self.enc.as_mut() else {
+        self.episode_encoded = true;
+        let Some(cached) = self.enc.as_mut() else {
             return false;
         };
+        let enc = &mut cached.enc;
         if b.abs_diff(self.applied_bitrate) * 100 > self.applied_bitrate.max(1) * 15 {
             enc.set_bitrate(b);
             self.applied_bitrate = b;
         }
         let off = usize::from(cr.y) * stride + usize::from(cr.x) * 4;
         let t0 = Instant::now();
-        let force = self.want_idr;
         let ts = unix_micros();
+        let plan = self.ltr.plan(ts, self.want_idr);
+        let force = plan.force_idr;
+        enc.set_frame_refs(plan.refs);
         let rect = (
             u32::from(cr.x),
             u32::from(cr.y),
@@ -313,16 +427,18 @@ impl VideoSession {
             Ok(a) => a,
             Err(e) => return self.fail(now, mailbox, e),
         };
+        let codec = enc.codec();
         self.stats.encode_time += t0.elapsed();
         if force {
             self.want_idr = false;
         }
         let mut any = false;
         for au in aus {
+            let ltr_flags = self.ltr.on_output(self.seq, &au);
             let header = VideoHeader {
                 seq: self.seq,
-                flags: if au.keyframe { VIDEO_KEYFRAME } else { 0 },
-                codec: CODEC_H264,
+                flags: if au.keyframe { VIDEO_KEYFRAME } else { 0 } | ltr_flags,
+                codec: codec.wire(),
                 rect: cr,
                 screen_w: w,
                 screen_h: h,
@@ -331,6 +447,7 @@ impl VideoSession {
             self.seq = self.seq.wrapping_add(1);
             self.stats.frames += 1;
             self.stats.keyframes += u64::from(au.keyframe);
+            self.stats.ltr_marks += u64::from(header.is_ltr());
             self.stats.bytes += au.data.len() as u64;
             mailbox.push_video(EncodedFrame::video(header, au.data));
             any = true;
@@ -338,19 +455,77 @@ impl VideoSession {
         any
     }
 
+    /// The spec a new `cw x ch` encoder is opened with.
+    fn spec(&self, cw: u32, ch: u32, bitrate: u32) -> EncoderSpec {
+        EncoderSpec {
+            w: cw,
+            h: ch,
+            fps: self.fps,
+            bitrate,
+            codec: self.wanted_codec(),
+            ltr_slots: if self.peer_ltr { LTR_SLOTS } else { 0 },
+        }
+    }
+
+    /// Keep the cached encoder when it matches `cw x ch` and the wanted
+    /// codec / LTR use, else open a new one (HEVC failing falls back to
+    /// H.264 for the session).
+    fn ensure_encoder(&mut self, cw: u32, ch: u32, bitrate: u32) -> Result<(), String> {
+        let want = self.spec(cw, ch, bitrate);
+        let matches = |s: &EncoderSpec| {
+            (s.w, s.h, s.codec, s.ltr_slots) == (want.w, want.h, want.codec, want.ltr_slots)
+        };
+        if self.enc.as_ref().is_some_and(|c| matches(&c.spec)) {
+            return Ok(());
+        }
+        self.enc = None;
+        let enc = match (self.factory)(&want) {
+            Ok(e) => e,
+            Err(e) if want.codec == VideoCodec::Hevc => {
+                self.hevc_failed = true;
+                self.last_error = Some(format!("HEVC encoder unavailable, using H.264: {e}"));
+                let h264 = self.spec(cw, ch, bitrate);
+                (self.factory)(&h264)?
+            }
+            Err(e) => return Err(e),
+        };
+        let spec = EncoderSpec {
+            codec: enc.codec(),
+            ..self.spec(cw, ch, bitrate)
+        };
+        // Keep the counters of the tracker being replaced.
+        self.stats.recoveries += self.ltr.recoveries;
+        self.stats.recover_idrs += self.ltr.recover_idrs;
+        self.ltr = LtrTracker::new(enc.ltr_slots().min(spec.ltr_slots), self.fps);
+        self.enc = Some(CachedEncoder { spec, enc });
+        self.applied_bitrate = bitrate;
+        self.want_idr = true;
+        self.stats.encoders += 1;
+        Ok(())
+    }
+
     /// The coded rect for motion rect `need` (even, inside the `sw x sh`
-    /// screen): the current encoder's size when `need` fits in it (and it
-    /// is not wastefully large), else `need` rounded up to 128 px buckets;
-    /// placed tile-aligned where possible. Falls back to `need` itself.
+    /// screen), placed tile-aligned where possible (falls back to `need`):
+    ///
+    /// * the current encoder's size when `need` fits in it — always within
+    ///   a motion period, at the start of one only when it is not more
+    ///   than twice the fresh bucket;
+    /// * fixed surface, growth past the encoder within a motion period:
+    ///   the full screen (one re-open per period at most);
+    /// * else `need` rounded up to [`ENCODER_BUCKET`] px.
     pub(super) fn encoder_rect(&self, need: TileRect, sw: u32, sh: u32) -> TileRect {
+        let (sw2, sh2) = (sw & !1, sh & !1);
         let bucket =
             |v: u16, s: u32| (u32::from(v).div_ceil(ENCODER_BUCKET) * ENCODER_BUCKET).min(s & !1);
         let (mut ew, mut eh) = (bucket(need.w, sw), bucket(need.h, sh));
-        if let Some((w0, h0, _)) = &self.enc {
-            let fits =
-                *w0 >= u32::from(need.w) && *h0 >= u32::from(need.h) && *w0 <= sw && *h0 <= sh;
-            if fits && u64::from(*w0) * u64::from(*h0) <= u64::from(ew) * u64::from(eh) * 2 {
-                (ew, eh) = (*w0, *h0);
+        if let Some(c) = &self.enc {
+            let (w0, h0) = (c.spec.w, c.spec.h);
+            let fits = w0 >= u32::from(need.w) && h0 >= u32::from(need.h) && w0 <= sw && h0 <= sh;
+            let thrifty = u64::from(w0) * u64::from(h0) <= u64::from(ew) * u64::from(eh) * 2;
+            if fits && (thrifty || (self.fixed_surface && self.episode_encoded)) {
+                (ew, eh) = (w0, h0);
+            } else if !fits && self.fixed_surface && self.episode_encoded {
+                (ew, eh) = (sw2, sh2);
             }
         }
         let place = |pos: u16, len: u16, e: u32, s: u32| -> Option<u32> {
@@ -361,6 +536,22 @@ impl VideoSession {
             }
             (x <= u32::from(pos) && x + e >= end).then_some(x)
         };
+        // Same size as now and still covering `need`: stay put (a moving
+        // coded rect costs bits, the static content no longer matches).
+        if let Some(a) = self
+            .active
+            .filter(|a| (u32::from(a.w), u32::from(a.h)) == (ew, eh))
+        {
+            let covers = a.x <= need.x
+                && a.y <= need.y
+                && u32::from(a.x) + u32::from(a.w) >= u32::from(need.x) + u32::from(need.w)
+                && u32::from(a.y) + u32::from(a.h) >= u32::from(need.y) + u32::from(need.h)
+                && u32::from(a.x) + ew <= sw
+                && u32::from(a.y) + eh <= sh;
+            if covers {
+                return a;
+            }
+        }
         match (place(need.x, need.w, ew, sw), place(need.y, need.h, eh, sh)) {
             (Some(x), Some(y)) => TileRect {
                 x: x as u16,
@@ -379,6 +570,20 @@ impl VideoSession {
         self.retry_at = Some(now + Duration::from_secs(5));
         self.stop(mailbox, true);
         false
+    }
+}
+
+/// The bounding box of two rects.
+fn union(a: TileRect, b: TileRect) -> TileRect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (u32::from(a.x) + u32::from(a.w)).max(u32::from(b.x) + u32::from(b.w));
+    let y1 = (u32::from(a.y) + u32::from(a.h)).max(u32::from(b.y) + u32::from(b.h));
+    TileRect {
+        x: x0,
+        y: y0,
+        w: (x1 - u32::from(x0)) as u16,
+        h: (y1 - u32::from(y0)) as u16,
     }
 }
 

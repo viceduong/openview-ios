@@ -8,6 +8,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Input wakes the host's capture: every injected input event pulls the
+  next capture in to the active frame interval and keeps the full capture
+  rate for 750 ms (the idle governor no longer lets a reaction wait up to
+  250 ms for its next tick). Input-to-photon probe (`--test-pattern video`,
+  loopback relay, 200 presses): p95 137-141 ms -> 38-67 ms, p99 143-174 ms
+  -> 97-155 ms, p50 6-34 ms -> 12-15 ms.
+- Palette bands (`CAP_PALETTE`, bit 21): band codec 4 sends few-colour
+  chunks (<= 16 colours per 64 pixels: text, UI) as a palette plus 1/2/4-bit
+  indices before zstd; the host falls back to plain zstd when that does not
+  halve the band. Synthetic 1080p screens vs plain zstd: anti-aliased text
+  2.3x smaller, a dark code editor 1.9x, flat UI / text pages 39-115x;
+  photos are unaffected. Decoded in pure Rust (desktop viewer and iOS).
+- Viewport priority (`CAP_VIEWPORT`, bit 22): the viewer reports what it
+  shows (`VIEWPORT`, `0x3D`: rect in remote pixels + zoom); the host sends
+  the visible changed tiles first and defers off-screen ones (sent once
+  settled, at most 500 ms later). The iOS app reports on pan / zoom
+  (throttled to 100 ms, `ov_viewport_record`); the desktop viewer reports
+  its whole-frame view and scale.
+- Video loss recovery without an IDR (`CAP_LTR`, bit 20). The host's
+  encoder keeps 2 long-term references (NVENC and the Microsoft MFT both
+  support it) and marks one picture per second (`VIDEO_LTR` flag); the
+  viewer acknowledges decoded ones (`VIDEO_LTR_ACK`, `0x28`). After a loss
+  the viewer sends `VIDEO_RECOVER` (`0x29`) naming the newest reference it
+  holds, and the host answers with a P-frame predicted only from it
+  (`VIDEO_RECOVERY`) instead of a keyframe; an IDR stays the fallback (no
+  confirmed reference, decoder error, encoder without LTR). At 1080p,
+  CBR 8 Mbps, the resync picture shrinks from 146 KB to 63 KB (H.264) and
+  from 196 KB to 19 KB (HEVC): about 80 ms (H.264) to 180 ms (HEVC) less
+  queueing on an 8 Mbit/s link. Desktop viewer, iOS assembler and host all
+  speak it; `ov_screen_set_video_caps` lets the iOS shell turn it off.
+- HEVC video (`CAP_HEVC`, bit 19). The `VIDEO_BEGIN` codec byte (unchanged
+  38-byte header) now also takes `2` = HEVC: Annex-B, Main profile, VPS +
+  SPS + PPS on every keyframe, hardware MFT only, same low-latency settings.
+  The host streams HEVC only to a viewer that advertises it (desktop: an HEVC
+  decoder MFT is present; iOS: `ov_screen_set_video_caps(OV_VIDEO_CAP_HEVC)`,
+  `ov_video_packet` gains `codec` and `vps`/`vps_len`), and falls back to
+  H.264 when the HEVC MFT does not open. Shared `video::VideoCodec`. On the
+  synthetic 1080p bench NVENC HEVC is not consistently better than H.264
+  High (83-113 % of the bytes, -5.7..+1.5 dB), so it stays an opt-in.
+- Stable encode surface during motion: a motion region that grows past
+  its encoder re-opens it once at the full screen for the rest of the
+  motion period, and a growth that fits no longer forces a keyframe. On a
+  steadily growing region (7 grows in 8 s): 2 encoders / 2 keyframes
+  instead of 8 / 8.
+- Windows viewer: hardware video decode with zero-copy present. With the
+  Direct2D renderer, the Media Foundation decoder runs on the renderer's
+  D3D11 device (DXVA). The D3D11 video processor converts each picture
+  from NV12 to BGRA, and the renderer draws it straight from the GPU over
+  the frame at the video rect. No NV12 reaches the CPU, and no framebuffer
+  snapshot is made per video picture. On a 1920x1080 test pattern the
+  `dec` stage went from 3.2/3.9 ms (p50/p95) to 0.2/0.8 ms, and viewer CPU
+  from 8.9 % to 6.2 % of a core. The software path stays as the fallback
+  (GDI renderer, no D3D11 or DXVA, recording, `--latency-probe`, GPU
+  errors). The viewer decodes HEVC when an HEVC decoder MFT can be created,
+  and only then advertises `CAP_HEVC`.
 - Stereo system audio. With `--system-audio` the host captures the
   loopback in stereo (surround folded down) and sends 2-channel Opus
   (128 kbit/s, 10 ms frames, in-band FEC) to viewers that advertise the new
@@ -36,6 +91,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exponential-decay inertia that stops when a finger lands. The natural
   direction is unchanged. iPad trackpad scrolling uses the same paced
   sender.
+- iOS: hardware video is decoded with a `VTDecompressionSession` (real
+  time) instead of an `AVSampleBufferDisplayLayer` overlay, and composited
+  into the Metal frame in the same pass as the tiles (BT.709 / BT.601 /
+  BT.2020 YCbCr conversion from the stream's VUI), so video is scaled and
+  sharpened like the rest of the screen and the end-of-motion stale flash
+  and its hide timer are gone. Decoded pictures are paced by the display
+  link (up to 120 Hz on ProMotion), newest wins, never more than one
+  queued. HEVC streams are decoded too (`CAP_HEVC`, advertised only with
+  VideoToolbox hardware HEVC decode). Every decode failure asks the host
+  for recovery instead of leaving the region black. Latency telemetry now
+  ends video's decode stage at the VideoToolbox callback
+  (`ov_screen_latency_video_decoded`) and its present stage at the Metal
+  presented time of the drawable showing it. Without Metal the app no
+  longer advertises `CAP_H264` (lossless tiles only).
 
 ## [0.1.0] - 2026-11-14
 

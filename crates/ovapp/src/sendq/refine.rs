@@ -182,15 +182,27 @@ impl UpdateEncoder {
         };
         let mut n = ((budget as f64 / per_tile) as usize).clamp(2, 64);
         let cols = self.backlog.cols();
-        'rows: for r in 0..self.backlog.rows() {
-            for c in 0..cols {
-                // Only settled tiles (a tile still changing is
-                // re-sent lossy anyway).
-                if self.backlog.get(c, r) && !self.recent((r * cols + c) as usize, now) {
-                    self.chunk.set(c, r);
-                    n -= 1;
-                    if n == 0 {
-                        break 'rows;
+        // Tiles inside the viewer's viewport first (CAP_VIEWPORT), then
+        // the rest.
+        let in_view = self.update_view_map(w, h);
+        for pass in [true, false] {
+            if pass && !in_view {
+                continue;
+            }
+            for r in 0..self.backlog.rows() {
+                for c in 0..cols {
+                    // Only settled tiles (a tile still changing is
+                    // re-sent lossy anyway).
+                    if self.backlog.get(c, r)
+                        && !self.chunk.get(c, r)
+                        && (!in_view || self.view_map.get(c, r) == pass)
+                        && !self.recent((r * cols + c) as usize, now)
+                    {
+                        self.chunk.set(c, r);
+                        n -= 1;
+                        if n == 0 {
+                            return;
+                        }
                     }
                 }
             }

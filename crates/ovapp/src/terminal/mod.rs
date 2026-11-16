@@ -38,14 +38,17 @@
 //! | `0x3C` | SAS          | empty: Ctrl+Alt+Del / secure attention sequence ([`CAP_INPUT2`]) |
 //! | `0x32` | CURSOR       | `4B x i32-LE` + `4B y i32-LE` (region-relative pixels; host->viewer) |
 //! | `0x33` | CURSOR_SHAPE | `2B hot_x u16-LE` + `2B hot_y u16-LE` + `2B w u16-LE` + `2B h u16-LE` + `w*h*4B` BGRA (host->viewer) |
+//! | `0x3D` | VIEWPORT     | `2B x` `2B y` `2B w` `2B h` `2B scale_milli` u16-BE (viewer->host, [`CAP_VIEWPORT`]: the visible rect in remote pixels; `w`/`h` 0 = none) |
 //! | `0x36` | QUALITY_SET  | `2B target_fps u16-BE` (viewer->host; `0` = AUTO: the host's queue-delay-driven auto-quality rule decides) |
 //! | `0x37` | CAPTURE_REGION | `4B x i32-BE` + `4B y i32-BE` + `4B w u32-BE` + `4B h u32-BE` (viewer->host; the rect the host should capture) |
 //! | `0x38` | MONITORS_INFO  | `1B count` + per monitor `4B x i32-BE` + `4B y i32-BE` + `4B w u32-BE` + `4B h u32-BE` + `1B is_primary` (host->viewer) |
 //! | `0x23` | TILES_BEGIN  | `8B seq` + `8B base_seq` + `4B w` + `4B h` + `1B fmt` + `1B codec` + `4B total` + `4B compressed_len` + `2B count` + count x (`2B x` `2B y` `2B w` `2B h`), all BE (host->viewer) |
 //! | `0x24` | KEYFRAME_REQUEST | `8B have_seq u64-BE` (optional; viewer->host: send a full frame) |
-//! | `0x25` | VIDEO_BEGIN  | 38-byte [`crate::video::VideoHeader`] (host->viewer; the H.264 Annex-B access unit follows as FRAME_DATA + FRAME_END(seq)) |
+//! | `0x25` | VIDEO_BEGIN  | 38-byte [`crate::video::VideoHeader`] (host->viewer; the H.264 / HEVC Annex-B access unit follows as FRAME_DATA + FRAME_END(seq)) |
 //! | `0x26` | VIDEO_IDR_REQUEST | `8B have_seq u64-BE` (viewer->host: the video chain broke, send an IDR) |
 //! | `0x27` | VIDEO_UNIT   | 38-byte [`crate::video::VideoHeader`] + Annex-B access unit (local only: produced from the media channel, never sent) |
+//! | `0x28` | VIDEO_LTR_ACK | `8B seq u64-BE` (viewer->host, [`CAP_LTR`]: the `VIDEO_LTR` unit `seq` was decoded) |
+//! | `0x29` | VIDEO_RECOVER | `8B ltr_seq u64-BE` (viewer->host, [`CAP_LTR`]: the chain broke through loss; recover from that long-term reference) |
 //! | `0x40` | AUDIO        | one audio tick (see [`crate::audio`]; host->viewer)            |
 //! | `0x50` | CLIPBOARD    | `1B kind` (`0` = UTF-8 text) + text (both directions)          |
 //! | `0x60` | CAPS         | `4B flags u32-BE` + reserved bytes (capability record, see below) |
@@ -83,7 +86,11 @@
 //! stream a high-motion region as `VIDEO_BEGIN` access units composited over
 //! the tile framebuffer (see [`crate::video`]). Video units are sequenced
 //! separately from screen updates and never skipped; a gap or a decode error
-//! makes the viewer drop P-frames and send `VIDEO_IDR_REQUEST`.
+//! makes the viewer drop P-frames and send `VIDEO_IDR_REQUEST` — or, when
+//! both peers set [`CAP_LTR`], `VIDEO_RECOVER` naming the newest long-term
+//! reference it decoded, answered with a recovery P-frame instead of an IDR.
+//! A viewer that also sets [`CAP_HEVC`] may get HEVC instead of H.264 (the
+//! header's codec byte says which).
 //!
 //! # Input v2 ([`CAP_INPUT2`])
 //!
@@ -150,6 +157,8 @@ pub use caps::{
     CAP_KEYFRAME, CAP_LOSSY, CAP_LZ4, CAP_MEDIA, CAP_MOVE, CAP_OPUS, CAP_RUDP, CAP_TILES, CAP_ZSTD,
     LOCAL_CAPS, VIEWER_W2_CAPS,
 };
+pub use caps::{CAP_HEVC, CAP_LTR};
+pub use caps::{CAP_PALETTE, CAP_VIEWPORT};
 pub(crate) use command::candidate_kind;
 pub use command::{
     Command, MonitorInfo, MouseButton, OpCode, PointerAction, PointerKind, WheelAccumulator,

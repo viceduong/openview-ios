@@ -11,7 +11,8 @@ use ovapp::sendq::{SubmitOutcome, UpdateEncoder};
 use ovcore::clocksync::instant_us;
 use tracing::{debug, warn};
 
-use super::hooks::{PendingRegion, SharedInput};
+use super::hooks::{unpack_viewport, PendingRegion, SharedInput};
+use super::wake::{next_after_input, InputBoost, InputWake};
 use crate::capture;
 use crate::input::{Region, VirtualScreen};
 use crate::settings::{
@@ -27,6 +28,9 @@ mod tests;
 const VIDEO_FPS: u32 = 30;
 /// Idle capture rate for a static screen (frames per second).
 const IDLE_FPS: u32 = 4;
+/// Longest DXGI wait slice while input-boosted (the boost state and the
+/// next input are noticed at least this often).
+const BOOST_POLL: Duration = Duration::from_millis(4);
 /// How often the host logs capture metrics while streaming.
 pub(super) const METRICS_EVERY: Duration = Duration::from_secs(30);
 
@@ -64,9 +68,16 @@ pub(super) struct CaptureCtl {
     pub(super) keyframe: Arc<AtomicBool>,
     /// Pending VIDEO_IDR_REQUEST (shared with the hooks).
     pub(super) video_idr: Arc<AtomicBool>,
+    /// VIDEO_RECOVER / VIDEO_LTR_ACK feedback (shared with the hooks).
+    pub(super) video_fb: Arc<ovapp::video::VideoFeedback>,
     /// The link pacer's delivery-rate estimate, bytes/s (0 = none yet):
     /// the H.264 bitrate follows it.
     pub(super) link_rate: AtomicU64,
+    /// Injected input (shared with the hooks): wakes the capture thread and
+    /// boosts it to the full rate for a moment.
+    pub(super) input_wake: Arc<InputWake>,
+    /// The viewer's VIEWPORT (packed, shared with the hooks; 0 = none).
+    pub(super) viewport: Arc<AtomicU64>,
 }
 
 /// Drain pacing: how long the capture thread should hold off so its next
@@ -236,6 +247,8 @@ pub(super) fn capture_loop(
     // Smoothed wire bytes of a changed update (for the 60 fps rule).
     let mut update_bytes: f64 = 0.0;
     let mut enc_logged = ovapp::sendq::EncoderStats::default();
+    // Full rate for a moment after the viewer's input (see `wake`).
+    let mut boost = InputBoost::default();
     #[cfg(windows)]
     let _mmcss = MmcssGuard::enter("Capture").or_else(|| {
         debug!("MMCSS registration failed (capture thread keeps normal priority)");
@@ -262,6 +275,8 @@ pub(super) fn capture_loop(
                     // New monitor: the next update is a full frame (and
                     // whatever streamed as video is gone).
                     enc.reset();
+                    // The old viewport described the old monitor.
+                    ctl.viewport.store(0, Ordering::Relaxed);
                     video.stop(&mailbox, false);
                     ctl.monitors_dirty.store(true, Ordering::Relaxed);
                     debug!(
@@ -282,6 +297,15 @@ pub(super) fn capture_loop(
         let caps = ctl.peer_caps.load(Ordering::Relaxed);
         enc.set_peer_caps(caps);
         enc.set_link_rate(ctl.link_rate.load(Ordering::Relaxed));
+        // Viewport priority (only acted on for a CAP_VIEWPORT viewer).
+        let vp = unpack_viewport(ctl.viewport.load(Ordering::Relaxed));
+        if vp != enc.viewport() {
+            match vp {
+                Some(r) => debug!("viewport -> {}x{} at ({},{})", r.w, r.h, r.x, r.y),
+                None => debug!("viewport -> whole screen"),
+            }
+            enc.set_viewport(vp);
+        }
         let h264 =
             caps & ovapp::terminal::CAP_H264 != 0 && H264_MODE.load(Ordering::Relaxed) != H264_OFF;
         if ctl.keyframe.swap(false, Ordering::Relaxed) {
@@ -289,6 +313,17 @@ pub(super) fn capture_loop(
             video.request_idr();
             next_capture = Instant::now();
         }
+        // CAP_HEVC / CAP_LTR choose the codec and LTR recovery; LTR acks and
+        // recover requests go to the session before this capture.
+        video.set_peer_caps(
+            caps & ovapp::terminal::CAP_HEVC != 0,
+            caps & ovapp::terminal::CAP_LTR != 0,
+        );
+        let fb = ctl.video_fb.take();
+        if fb.recover.is_some() {
+            next_capture = Instant::now();
+        }
+        video.apply_feedback(fb);
         if ctl.video_idr.swap(false, Ordering::Relaxed) {
             video.request_idr();
             next_capture = Instant::now();
@@ -323,6 +358,14 @@ pub(super) fn capture_loop(
             }
         };
         let effective = decision.fps;
+        let active = Duration::from_secs_f64(1.0 / f64::from(effective.max(1)));
+        // Input injected: the reaction is captured at the active rate, not
+        // at the next idle tick.
+        if let Some(at) = ctl.input_wake.take() {
+            boost.on_input(at);
+            let _ = gov.on_change();
+            next_capture = next_after_input(next_capture, last_started, active, Instant::now());
+        }
         let rate = ctl.link_rate.load(Ordering::Relaxed);
         video.set_link_rate((rate > 0).then_some(rate as f64 * decision.bitrate_scale));
         video.set_fps(if want == 0 && !decision.degraded {
@@ -367,13 +410,13 @@ pub(super) fn capture_loop(
                 metrics.encodes += 1;
             }
         }
-        let poll = if refine_due {
-            Duration::from_millis(4)
+        let now = Instant::now();
+        let boosted = boost.active(now);
+        let poll = if refine_due || boosted {
+            BOOST_POLL
         } else {
             Duration::from_millis(20)
         };
-        let now = Instant::now();
-        let active = Duration::from_secs_f64(1.0 / f64::from(effective.max(1)));
         if now < next_capture {
             // Short slices so stop/retarget/pause are noticed promptly.
             let slice = (next_capture - now).min(poll);
@@ -391,7 +434,10 @@ pub(super) fn capture_loop(
                     }
                 }
                 Some(false) => {}
-                None => std::thread::sleep(slice),
+                // GDI / test pattern: sleep, but wake on input.
+                None => {
+                    let _ = ctl.input_wake.sleep(slice);
+                }
             }
             continue;
         }
@@ -516,9 +562,15 @@ pub(super) fn capture_loop(
                         let _ = gov.on_change();
                     }
                     SubmitOutcome::Unchanged => {
-                        // Unchanged screen: no wire traffic at all.
+                        // Unchanged screen: no wire traffic at all. Right
+                        // after input the rate stays up (the reaction may
+                        // still be on its way).
                         frames_skipped += 1;
-                        let _ = gov.on_idle();
+                        let _ = if boost.active(Instant::now()) {
+                            gov.on_change()
+                        } else {
+                            gov.on_idle()
+                        };
                     }
                     out => {
                         metrics.encodes += 1;
@@ -605,7 +657,7 @@ pub(super) fn capture_loop(
 /// The H.264 encoder factory of the capture thread: Media Foundation,
 /// hardware first unless `--h264 sw`.
 fn video_encoder_factory() -> ovapp::video::EncoderFactory {
-    Box::new(|w, h, fps, bitrate| {
+    Box::new(|spec: &ovapp::video::EncoderSpec| {
         #[cfg(windows)]
         {
             let pref = match H264_MODE.load(Ordering::Relaxed) {
@@ -614,19 +666,24 @@ fn video_encoder_factory() -> ovapp::video::EncoderFactory {
                 _ => ovapp::mfcodec::EncoderPref::Auto,
             };
             let t0 = Instant::now();
-            let e = ovapp::mfcodec::MfVideoEncoder::new(w, h, fps, bitrate, pref)?;
+            let e = ovapp::mfcodec::MfVideoEncoder::with_spec(spec, pref)?;
             debug!(
-                "H.264 encoder {} for {w}x{h} @ {fps} fps, {:.1} Mbps (opened in {} ms)",
+                "{} encoder {} for {}x{} @ {} fps, {:.1} Mbps, LTR x{} (opened in {} ms)",
+                spec.codec,
                 ovapp::video::VideoEncode::name(&e),
-                f64::from(bitrate) / 1e6,
+                spec.w,
+                spec.h,
+                spec.fps,
+                f64::from(spec.bitrate) / 1e6,
+                ovapp::video::VideoEncode::ltr_slots(&e),
                 t0.elapsed().as_millis()
             );
             Ok(Box::new(e) as Box<dyn ovapp::video::VideoEncode>)
         }
         #[cfg(not(windows))]
         {
-            let _ = (w, h, fps, bitrate);
-            Err("no H.264 encoder on this platform".to_owned())
+            let _ = spec;
+            Err("no video encoder on this platform".to_owned())
         }
     })
 }
@@ -638,15 +695,20 @@ fn log_video(st: &ovapp::video::VideoStats, last: &mut ovapp::video::VideoStats,
         let bytes = st.bytes - last.bytes;
         let t = st.encode_time.saturating_sub(last.encode_time);
         debug!(
-            "H.264: {frames} pictures ({} IDR), {:.2} ms/picture encode, {:.0} KB/s; \
-             {} motion period(s), {} grow(s), {} back to tiles, {} skipped (link busy)",
+            "video: {frames} pictures ({} IDR), {:.2} ms/picture encode, {:.0} KB/s; \
+             {} motion period(s), {} grow(s), {} back to tiles, {} skipped (link busy); \
+             {} encoder(s), {} LTR mark(s), {} LTR recoveries, {} recover-by-IDR",
             st.keyframes - last.keyframes,
             t.as_secs_f64() * 1000.0 / frames.max(1) as f64,
             bytes as f64 / 1024.0 / over.as_secs_f64().max(0.001),
             st.enters - last.enters,
             st.grows - last.grows,
             st.exits - last.exits,
-            st.skipped - last.skipped
+            st.skipped - last.skipped,
+            st.encoders - last.encoders,
+            st.ltr_marks - last.ltr_marks,
+            st.recoveries - last.recoveries,
+            st.recover_idrs - last.recover_idrs
         );
     }
     *last = *st;

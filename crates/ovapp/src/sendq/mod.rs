@@ -54,6 +54,7 @@ mod encoder;
 mod mailbox;
 mod refine;
 mod sender;
+mod viewport;
 
 #[cfg(test)]
 mod tests;

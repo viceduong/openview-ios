@@ -180,3 +180,69 @@ fn probe_echoes_do_not_disturb_the_keepalive_rtt() {
         crate::ov_screen_free(screen);
     }
 }
+
+extern "C" fn on_video(_user: *mut c_void, _packet: *const crate::OvVideoPacket) {}
+
+/// Shell-reported video decode times (`ov_screen_latency_video_decoded`):
+/// once opted in, a unit handed to the video sink is measured only after
+/// the shell said it decoded it, by a present drawn after that.
+#[test]
+fn video_decode_time_comes_from_the_shell() {
+    use ovapp::tiles::TileRect;
+    use ovapp::video::{VideoHeader, CODEC_H264, VIDEO_KEYFRAME};
+    let idr: Vec<u8> = [
+        &[0, 0, 0, 1, 0x67, 0x4D, 0x00, 0x28, 0xAB][..],
+        &[0, 0, 0, 1, 0x68, 0xEE, 0x3C, 0x80][..],
+        &[0, 0, 1, 0x65, 0x88, 0x80, 0x10, 0x00, 0x2F][..],
+    ]
+    .concat();
+    let header = VideoHeader {
+        seq: 0,
+        flags: VIDEO_KEYFRAME,
+        codec: CODEC_H264,
+        rect: TileRect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 32,
+        },
+        screen_w: 640,
+        screen_h: 480,
+        pts_us: 1,
+    };
+    unsafe {
+        assert_eq!(
+            crate::ov_screen_latency_video_decoded(std::ptr::null_mut(), 0, 0),
+            -1
+        );
+        let screen = crate::ov_screen_new();
+        assert_eq!(
+            crate::ov_screen_set_video_sink(screen, std::ptr::null_mut(), Some(on_video)),
+            0
+        );
+        assert_eq!(feed(screen, &Command::Caps { flags: LOCAL_CAPS }), 0);
+        // Opt in (an unknown unit: nothing to mark).
+        assert_eq!(crate::ov_screen_latency_video_decoded(screen, 99, 0), 0);
+        assert_eq!(
+            feed(
+                screen,
+                &Command::VideoBegin {
+                    header,
+                    compressed_len: idr.len() as u32
+                }
+            ),
+            0
+        );
+        assert_eq!(feed(screen, &Command::FrameData(idr.clone())), 0);
+        assert_eq!(feed(screen, &Command::FrameEnd(0)), 0);
+        // Handed over but not decoded yet: a present measures nothing.
+        assert_eq!(crate::ov_screen_latency_presented(screen, 0, 0), 0);
+        // Decoded 1 ms ago; the next present (drawn now) measures it.
+        assert_eq!(crate::ov_screen_latency_video_decoded(screen, 0, 1_000), 0);
+        assert_eq!(crate::ov_screen_latency_presented(screen, 0, 0), 1);
+        let s = stats(screen);
+        assert_eq!(s.present.samples, 1);
+        assert!(s.present.p50_us >= 1_000, "present {:?}", s.present);
+        crate::ov_screen_free(screen);
+    }
+}

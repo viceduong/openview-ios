@@ -26,9 +26,10 @@ final class ScreenModel: ObservableObject {
     // and the renderer blits them (not published: the surface drains it on
     // every redraw). nil = no Metal: the CGImage path above.
     let uploads: FrameUploadQueue? = MetalContext.shared.map { FrameUploadQueue(context: $0) }
-    // The H.264 overlay for high-motion regions (not published —
-    // the frame view hosts its layer; samples are enqueued directly).
-    let video = VideoOverlay()
+    // Decoded hardware-video (H.264 / HEVC) pictures for high-motion
+    // regions (not published — thread safe: the VideoToolbox output fills
+    // it, the Metal renderer takes the newest at each display refresh).
+    let video = VideoFrameQueue()
 }
 
 /// Liveness state, observed only by the stats chip and the
@@ -52,9 +53,6 @@ struct PendingScreen {
     var frame: (image: CGImage?, size: CGSize)?
     var cursorPos: CGPoint?
     var cursorShape: (image: CGImage?, hotspot: CGSize, size: CGSize)?
-    /// This frame is the lossless refresh after VIDEO_END of that
-    /// video generation — hide the overlay together with showing it.
-    var hideVideoGen: Int?
 
-    var isEmpty: Bool { frame == nil && cursorPos == nil && cursorShape == nil && hideVideoGen == nil }
+    var isEmpty: Bool { frame == nil && cursorPos == nil && cursorShape == nil }
 }

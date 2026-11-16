@@ -12,6 +12,8 @@ mod lan;
 mod latency;
 mod pin;
 mod relay;
+mod video_ltr;
+mod viewport;
 
 thread_local! {
     static THROTTLE: std::sync::Arc<ovcore::throttle::AuthThrottle> =

@@ -488,6 +488,12 @@ DXGI capture path (capture the primary monitor). The viewer presses F24
 `--dry-input` — waits for the patch colour at (32, 32) to flip, then pauses
 300 ms; a flip not seen within 3 s counts as a timeout.
 
+Since the input wake (any input pulls the host's next capture in and holds
+the full capture rate for 750 ms) the probe on loopback with `--test-pattern
+video` reads p95 38-67 ms / p99 97-155 ms over 200 presses, down from
+p95 ~140 ms / p99 143-174 ms, where a press during the pattern's rest phase
+waited for the idle governor's next 4 fps tick.
+
 **Measurement plan.** For each change: release builds, the same two machines
 (or loopback for the pipeline alone), 60 s of `--test-pattern video` plus a
 200-press probe, recorded on the relay path and on the direct path, with

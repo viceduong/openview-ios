@@ -1496,11 +1496,11 @@ fn screen_passes_h264_through_and_advertises_cap_h264() {
         assert_eq!(crate::ov_screen_request_video_idr(std::ptr::null_mut()), -1);
         crate::ov_screen_free(screen);
     }
-    // Layout: u64 x2, u32 x8, 6 words, then four
-    // colour bytes padded to the struct alignment.
+    // Layout: u64 x2, u32 x8, 6 words, four colour bytes padded to a word,
+    // then the HEVC vps pointer + length (2 words).
     assert_eq!(
         std::mem::size_of::<crate::OvVideoPacket>(),
-        16 + 32 + 6 * std::mem::size_of::<usize>() + std::mem::size_of::<usize>()
+        16 + 32 + 9 * std::mem::size_of::<usize>()
     );
     assert_eq!(
         std::mem::offset_of!(crate::OvVideoPacket, colour_primaries),

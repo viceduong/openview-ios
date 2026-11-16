@@ -562,3 +562,40 @@ pub unsafe extern "C" fn ov_session_option_record(
         b.len() as i32
     })
 }
+
+/// Build a VIEWPORT record payload into `out` (>= 11 bytes) for
+/// `ov_session_send_record(channel 0)`: the part of the remote screen the
+/// shell shows (`x, y, w, h` in remote frame pixels; `w`/`h` 0 = none) and
+/// its zoom (`scale_milli` = device pixels per remote pixel x 1000). Send it
+/// only when `ov_screen_peer_caps` has `CAP_VIEWPORT` (1 << 22): the host
+/// then sends the visible tiles first. Returns the length (11) or -1.
+///
+/// # Safety
+/// `out` must be null or writable for `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ov_viewport_record(
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    scale_milli: u16,
+    out: *mut u8,
+    cap: usize,
+) -> i32 {
+    ffi_guard!(OV_ERR_PANIC, {
+        let b = ovapp::terminal::encode(&ovapp::terminal::Command::Viewport {
+            x,
+            y,
+            w,
+            h,
+            scale_milli,
+        });
+        if out.is_null() || cap < b.len() {
+            return -1;
+        }
+        // SAFETY: `out` is non-null and writable for `cap >= b.len()` bytes
+        // (caller contract).
+        unsafe { write(&b, out) };
+        b.len() as i32
+    })
+}

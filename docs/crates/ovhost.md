@@ -18,6 +18,7 @@ relative to the repository root.
 | `crates/ovhost/src/lan.rs` | `LanListener`: the LAN session port (UDP, default 4571) that takes a viewer's HELLO without the relay |
 | `crates/ovhost/src/session/screen.rs` | `serve_screen` / `screen_session_loop`: capture and mic threads, the session thread that owns the wire |
 | `crates/ovhost/src/session/capture_loop.rs` (+ `capture_loop/tests.rs`) | The capture thread: grab, tile / H.264 encode, rate and quality control, metrics |
+| `crates/ovhost/src/session/wake.rs` | Input wake of the capture thread (`InputWake`, `InputBoost`, `INPUT_BOOST`) |
 | `crates/ovhost/src/session/terminal.rs` | `serve_terminal`: the terminal-mode loop |
 | `crates/ovhost/src/session/hooks.rs` (+ `hooks/tests.rs`) | `HostHooks`: the inbound-command hook shared by both loops (input, CAPS, quality, clipboard, audio, files, chat) |
 | `crates/ovhost/src/session/liveness.rs` | Keepalive PONG bookkeeping and the dead / gone verdicts |
@@ -235,6 +236,8 @@ transport retransmit timer). The constants (in `src/session/`) are:
 | (screen mode cap) | `screen.rs` | 50 ms | Longest idle wait in screen mode when the socket is watched |
 | `METRICS_EVERY` | `capture_loop.rs` | 30 s | Interval between capture, pacing and media metric lines |
 | `IDLE_FPS` | `capture_loop.rs` | 4 | Governor rate for a static screen |
+| `INPUT_BOOST` | `wake.rs` | 750 ms | Full capture rate after each injected input event |
+| `BOOST_POLL` | `capture_loop.rs` | 4 ms | Longest DXGI wait slice while input-boosted |
 | `VIDEO_FPS` | `capture_loop.rs` | 30 | Minimum capture rate while a region streams as H.264 (AUTO only) |
 | `FRAME_CHUNK` | `screen.rs` | `ovapp::sendq::DEFAULT_CHUNK` = 4096 B | FRAME_DATA chunk size |
 
@@ -390,6 +393,13 @@ in `ovapp`.
 * **Rate control**:
   * `RateGovernor::new(--fps, IDLE_FPS=4)`: when nothing changes, the capture
     rate eases down to 4 fps.
+  * Input wake (`session/wake.rs`): the hook calls `InputWake::notify` after
+    every injected input event; the capture loop then pulls its next capture
+    in to the active interval and holds the full rate for `INPUT_BOOST`
+    (750 ms) — a non-waitable source's sleep ends on the input.
+  * `VIEWPORT` (`CAP_VIEWPORT`): the hook parks the viewer's visible rect
+    (packed in one `AtomicU64`); the capture loop hands it to
+    `UpdateEncoder::set_viewport` (cleared on a monitor retarget).
   * `QUALITY_SET` from the viewer: 0 means AUTO. Any other value is a fixed
     rate that overrides AUTO.
   * AUTO uses `ovapp::adapt::AutoQuality`, which follows the pacer's excess

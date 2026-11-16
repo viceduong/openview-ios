@@ -31,11 +31,12 @@ pub(super) fn friendly_name(a: &IMFActivate) -> String {
     }
 }
 
-/// Registered hardware H.264 encoders (best first).
-pub(super) fn hardware_encoders() -> Vec<IMFActivate> {
+/// Registered hardware encoders producing `subtype` (`MFVideoFormat_H264` /
+/// `MFVideoFormat_HEVC`), best first.
+pub(super) fn hardware_encoders(subtype: &GUID) -> Vec<IMFActivate> {
     let out = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: *subtype,
     };
     let mut pp: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut n = 0u32;

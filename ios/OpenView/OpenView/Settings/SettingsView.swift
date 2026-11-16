@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.directConnection) private var directConnection = true
     // Display
     @AppStorage(SettingsKey.sharpen) private var sharpen = true
+    @AppStorage(SettingsKey.hevcVideo) private var hevcVideo = false
     // Input
     @AppStorage(RemoteInputController.cmdAsCtrlDefaultsKey) private var cmdAsCtrl = true
     @AppStorage(RemoteInputController.pointerLockDefaultsKey) private var pointerLock = false
@@ -149,8 +150,9 @@ struct SettingsView: View {
     /// Renderer look.
     private var display: some View {
         Section(header: Text("Display"),
-                footer: Text("Sharpens the remote screen after scaling.")) {
+                footer: Text("Sharpen: crisper remote screen after scaling. HEVC: asks the PC for HEVC instead of H.264 for moving content (experimental; applies to new connections).")) {
             Toggle("Sharpen", isOn: $sharpen)
+            Toggle("HEVC video (experimental)", isOn: $hevcVideo)
         }
     }
 

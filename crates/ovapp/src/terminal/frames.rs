@@ -9,11 +9,12 @@ use ovtransport::TransportError;
 use crate::latency::{KIND_SCREEN, KIND_VIDEO};
 use crate::screen::{Frame, FrameHook};
 use crate::tiles::{ApplyError, UpdateMeta};
+use crate::video::DecodedTo;
 
 use super::session::PendingFrame;
 use super::{
-    compress_frame, Command, FrameCodec, TerminalSession, VideoRxStats, CAP_H264, CAP_KEYFRAME,
-    KEYFRAME_RETRY, MAX_LATENCY_SAMPLES, MAX_QUEUED_FRAMES, VIDEO_STALL_GAP,
+    compress_frame, Command, FrameCodec, TerminalSession, VideoRxStats, CAP_H264, CAP_HEVC,
+    CAP_KEYFRAME, CAP_LTR, KEYFRAME_RETRY, MAX_LATENCY_SAMPLES, MAX_QUEUED_FRAMES, VIDEO_STALL_GAP,
 };
 
 impl TerminalSession {
@@ -23,13 +24,20 @@ impl TerminalSession {
         &self.video_latencies
     }
 
-    /// Install an H.264 decoder and advertise [`CAP_H264`] (call
-    /// before [`announce_caps`](Self::announce_caps)). Video units are then
-    /// decoded in arrival order and painted over the framebuffer that
-    /// `take_*frame` snapshots.
+    /// Install a video decoder and advertise [`CAP_H264`] — plus
+    /// [`CAP_HEVC`] when [`VideoDecode::hevc`](crate::video::VideoDecode::hevc)
+    /// says it takes HEVC (call before
+    /// [`announce_caps`](Self::announce_caps)). Video units are then decoded
+    /// in arrival order and painted over the framebuffer that `take_*frame`
+    /// snapshots.
     pub fn set_video_decoder(&mut self, dec: Box<dyn crate::video::VideoDecode>) {
-        self.video_dec = Some(dec);
         self.local_caps |= CAP_H264;
+        if dec.hevc() {
+            self.local_caps |= CAP_HEVC;
+        } else {
+            self.local_caps &= !CAP_HEVC;
+        }
+        self.video_dec = Some(dec);
     }
 
     /// H.264 receive counters.
@@ -160,6 +168,9 @@ impl TerminalSession {
                 }
             }
         }
+        if std::mem::take(&mut self.video_gpu_end) && self.end_gpu_video() {
+            applied = true;
+        }
         if applied {
             if let Some(old) = out.take() {
                 self.recycle_pixels(old.pixels);
@@ -168,7 +179,7 @@ impl TerminalSession {
         }
         // Everything queued was consumed: what was skipped or merged
         // reaches the screen with this snapshot.
-        if self.latency_on && out.is_some() {
+        if self.latency_on && (out.is_some() || self.video_gpu_fresh) {
             self.latency.on_decoded_all(Instant::now());
         }
         out
@@ -296,6 +307,9 @@ impl TerminalSession {
                 // lossless refresh that follows overwrites it.
                 self.video_stats.ends += 1;
                 self.last_paint = None;
+                if self.video_gpu.is_some() {
+                    self.video_gpu_end = true;
+                }
                 self.recycle_wire(data);
             }
             VideoVerdict::Drop => {
@@ -344,9 +358,30 @@ impl TerminalSession {
         };
         let (w, h) = (u32::from(header.rect.w), u32::from(header.rect.h));
         let t0 = Instant::now();
-        match dec.decode(data, w, h, &mut self.video_px) {
-            Ok(true) => {
-                self.video_stats.decode_time += t0.elapsed();
+        // Zero-copy (GPU-presented) pictures unless an `on_frame` hook
+        // wants every frame's pixels.
+        let res = if self.on_frame.is_none() {
+            dec.decode_unit(header, data, &mut self.video_px)
+        } else {
+            dec.decode_codec(header.video_codec(), data, w, h, &mut self.video_px)
+                .map(|ok| match ok {
+                    true => DecodedTo::Cpu,
+                    false => DecodedTo::Nothing,
+                })
+        };
+        let decode_time = t0.elapsed();
+        if res.is_ok() {
+            if let Some(seq) = self.video_rx.decoded(header) {
+                // An LTR picture is in the decoder: the host may recover from it.
+                if self.send(&Command::VideoLtrAck { seq }).is_ok() {
+                    self.video_stats.ltr_acks += 1;
+                }
+            }
+        }
+        match res {
+            Ok(DecodedTo::Cpu) => {
+                self.video_stats.decode_time += decode_time;
+                self.video_gpu = None;
                 let painted = self.screen.blit(
                     header.rect,
                     header.screen_w,
@@ -354,40 +389,78 @@ impl TerminalSession {
                     &self.video_px,
                 );
                 if painted {
-                    self.video_stats.painted += 1;
-                    let lat = crate::video::unix_micros().saturating_sub(header.pts_us);
-                    if lat < 10_000_000 {
-                        self.video_stats.latency_sum_us += lat;
-                        self.video_stats.latency_n += 1;
-                        self.video_stats.latency_max_us = self.video_stats.latency_max_us.max(lat);
-                        if self.video_latencies.len() < MAX_LATENCY_SAMPLES {
-                            self.video_latencies.push(lat as u32);
-                        }
-                    }
-                    let now = Instant::now();
-                    if let Some(prev) = self.last_paint {
-                        let gap = now.saturating_duration_since(prev);
-                        if gap > VIDEO_STALL_GAP {
-                            self.video_stats.stalls += 1;
-                            self.video_stats.stall_us += gap.as_micros() as u64;
-                        }
-                    }
-                    self.last_paint = Some(now);
+                    self.note_video_painted(header);
                 }
                 painted
             }
-            Ok(false) => false,
+            Ok(DecodedTo::Gpu) => {
+                // On screen through the decoder's GPU picture; the
+                // framebuffer itself is unchanged.
+                self.video_stats.decode_time += decode_time;
+                self.video_gpu = Some((header.rect, header.screen_w, header.screen_h));
+                self.video_gpu_fresh = true;
+                self.note_video_painted(header);
+                false
+            }
+            Ok(DecodedTo::Nothing) => false,
             Err(e) => {
                 tracing::debug!("video {}: decode failed: {e}", header.seq);
                 self.video_stats.decode_errors += 1;
-                self.video_rx.mark_broken();
+                self.video_rx.mark_corrupt();
                 self.request_video_idr();
                 false
             }
         }
     }
 
-    /// Ask the host for an IDR, at most every [`KEYFRAME_RETRY`].
+    /// Stats for a video picture that reached the screen: count, capture
+    /// latency, stalls.
+    fn note_video_painted(&mut self, header: &crate::video::VideoHeader) {
+        self.video_stats.painted += 1;
+        let lat = crate::video::unix_micros().saturating_sub(header.pts_us);
+        if lat < 10_000_000 {
+            self.video_stats.latency_sum_us += lat;
+            self.video_stats.latency_n += 1;
+            self.video_stats.latency_max_us = self.video_stats.latency_max_us.max(lat);
+            if self.video_latencies.len() < MAX_LATENCY_SAMPLES {
+                self.video_latencies.push(lat as u32);
+            }
+        }
+        let now = Instant::now();
+        if let Some(prev) = self.last_paint {
+            let gap = now.saturating_duration_since(prev);
+            if gap > VIDEO_STALL_GAP {
+                self.video_stats.stalls += 1;
+                self.video_stats.stall_us += gap.as_micros() as u64;
+            }
+        }
+        self.last_paint = Some(now);
+    }
+
+    /// Motion ended while the decoder showed a GPU picture: read it back
+    /// into the framebuffer (the lossless refresh then replaces it) and
+    /// stop showing it. Whether the framebuffer changed.
+    fn end_gpu_video(&mut self) -> bool {
+        let Some((rect, sw, sh)) = self.video_gpu.take() else {
+            return false;
+        };
+        let Some(dec) = self.video_dec.as_mut() else {
+            return false;
+        };
+        dec.end_gpu(&mut self.video_px) && self.screen.blit(rect, sw, sh, &self.video_px)
+    }
+
+    /// Whether a GPU-presented video picture (zero-copy decoder) was decoded
+    /// since the last call — it reaches the screen without a framebuffer
+    /// snapshot, so the presenter must repaint.
+    pub fn take_gpu_video(&mut self) -> bool {
+        std::mem::take(&mut self.video_gpu_fresh)
+    }
+
+    /// The video chain is broken: ask the host for a way back in, at most
+    /// every [`KEYFRAME_RETRY`] — `VIDEO_RECOVER` from the newest long-term
+    /// reference we hold when both peers speak [`CAP_LTR`] (and no recovery
+    /// for it is outstanding), else `VIDEO_IDR_REQUEST`.
     pub(super) fn request_video_idr(&mut self) {
         let now = Instant::now();
         if self
@@ -397,9 +470,19 @@ impl TerminalSession {
             return;
         }
         self.last_idr_request = Some(now);
-        let have_seq = self.last_video_seq;
-        if self.send(&Command::VideoIdrRequest { have_seq }).is_ok() {
-            self.video_stats.idr_requests += 1;
+        let ltr = self.local_caps & self.peer_caps.unwrap_or(0) & CAP_LTR != 0;
+        match self.video_rx.request(ltr) {
+            crate::video::VideoRequest::Recover { ltr_seq } => {
+                if self.send(&Command::VideoRecover { ltr_seq }).is_ok() {
+                    self.video_stats.recover_requests += 1;
+                }
+            }
+            crate::video::VideoRequest::Idr => {
+                let have_seq = self.last_video_seq;
+                if self.send(&Command::VideoIdrRequest { have_seq }).is_ok() {
+                    self.video_stats.idr_requests += 1;
+                }
+            }
         }
     }
 

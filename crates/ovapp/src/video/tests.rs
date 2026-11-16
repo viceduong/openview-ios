@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::convert::{bgra_to_nv12_band, nv12_to_bgra_band};
+use super::session::CachedEncoder;
 use super::*;
 use crate::sendq::FrameMailbox;
 use crate::tiles::{TileMap, TileRect};
@@ -555,6 +556,7 @@ impl VideoEncode for Fake {
         Ok(vec![EncodedAu {
             data: vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, 1],
             keyframe: key,
+            ltr: Default::default(),
             pts_us,
         }])
     }
@@ -567,7 +569,8 @@ impl VideoEncode for Fake {
 }
 
 fn fake_factory(log: std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> EncoderFactory {
-    Box::new(move |w, h, _fps, _b| {
+    Box::new(move |s: &EncoderSpec| {
+        let (w, h) = (s.w, s.h);
         log.borrow_mut().push(format!("new {w}x{h}"));
         Ok(Box::new(Fake {
             log: log.clone(),
@@ -582,6 +585,7 @@ fn fake_factory(log: std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> EncoderFac
 fn encoder_rect_buckets_and_reuses_the_encoder_size() {
     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let mut vs = VideoSession::new(fake_factory(log.clone()), 30);
+    vs.set_fixed_surface(false);
     let (sw, sh) = (1920u32, 1080u32);
     let need = TileRect {
         x: 640,
@@ -596,7 +600,18 @@ fn encoder_rect_buckets_and_reuses_the_encoder_size() {
     };
     assert!(contains(r, need) && u32::from(r.x) + u32::from(r.w) <= sw);
     // An encoder of that size exists: a grown rect that still fits keeps it.
-    vs.enc = Some((640, 384, (vs.factory)(640, 384, 30, 1).unwrap()));
+    let spec = EncoderSpec {
+        w: 640,
+        h: 384,
+        fps: 30,
+        bitrate: 1,
+        codec: VideoCodec::H264,
+        ltr_slots: 0,
+    };
+    vs.enc = Some(CachedEncoder {
+        spec,
+        enc: (vs.factory)(&spec).unwrap(),
+    });
     let grown = TileRect {
         x: 576,
         y: 320,
@@ -835,8 +850,7 @@ fn encoder_failure_falls_back_to_tiles() {
         enter_after: Duration::ZERO,
         ..MotionConfig::default()
     };
-    let mut vs =
-        VideoSession::with_config(Box::new(|_, _, _, _| Err("no encoder".to_owned())), 30, cfg);
+    let mut vs = VideoSession::with_config(Box::new(|_| Err("no encoder".to_owned())), 30, cfg);
     let mb = FrameMailbox::default();
     let all = map_with(
         w,

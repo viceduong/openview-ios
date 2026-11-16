@@ -157,6 +157,19 @@ pub fn encode(cmd: &Command) -> Vec<u8> {
         Command::QualitySet { target_fps } => {
             (OpCode::QualitySet, target_fps.to_be_bytes().to_vec())
         }
+        Command::Viewport {
+            x,
+            y,
+            w,
+            h,
+            scale_milli,
+        } => {
+            let b = [x, y, w, h, scale_milli]
+                .iter()
+                .flat_map(|v| v.to_be_bytes())
+                .collect();
+            (OpCode::Viewport, b)
+        }
         Command::CaptureRegion { x, y, w, h } => {
             let mut b = Vec::with_capacity(16);
             b.extend_from_slice(&x.to_be_bytes());
@@ -237,6 +250,8 @@ pub fn encode(cmd: &Command) -> Vec<u8> {
         Command::VideoIdrRequest { have_seq } => {
             (OpCode::VideoIdrRequest, have_seq.to_be_bytes().to_vec())
         }
+        Command::VideoLtrAck { seq } => (OpCode::VideoLtrAck, seq.to_be_bytes().to_vec()),
+        Command::VideoRecover { ltr_seq } => (OpCode::VideoRecover, ltr_seq.to_be_bytes().to_vec()),
         Command::DirectCandidates { cands } => {
             let mut b = Vec::with_capacity(1 + cands.len() * 20);
             let n = cands.len().min(32);
@@ -488,6 +503,19 @@ fn decode_command(wire: &[u8]) -> Result<Command, String> {
                 bgra: payload[8..].to_vec(),
             }
         }
+        OpCode::Viewport => {
+            let Ok(b) = <[u8; 10]>::try_from(payload) else {
+                return Err("VIEWPORT payload must be 10 bytes".into());
+            };
+            let u = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+            Command::Viewport {
+                x: u(0),
+                y: u(2),
+                w: u(4),
+                h: u(6),
+                scale_milli: u(8),
+            }
+        }
         OpCode::QualitySet => {
             if payload.len() != 2 {
                 return Err("QUALITY_SET payload must be 2 bytes".into());
@@ -624,6 +652,17 @@ fn decode_command(wire: &[u8]) -> Result<Command, String> {
                 0
             },
         },
+        OpCode::VideoLtrAck | OpCode::VideoRecover => {
+            let Some(b) = payload.get(..8) else {
+                return Err(format!("{op:?} payload too short"));
+            };
+            let v = u64::from_be_bytes(b.try_into().unwrap());
+            if op == OpCode::VideoLtrAck {
+                Command::VideoLtrAck { seq: v }
+            } else {
+                Command::VideoRecover { ltr_seq: v }
+            }
+        }
         OpCode::DirectCandidates => Command::DirectCandidates {
             cands: parse_candidates(payload)?,
         },

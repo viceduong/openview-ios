@@ -131,6 +131,15 @@ pub struct TerminalSession {
     pub(super) video_dec: Option<Box<dyn crate::video::VideoDecode>>,
     /// Decoded picture scratch (tight BGRA).
     pub(super) video_px: Vec<u8>,
+    /// Where the picture a zero-copy decoder presents on the GPU sits
+    /// (`rect`, screen w, screen h): the framebuffer under it is stale until
+    /// [`VideoDecode::end_gpu`](crate::video::VideoDecode::end_gpu).
+    pub(super) video_gpu: Option<(crate::tiles::TileRect, u32, u32)>,
+    /// A GPU-presented picture was decoded since the last `take_gpu_video`.
+    pub(super) video_gpu_fresh: bool,
+    /// VIDEO_END arrived while a GPU picture showed: fold it into the
+    /// framebuffer once the queued units are decoded.
+    pub(super) video_gpu_end: bool,
     /// When the last VIDEO_IDR_REQUEST went out (rate limit).
     pub(super) last_idr_request: Option<Instant>,
     /// Sequence number of the last complete video unit (IDR requests).
@@ -170,6 +179,10 @@ pub struct VideoRxStats {
     pub decode_errors: u64,
     /// VIDEO_IDR_REQUESTs sent.
     pub idr_requests: u64,
+    /// VIDEO_RECOVERs sent (LTR recovery asked instead of an IDR).
+    pub recover_requests: u64,
+    /// VIDEO_LTR_ACKs sent.
+    pub ltr_acks: u64,
     /// VIDEO_END markers received (end of a motion period).
     pub ends: u64,
     /// Total decode time.
@@ -245,6 +258,9 @@ impl TerminalSession {
             video_rx: crate::video::VideoRx::new(),
             video_dec: None,
             video_px: Vec::new(),
+            video_gpu: None,
+            video_gpu_fresh: false,
+            video_gpu_end: false,
             last_idr_request: None,
             last_video_seq: 0,
             video_stats: VideoRxStats::default(),

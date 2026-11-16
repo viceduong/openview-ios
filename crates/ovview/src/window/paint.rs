@@ -48,7 +48,15 @@ pub(super) unsafe fn paint(hdc: HDC, state: &WindowState) {
         if let Some(r) = slot.as_mut() {
             let overlay = state.cursor.lock().map(|c| c.clone()).unwrap_or_default();
             let rect = state.content_rect();
-            match r.render(guard.as_ref(), &overlay, &hud, rect, state.client_size()) {
+            let video = state.video.current();
+            match r.render(
+                guard.as_ref(),
+                video.as_ref(),
+                &overlay,
+                &hud,
+                rect,
+                state.client_size(),
+            ) {
                 Ok(true) => return,
                 Ok(false) => {
                     state.repaint_pending.store(true, Ordering::Relaxed);
@@ -57,6 +65,9 @@ pub(super) unsafe fn paint(hdc: HDC, state: &WindowState) {
                 Err(e) => {
                     tracing::warn!("Direct2D presenter failed ({e}); falling back to GDI");
                     *slot = None;
+                    // GDI cannot draw GPU pictures: the decoder paints the
+                    // framebuffer again from its next picture.
+                    state.video.set_enabled(false);
                 }
             }
         }

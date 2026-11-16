@@ -447,7 +447,8 @@ pub enum MediaEvent {
     /// One complete video unit (VideoHeader || Annex-B), in frame order.
     Video(Vec<u8>),
     /// `frames` video frames are gone for good (FEC and NACK could not
-    /// repair them): stop decoding P-frames and ask for an IDR.
+    /// repair them): stop decoding P-frames and ask for a way back in (a
+    /// long-term-reference recovery picture, or an IDR).
     VideoLost {
         /// How many frames were lost.
         frames: u32,

@@ -9,6 +9,7 @@ use ovapp::monitors::validate_region;
 use ovapp::terminal::{Command, TerminalSession};
 use tracing::{debug, info, trace, warn};
 
+use super::wake::InputWake;
 use super::SharedClipboard;
 use crate::input::{self, VirtualScreen};
 use crate::{clipboard_os, desktop_fx, settings, speaker};
@@ -88,8 +89,16 @@ pub(super) struct HostHooks {
     pub(super) keyframe: Arc<AtomicBool>,
     /// VIDEO_IDR_REQUEST seen: the next H.264 picture is an IDR.
     pub(super) video_idr: Arc<AtomicBool>,
+    /// VIDEO_RECOVER / VIDEO_LTR_ACK seen (CAP_LTR): for the capture thread.
+    pub(super) video_fb: Arc<ovapp::video::VideoFeedback>,
     /// The session's desktop effects (SESSION_OPTION toggles).
     pub(super) fx: Option<Arc<Mutex<desktop_fx::DesktopFx>>>,
+    /// Every injected input event wakes the capture thread (full rate for
+    /// a moment, next capture pulled in; see [`super::wake`]).
+    pub(super) input_wake: Arc<InputWake>,
+    /// The viewer's VIEWPORT (`CAP_VIEWPORT`), packed by
+    /// [`pack_viewport`] (0 = none). Read by the capture thread.
+    pub(super) viewport: Arc<AtomicU64>,
 }
 
 /// The input backend for this run: `SendInput`, or the logging dry run.
@@ -131,7 +140,10 @@ impl HostHooks {
             peer_caps: Arc::new(AtomicU32::new(0)),
             keyframe: Arc::new(AtomicBool::new(false)),
             video_idr: Arc::new(AtomicBool::new(false)),
+            video_fb: Arc::new(ovapp::video::VideoFeedback::new()),
             fx: None,
+            input_wake: Arc::new(InputWake::new()),
+            viewport: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -173,7 +185,10 @@ impl HostHooks {
         let peer_caps = Arc::clone(&self.peer_caps);
         let keyframe = Arc::clone(&self.keyframe);
         let video_idr = Arc::clone(&self.video_idr);
+        let video_fb = Arc::clone(&self.video_fb);
         let fx = self.fx.clone();
+        let input_wake = Arc::clone(&self.input_wake);
+        let viewport = Arc::clone(&self.viewport);
         term.on_cmd(Some(Box::new(move |cmd| {
             let _ = live.lock().map(|mut l| l.record_inbound(Instant::now()));
             match cmd {
@@ -216,6 +231,8 @@ impl HostHooks {
                             }
                         }
                     }
+                    // The reaction is on its way: capture at full rate now.
+                    input_wake.notify();
                 }
                 Command::Echo(p) => trace!("echo {} bytes", p.len()),
                 Command::Ping(_) => {} // auto-replied by the pump
@@ -265,6 +282,13 @@ impl HostHooks {
                 Command::VideoIdrRequest { have_seq } => {
                     video_idr.store(true, Ordering::Relaxed);
                     debug!("H.264 IDR requested (viewer at video unit {have_seq})");
+                }
+                // CAP_LTR: the viewer holds LTR `seq` / lost pictures and
+                // asks to recover from `ltr_seq` instead of an IDR.
+                Command::VideoLtrAck { seq } => video_fb.ack(*seq),
+                Command::VideoRecover { ltr_seq } => {
+                    video_fb.recover(*ltr_seq);
+                    debug!("video recovery requested from LTR unit {ltr_seq}");
                 }
                 // Cursor commands are viewer-bound (host → viewer only); the host
                 // never receives them, so this is just the exhaustive-match arm.
@@ -361,6 +385,20 @@ impl HostHooks {
                 // hook; an audio gap of the viewer's mic is simply skipped
                 // (the speaker jitter buffer rides it out).
                 Command::VideoUnit { .. } | Command::MediaGap { .. } => {}
+                // VIEWPORT: what the viewer shows; the capture thread
+                // sends those tiles first.
+                Command::Viewport {
+                    x,
+                    y,
+                    w,
+                    h,
+                    scale_milli,
+                } => {
+                    let packed = pack_viewport(*x, *y, *w, *h);
+                    if viewport.swap(packed, Ordering::Relaxed) != packed {
+                        trace!("viewport {w}x{h} at ({x},{y}), scale {scale_milli}/1000");
+                    }
+                }
                 // QUALITY_SET: the viewer's target capture rate (0 = auto).
                 Command::QualitySet { target_fps: want } => {
                     target_fps.store(*want, Ordering::Relaxed);
@@ -378,6 +416,26 @@ impl HostHooks {
     pub(super) fn drain(&self) -> Vec<Vec<u8>> {
         std::mem::take(&mut *self.echo.lock().unwrap())
     }
+}
+
+/// Pack a VIEWPORT rect into one atomic word (`0` = no viewport: an
+/// empty rect).
+pub(super) fn pack_viewport(x: u16, y: u16, w: u16, h: u16) -> u64 {
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    u64::from(x) << 48 | u64::from(y) << 32 | u64::from(w) << 16 | u64::from(h)
+}
+
+/// Inverse of [`pack_viewport`].
+pub(super) fn unpack_viewport(v: u64) -> Option<ovapp::tiles::TileRect> {
+    let r = ovapp::tiles::TileRect {
+        x: (v >> 48) as u16,
+        y: (v >> 32) as u16,
+        w: (v >> 16) as u16,
+        h: v as u16,
+    };
+    (r.w > 0 && r.h > 0).then_some(r)
 }
 
 /// One trace line per inbound input command.

@@ -84,6 +84,8 @@ pub struct OvScreen {
     /// H.264 video sink: access units passed through (SPS/PPS +
     /// AVCC) for VideoToolbox. Installing it advertises `CAP_H264`.
     video_sink: Sink<VideoSink>,
+    /// [`OV_VIDEO_CAP_HEVC`] | [`OV_VIDEO_CAP_LTR`] ([`ov_screen_set_video_caps`]).
+    video_caps: u32,
     /// The open VIDEO_BEGIN (its FRAME_DATA accumulates in `buf`).
     rx_video: Option<(ovapp::video::VideoHeader, u32)>,
     /// Video continuity (a gap drops P-frames until the next IDR).
@@ -128,6 +130,10 @@ pub struct OvScreen {
     clock: ovapp::latency::ClockProbe,
     /// Per-update latency join ([`ov_screen_latency_stats`]).
     latency: ovapp::latency::LatencyTracker,
+    /// The shell reports when it decoded each video unit
+    /// ([`ov_screen_latency_video_decoded`]): delivery then only marks
+    /// video "received", and the decode stage ends at the shell's decoder.
+    video_decode_timing: bool,
 }
 
 impl OvScreen {
@@ -151,6 +157,7 @@ impl OvScreen {
             opus_sink: Sink::none(),
             opus_stereo: false,
             video_sink: Sink::none(),
+            video_caps: OV_VIDEO_CAP_LTR,
             rx_video: None,
             video_rx: ovapp::video::VideoRx::new(),
             last_video_seq: 0,
@@ -171,6 +178,7 @@ impl OvScreen {
             epoch: now,
             clock: ovapp::latency::ClockProbe::new(),
             latency: ovapp::latency::LatencyTracker::new(),
+            video_decode_timing: false,
         }
     }
 
@@ -221,6 +229,12 @@ impl OvScreen {
         }
         if self.video_sink.f.is_some() {
             flags |= ovapp::terminal::CAP_H264;
+            if self.video_caps & OV_VIDEO_CAP_HEVC != 0 {
+                flags |= ovapp::terminal::CAP_HEVC;
+            }
+        }
+        if self.video_caps & OV_VIDEO_CAP_LTR == 0 {
+            flags &= !ovapp::terminal::CAP_LTR;
         }
         if self.direct_capable {
             // The session's direct engine speaks the v2 framing and

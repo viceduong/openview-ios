@@ -364,12 +364,14 @@ MEDIA encryption:
 
 | Type | Layout |
 |---|---|
-| 1 VIDEO | `frame_id u32 ‖ idx u16 ‖ k u16 ‖ m u16 ‖ unit_len u32 ‖ flags u8 (1 keyframe, 2 retx) ‖ shard[S ≤ 1136, even]`. Shards 0..k are data; k..k+m are Reed-Solomon (GF(2^16)) recovery shards. Unit = `VideoHeader(38 B) ‖ Annex-B` (ovapp) |
+| 1 VIDEO | `frame_id u32 ‖ idx u16 ‖ k u16 ‖ m u16 ‖ unit_len u32 ‖ flags u8 (1 keyframe, 2 retx) ‖ shard[S ≤ 1136, even]`. Shards 0..k are data; k..k+m are Reed-Solomon (GF(2^16)) recovery shards. Unit = `VideoHeader(38 B) ‖ Annex-B` (ovapp; H.264 or HEVC per the header codec byte, see [MEDIA_PIPELINE §3.7](MEDIA_PIPELINE.md#37-video-wire-format-codecs-and-loss-recovery)) |
 | 2 AUDIO | `aseq u32 ‖ audio payload` (ovapp wire form) |
 | 3 FEEDBACK | `base u32 ‖ count u16 ‖ ref_us u32 ‖ count × u16` (arrival delta in 50 µs units, `0xFFFF` = lost); sent every 25 ms, ≤ 500 entries per message |
 | 4 NACK | `frame_id u32 ‖ n u16 ‖ n × idx u16`; n = 0 means the whole frame |
 
 The FEC ratio is `clamp(0.10 + 4·loss, 0.10, 0.30)` while there is loss, and 0.02 for delta frames after 3 s without loss while the RTT is below the frame interval (sender-side only: the shard format does not change, `m` stays ≥ 1). Feedback drives a GCC-like delay-based controller (start rate 6 Mbps, range 2–200 Mbps). That controller sets the pacer (1.5 × target, reliable lane first) and the rudp window. Details: [ovtransport.md §9–10](crates/ovtransport.md).
+
+A video frame that FEC and NACK cannot repair is reported to the application as `VideoLost`. The viewer then drops P-frames and asks for a way back in on the reliable channel: `VIDEO_RECOVER(ltr_seq)` (opcode `0x29`, both peers `CAP_LTR`; the host answers with a P-frame predicted from that long-term reference) or `VIDEO_IDR_REQUEST` (`0x26`). See [MEDIA_PIPELINE §3.7](MEDIA_PIPELINE.md#37-video-wire-format-codecs-and-loss-recovery).
 
 ---
 

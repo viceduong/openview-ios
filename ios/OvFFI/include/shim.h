@@ -66,7 +66,9 @@ typedef struct ov_video_packet {
     uint32_t h;
     uint32_t screen_w;
     uint32_t screen_h;
-    uint32_t reserved;
+    // 1 = H.264 (sps/pps, AVCC data), 2 = HEVC (vps/sps/pps, HVCC data with
+    // 4-byte lengths; only after ov_screen_set_video_caps(OV_VIDEO_CAP_HEVC)).
+    uint32_t codec;
     const uint8_t *sps;
     size_t sps_len;
     const uint8_t *pps;
@@ -75,12 +77,15 @@ typedef struct ov_video_packet {
     size_t data_len;
     // The stream's colour description as H.264 / ISO 23001-8 code points
     // from the SPS VUI (host default: BT.709 limited range = 1 / 1 / 1 / 0).
-    // Four u8s after a size_t: the struct stays 8-byte aligned (4 bytes of
-    // tail padding), same as the Rust #[repr(C)] OvVideoPacket.
+    // Four u8s after a size_t, then 4 bytes of padding before `vps` (64-bit),
+    // same as the Rust #[repr(C)] OvVideoPacket.
     uint8_t colour_primaries;
     uint8_t transfer;
     uint8_t matrix;
     uint8_t full_range;
+    // HEVC keyframes: the raw VPS NAL unit (else NULL / 0).
+    const uint8_t *vps;
+    size_t vps_len;
 } ov_video_packet;
 typedef void (*ov_video_sink)(void *user, const ov_video_packet *packet);
 typedef void (*ov_clipboard_sink)(void *user, uint8_t kind, const uint8_t *text, size_t len);
@@ -173,6 +178,11 @@ int64_t ov_session_direct_path(OvSession *s);         /* active path_id or -1 */
 // value 0/1) for ov_session_send_record on channel 0. Returns the length
 // (3) or -1.
 int32_t ov_session_option_record(uint8_t key, uint8_t value, uint8_t *out, size_t cap);
+// VIEWPORT payload for ov_session_send_record on channel 0 (only to a host
+// with CAP_VIEWPORT, 1 << 22): the visible part of the remote screen in
+// remote pixels (w/h 0 = none) and the zoom (device pixels per remote pixel
+// x 1000). The host sends those tiles first. Returns the length (11) or -1.
+int32_t ov_viewport_record(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t scale_milli, uint8_t *out, size_t cap);
 
 // File transfer: send a named file to the peer in 16 KiB chunks.
 int32_t ov_file_send(OvSession *s, const char *name, const uint8_t *data, size_t data_len);
@@ -202,6 +212,13 @@ int32_t ov_screen_set_video_sink(OvScreen *screen, void *user, ov_video_sink sin
 // VIDEO_IDR_REQUEST (sent via ov_screen_take_pong_reply). Never call it from
 // inside a sink (ov_screen_feed is still running): defer it.
 int32_t ov_screen_request_video_idr(OvScreen *screen);
+// Optional video features of the shell decoder (before the first
+// ov_screen_feed, with the video sink installed; default OV_VIDEO_CAP_LTR):
+// OV_VIDEO_CAP_HEVC advertises CAP_HEVC (codec 2 packets may follow);
+// clearing OV_VIDEO_CAP_LTR stops long-term-reference recovery (CAP_LTR).
+#define OV_VIDEO_CAP_HEVC 1u
+#define OV_VIDEO_CAP_LTR 2u
+int32_t ov_screen_set_video_caps(OvScreen *screen, uint32_t caps);
 int32_t ov_screen_set_clipboard_sink(OvScreen *screen, void *user, ov_clipboard_sink sink);
 int32_t ov_screen_set_file_sink(OvScreen *screen, void *user, ov_file_sink sink);
 // Feed one channel-0 command record. -1 = undecodable command or malformed
@@ -263,8 +280,14 @@ int32_t ov_screen_latency_stats(OvScreen *screen, ov_latency_stats *out);
 // A picture reached the screen: every update handed to the shell at least
 // drawn_age_us ago (when the picture was drawn) was presented
 // presented_age_us ago, both relative to this call (Metal:
-// CACurrentMediaTime() - drawable.presentedTime; AVSampleBufferDisplayLayer:
-// 0 / 0 right after enqueue). Session queue. Returns the updates measured.
+// CACurrentMediaTime() - drawable.presentedTime). Session queue. Returns
+// the updates measured.
 int32_t ov_screen_latency_presented(OvScreen *screen, int64_t drawn_age_us, int64_t presented_age_us);
+// The shell's decoder (VideoToolbox output callback) returned the picture
+// of video unit `seq` decoded_age_us ago. The first call switches video to
+// shell-reported decode times (delivery then only marks a unit received):
+// decode stage = reassembled -> decoded, present = decoded -> presented.
+// Session queue. 0, or -1 on a null handle.
+int32_t ov_screen_latency_video_decoded(OvScreen *screen, uint64_t seq, int64_t decoded_age_us);
 
 #endif

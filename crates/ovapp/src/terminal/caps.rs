@@ -108,6 +108,34 @@ pub const CAP_TIMING: u32 = 1 << 17;
 /// `opus` feature (see `crate::audio::audio_caps`) and by the iOS shell when
 /// AVAudioConverter decodes stereo Opus.
 pub const CAP_STEREO: u32 = 1 << 18;
+/// [`Command::Caps`] bit (viewer): "I decode HEVC `VIDEO_BEGIN` access
+/// units" (codec byte [`crate::video::CODEC_HEVC`], Annex-B, VPS + SPS + PPS
+/// on every keyframe). Needs [`CAP_H264`]; a host that sees both and has a
+/// hardware HEVC encoder streams HEVC, else H.264. Advertised only with a
+/// working HEVC decoder (desktop: the MF HEVC decoder — HEVC Video
+/// Extensions — see [`crate::video::VideoDecode::hevc`]; iOS: VideoToolbox
+/// hardware HEVC decode, `ov_screen_set_video_caps`). Never part of
+/// [`LOCAL_CAPS`].
+pub const CAP_HEVC: u32 = 1 << 19;
+/// [`Command::Caps`] bit (both directions): "I speak long-term-reference
+/// loss recovery" — a viewer `VIDEO_LTR_ACK`s every decoded picture flagged
+/// [`crate::video::VIDEO_LTR`] and, after a loss, asks with `VIDEO_RECOVER`
+/// (naming the newest LTR it holds) instead of `VIDEO_IDR_REQUEST`; a host
+/// marks LTR pictures and answers a recover with a
+/// [`crate::video::VIDEO_RECOVERY`] P-frame (or an IDR when it cannot).
+/// Used only when both peers set it; part of [`LOCAL_CAPS`] (pure protocol:
+/// a viewer without a video decoder never sends either opcode).
+pub const CAP_LTR: u32 = 1 << 20;
+/// [`Command::Caps`] bit (viewer): "I decode palette bands" (band codec 4
+/// inside a [`FrameCodec::Packed`] container: few-colour chunks as a
+/// palette + 1/2/4-bit indices, then zstd; see `crate::bands::palette`).
+/// Every build decodes it (pure Rust); part of [`LOCAL_CAPS`].
+pub const CAP_PALETTE: u32 = 1 << 21;
+/// [`Command::Caps`] bit (host): "I act on [`Command::Viewport`]" — the
+/// viewer's visible rect: tiles inside it go first, the rest are deferred
+/// (still sent). A viewer sends VIEWPORT only to a host that set it. Part
+/// of [`LOCAL_CAPS`].
+pub const CAP_VIEWPORT: u32 = 1 << 22;
 /// What every build supports (tiles + zstd decode in pure Rust; every UDP
 /// carrier understands the reliable framing). The session advertises this
 /// plus `crate::audio::audio_caps` (Opus with the `opus` feature); see
@@ -121,4 +149,7 @@ pub const LOCAL_CAPS: u32 = CAP_TILES
     | CAP_BANDS
     | CAP_MOVE
     | CAP_BYE
-    | CAP_TIMING;
+    | CAP_TIMING
+    | CAP_LTR
+    | CAP_PALETTE
+    | CAP_VIEWPORT;

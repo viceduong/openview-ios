@@ -118,6 +118,11 @@ impl OvScreen {
     pub(super) fn latency_delivered(&mut self, kind: u8, seq: u64, received: Instant) {
         let now = Instant::now();
         self.latency.on_received(kind, seq, received);
+        if kind == ovapp::latency::KIND_VIDEO && self.video_decode_timing {
+            // The shell decodes asynchronously and reports the picture
+            // itself (ov_screen_latency_video_decoded).
+            return;
+        }
         self.latency.on_decoded(kind, seq, now);
     }
 }
@@ -146,11 +151,48 @@ pub unsafe extern "C" fn ov_screen_latency_stats(
     })
 }
 
+/// The shell's video decoder (iOS: the VideoToolbox output callback)
+/// returned the picture of video unit `seq` `decoded_age_us` ago (relative
+/// to this call). The first call switches this screen to shell-reported
+/// video decode times: from then on handing a unit to the video sink only
+/// marks it received, so the decode stage is network-reassembled ->
+/// decoded and the present stage decoded -> presented (by a later
+/// [`ov_screen_latency_presented`] whose picture was drawn after the
+/// decode). A unit that never decodes is never measured. Returns 0, or -1
+/// on a null handle.
+///
+/// # Safety
+/// `s` must be null or a live handle from [`ov_screen_new`](crate::ov_screen_new),
+/// with no concurrent call on it (session queue).
+#[no_mangle]
+pub unsafe extern "C" fn ov_screen_latency_video_decoded(
+    s: *mut OvScreen,
+    seq: u64,
+    decoded_age_us: i64,
+) -> i32 {
+    ffi_guard!(OV_ERR_PANIC, {
+        // SAFETY: `s` is null or a live screen with no concurrent use
+        // (caller contract).
+        let Some(screen) = (unsafe { s.as_mut() }) else {
+            return -1;
+        };
+        screen.video_decode_timing = true;
+        let now = Instant::now();
+        let at = now
+            .checked_sub(Duration::from_micros(decoded_age_us.max(0) as u64))
+            .unwrap_or(now);
+        screen
+            .latency
+            .on_decoded(ovapp::latency::KIND_VIDEO, seq, at);
+        0
+    })
+}
+
 /// A picture reached the screen: every update the shell had been handed at
 /// least `drawn_age_us` ago (when the picture was drawn) was presented
 /// `presented_age_us` ago (both relative to this call; e.g. Metal:
-/// `CACurrentMediaTime() − drawable.presentedTime`; AVSampleBufferDisplayLayer:
-/// 0 / 0 right after enqueue). Returns how many updates were measured, or
+/// `CACurrentMediaTime() − drawable.presentedTime`). Returns how many updates
+/// were measured, or
 /// -1 on a null handle.
 ///
 /// # Safety

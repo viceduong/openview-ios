@@ -199,13 +199,19 @@ final class SessionController: ObservableObject {
     /// ms) and what was published (only changes go to main).
     var lastLatencyPublishMs: Int64 = 0
     var lastLatency: LatencyBreakdown?
-    /// H.264 overlay state: CMSampleBuffer builder, whether a motion period
-    /// is running, its generation, and the generation whose END is waiting
-    /// for the refresh frame.
-    let videoSamples = H264SampleBuilder()
+    /// Hardware video (session queue): the VideoToolbox decoder, whether
+    /// a motion period is running and its generation
+    /// (`screenModel.video.begin()`). Created on first use; its output
+    /// closures run on VideoToolbox's thread.
+    lazy var videoDecoder = VideoDecoder(
+        onFrame: { [weak self] pixelBuffer, unit, decodedAt in
+            self?.videoDecoded(pixelBuffer, unit: unit, decodedAt: decodedAt)
+        },
+        onError: { [weak self] status in
+            self?.videoDecodeFailed(status)
+        })
     var videoActive = false
     var videoGen = 0
-    var pendingHideGen: Int?
     /// Last host CAPS seen (CAP_INPUT2 picks the input commands).
     var lastPeerCaps: UInt32 = 0
     /// The desktop-effect wishes went out to this host.
@@ -297,13 +303,8 @@ final class SessionController: ObservableObject {
         input.send = { [weak self] payload in
             self?.sendCommand(payload)
         }
-        // The overlay's decoder failed (main): ask the host for an IDR from
-        // the session queue.
-        screenModel.video.onFailure = { [weak self] in
-            self?.queue.async { [weak self] in
-                guard let self, !self.halted else { return }
-                self.screen.requestVideoIdr()
-            }
+        input.viewportReporter.send = { [weak self] payload in
+            self?.sendCommand(payload)
         }
         // Latency telemetry: every presented Metal drawable reports when
         // it was drawn and when it reached the screen.
@@ -332,6 +333,8 @@ final class SessionController: ObservableObject {
         clipboardTimer?.cancel()
         clipboardTimer = nil
         clipboard.send = nil
+        input.viewportReporter.send = nil
+        input.viewportReporter.reset()
         // Release every key / button held on the host before teardown (the
         // records queue ahead of the teardown below), then unhook input.
         input.releaseAll()
@@ -419,13 +422,15 @@ final class SessionController: ObservableObject {
         // Nothing stays pressed; the next host's CAPS decide the commands.
         input.releaseAll()
         input.input2 = false
+        input.viewportReporter.reset()
         livenessModel.peerAlive = true
         livenessModel.rttMs = -1
         livenessModel.fps = 0
         livenessModel.path = nil
         livenessModel.latency = nil
         hostSupportsDesktopFx = false
-        screenModel.video.hide(generation: screenModel.video.generation)
+        // No picture of the previous attempt's motion period lands any more.
+        screenModel.video.end()
         log("Connecting to \(req.displayName) via \(req.transport.detail)")
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
             self?.handshakeTimedOut(generation: gen)
@@ -773,8 +778,9 @@ final class SessionController: ObservableObject {
 
     /// The host's CAPS changed: pick the input command set and show / hide
     /// the desktop-effect switches.
-    func applyPeerCaps(input2: Bool, desktopFx: Bool) {
+    func applyPeerCaps(input2: Bool, desktopFx: Bool, viewport: Bool) {
         input.input2 = input2
+        input.viewportReporter.capable = viewport
         if hostSupportsDesktopFx != desktopFx {
             hostSupportsDesktopFx = desktopFx
         }

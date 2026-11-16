@@ -478,6 +478,7 @@ Flow:
 
 ```c
 int32_t ov_session_option_record(uint8_t key, uint8_t value, uint8_t *out, size_t cap);
+int32_t ov_viewport_record(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t scale_milli, uint8_t *out, size_t cap);
 int32_t ov_file_send(OvSession *s, const char *name, const uint8_t *data, size_t data_len);
 ```
 
@@ -486,6 +487,14 @@ int32_t ov_file_send(OvSession *s, const char *name, const uint8_t *data, size_t
   disable animations, `value` 0/1. It is meaningful only when the peer's
   CAPS include `CAP_DESKTOP_FX` (`1 << 8`). It needs no session. Returns 3,
   or `-1` if `cap < 3`.
+- `viewport_record` builds an 11-byte `VIEWPORT` (`0x3D`) payload for
+  channel 0: the visible part of the remote frame in remote pixels (`w`/`h`
+  0 = none) and the zoom (`scale_milli` = device pixels per remote pixel x
+  1000). Send it only when the host's CAPS include `CAP_VIEWPORT`
+  (`1 << 22`); the host then sends the visible tiles first. The iOS shell
+  reports on every pan / zoom, at most every 100 ms (`ViewportReporter` in
+  `RemoteSurfaceView+Viewport.swift`). Returns 11, or `-1` (null / short
+  buffer).
 - `file_send` sends a whole in-memory file as `FILE_XFER_DATA` chunks
   (16 KiB default) plus `FILE_XFER_COMPLETE`, all on channel 0, via
   `ovapp::file_transfer::FileTransfer::send`. Each command is one AEAD

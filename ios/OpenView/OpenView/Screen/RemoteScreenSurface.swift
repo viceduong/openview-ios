@@ -4,7 +4,8 @@ import SwiftUI
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
 
-// The remote screen surface: frame + H.264 overlay inside one
+// The remote screen surface: the frame (Metal, with hardware video
+// composited into it; or the CGImage fallback) inside one
 // zoom/pan-transformed container layer, a locally drawn cursor, the touch /
 // pointer / keyboard input layer and the viewport. Self-contained so the
 // immersive session can re-host it.
@@ -90,7 +91,9 @@ struct RemoteScreenSurface: UIViewRepresentable {
     /// Metal).
     let uploads: FrameUploadQueue?
     let frameSize: CGSize
-    let video: VideoOverlay
+    /// Decoded hardware-video pictures (Metal only), composited by the
+    /// renderer at the next display refresh.
+    let video: VideoFrameQueue
     let cursorPos: CGPoint?
     let cursorImage: CGImage?
     let cursorHotspot: CGSize
@@ -140,13 +143,11 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     /// A redraw is wanted at the next display refresh.
     var needsRender = false
     var idleRenderTicks = 0
-    /// Hide the H.264 overlay of this generation once the next drawable
-    /// (which holds the lossless refresh) has been presented.
-    var hideVideoAfterPresent: Int?
     lazy var renderTicker = FrameTicker { [weak self] _ in
         self?.renderTick()
     }
-    weak var video: VideoOverlay?
+    /// Hardware-video pictures for the renderer (newest wins per refresh).
+    weak var video: VideoFrameQueue?
     let cursorLayer = CALayer()
     let dragRing = CAShapeLayer()
 
@@ -300,8 +301,8 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     func setupLayers() {
         if let metal {
             // Below the zoom container: drawn at device resolution for the
-            // current viewport (the container still carries the H.264
-            // overlay, transformed with the zoom).
+            // current viewport (hardware video is composited into the
+            // frame texture, so it zooms / pans with the tiles).
             layer.addSublayer(metal.layer)
             frameLayer.isHidden = true
         }
@@ -416,6 +417,9 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     func teardown() {
         animTicker.stop()
         renderTicker.stop()
+        // (The video queue's `onReady` holds this view weakly; a newer
+        // surface re-claims it in `attachVideo`.)
+        metal?.releaseVideo()
         gcMouse.stop()
         releasePointerButtons()
         endLocalGestures()
@@ -481,17 +485,14 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
 
     // MARK: Model updates
 
-    /// Host the H.264 overlay's layer inside the transformed container
-    /// (above the frame image), so it zooms / pans with it.
-    func attachVideo(_ overlay: VideoOverlay) {
-        guard overlay.layer.superlayer !== container else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        container.addSublayer(overlay.layer)
-        CATransaction.commit()
-        video = overlay
-        if frameSize.width > 0 {
-            overlay.layout(in: container.bounds)
+    /// Draw decoded video pictures: each one that lands in the (empty)
+    /// slot asks for a redraw at the next display refresh, which composites
+    /// the newest into the frame texture — frame pacing is the display link.
+    func attachVideo(_ queue: VideoFrameQueue) {
+        guard video !== queue || queue.onReady == nil else { return }
+        video = queue
+        queue.onReady = { [weak self] in
+            self?.setNeedsRender()
         }
     }
 
@@ -504,7 +505,6 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
             container.bounds = CGRect(origin: .zero, size: size)
             frameLayer.frame = container.bounds
             CATransaction.commit()
-            video?.layout(in: container.bounds)
             input.frameSize = size
             if followPreset == nil { followPreset = .openDefault }
             refit()
@@ -528,19 +528,6 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
             // A new surface over an existing session: the redraw asks the
             // session to stage the whole frame again.
             setNeedsRender()
-        }
-        // The frame that carries the lossless refresh after VIDEO_END is
-        // now in the texture / layer: drop the H.264 overlay together with
-        // showing it — with Metal only once the drawable holding it is
-        // presented (renderNow), with the CGImage layer in this same
-        // Core Animation commit.
-        if let gen = video?.takePendingHide() {
-            if metal != nil {
-                hideVideoAfterPresent = gen
-                setNeedsRender()
-            } else {
-                video?.hide(generation: gen)
-            }
         }
     }
 
@@ -574,39 +561,27 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     func renderNow() {
         guard let metal, window != nil, scale > 0, bounds.width > 0, bounds.height > 0,
               UIApplication.shared.applicationState != .background else { return }
-        let hide: (() -> Void)?
-        let hideGen = hideVideoAfterPresent
-        if let gen = hideGen, let overlay = video {
-            hideVideoAfterPresent = nil
-            hide = { [weak overlay] in
-                DispatchQueue.main.async {
-                    overlay?.hide(generation: gen)
-                }
-            }
-        } else {
-            hide = nil
-        }
         // Latency telemetry: report when this drawable reached the screen
-        // (a presented time of 0 = it never was).
+        // (a presented time of 0 = it never was). It holds every tile
+        // update and every decoded video picture handed over before
+        // `drawnAt` (the video slot is taken inside `render`), so video's
+        // present stage is the real presented time of its picture.
         let report = uploads?.onPresented
         let drawnAt = CACurrentMediaTime()
         let presented: ((CFTimeInterval) -> Void)?
-        if hide != nil || report != nil {
+        if let report {
             presented = { presentedAt in
-                hide?()
-                if presentedAt > 0 { report?(drawnAt, presentedAt) }
+                if presentedAt > 0 { report(drawnAt, presentedAt) }
             }
         } else {
             presented = nil
         }
         let done = metal.render(scale: scale, offset: offset, sharpenOn: AppSettings.sharpen,
-                                uploads: uploads, onPresented: presented)
+                                uploads: uploads, video: video, onPresented: presented)
         if !done {
             // The GPU still has the previous frame: retry at the next
-            // refresh (keeps the display link running), nothing lost.
-            if hide != nil {
-                hideVideoAfterPresent = hideGen
-            }
+            // refresh (keeps the display link running), nothing lost —
+            // the newest video picture keeps waiting in its slot.
             needsRender = true
         }
     }
