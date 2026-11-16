@@ -1577,3 +1577,72 @@ fn screen_decodes_lz4_frames() {
         crate::ov_screen_free(screen);
     }
 }
+
+/// `ov_screen_mask_caps(OV_CLASSIC_CAPS_MASK)` advertises the 0.1.x viewer
+/// cap set: no CAP_HEVC / CAP_LTR / CAP_PALETTE / CAP_VIEWPORT, the rest
+/// (H.264 with a video sink, tiles, timing) unchanged.
+#[test]
+fn screen_mask_caps_gives_the_classic_set() {
+    use ovapp::terminal::{
+        encode, Command, CAP_H264, CAP_HEVC, CAP_LTR, CAP_PALETTE, CAP_TILES, CAP_VIEWPORT,
+    };
+    extern "C" fn on_video(_u: *mut c_void, _p: *const crate::OvVideoPacket) {}
+    fn caps_reply(screen: *mut crate::OvScreen) -> u32 {
+        let wire = encode(&Command::MonitorsInfo { monitors: vec![] });
+        assert_eq!(
+            unsafe { crate::ov_screen_feed(screen, wire.as_ptr(), wire.len()) },
+            0
+        );
+        let mut out = [0u8; 9];
+        assert_eq!(
+            unsafe { crate::ov_screen_take_pong_reply(screen, out.as_mut_ptr(), 9) },
+            1
+        );
+        match ovapp::terminal::decode(&out).unwrap() {
+            Command::Caps { flags } => flags,
+            other => panic!("expected CAPS, got {other:?}"),
+        }
+    }
+    let new_bits = CAP_HEVC | CAP_LTR | CAP_PALETTE | CAP_VIEWPORT;
+    assert_eq!(crate::OV_CLASSIC_CAPS_MASK, new_bits);
+    unsafe {
+        assert_eq!(crate::ov_screen_mask_caps(std::ptr::null_mut(), 0), -1);
+        let full = crate::ov_screen_new();
+        assert_eq!(
+            crate::ov_screen_set_video_sink(full, std::ptr::null_mut(), Some(on_video)),
+            0
+        );
+        assert_eq!(
+            crate::ov_screen_set_video_caps(
+                full,
+                crate::OV_VIDEO_CAP_HEVC | crate::OV_VIDEO_CAP_LTR
+            ),
+            0
+        );
+        let all = caps_reply(full);
+        assert_eq!(all & new_bits, new_bits);
+        crate::ov_screen_free(full);
+
+        let classic = crate::ov_screen_new();
+        assert_eq!(
+            crate::ov_screen_set_video_sink(classic, std::ptr::null_mut(), Some(on_video)),
+            0
+        );
+        assert_eq!(
+            crate::ov_screen_set_video_caps(
+                classic,
+                crate::OV_VIDEO_CAP_HEVC | crate::OV_VIDEO_CAP_LTR
+            ),
+            0
+        );
+        assert_eq!(
+            crate::ov_screen_mask_caps(classic, crate::OV_CLASSIC_CAPS_MASK),
+            0
+        );
+        let caps = caps_reply(classic);
+        assert_eq!(caps & new_bits, 0);
+        assert_eq!(caps & (CAP_H264 | CAP_TILES), CAP_H264 | CAP_TILES);
+        assert_eq!(caps, all & !new_bits);
+        crate::ov_screen_free(classic);
+    }
+}

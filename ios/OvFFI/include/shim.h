@@ -231,6 +231,11 @@ uint32_t ov_screen_peer_caps(const OvScreen *screen);
 // Advertise CAP_DIRECT (1 << 7) in our CAPS (before the first screen
 // command, alongside ov_session_set_direct_sinks).
 int32_t ov_screen_set_direct_capable(OvScreen *s, int32_t on);
+// Diagnostic: never advertise the CAPS bits in `mask` (before the first
+// screen command; 0 = none). CAP_HEVC | CAP_LTR | CAP_PALETTE | CAP_VIEWPORT
+// (OV_CLASSIC_CAPS_MASK) gives the 0.1.x (build 11.2) viewer cap set.
+#define OV_CLASSIC_CAPS_MASK 7864320u // 0x780000: bits 19..=22
+int32_t ov_screen_mask_caps(OvScreen *screen, uint32_t mask);
 // The rects the last delivered frame changed, as packed u16 quadruples
 // x, y, w, h (frame pixels) in `out` (room for max_rects). Returns the rect
 // count (may exceed max_rects), 0 before any frame, -1 on a null handle.

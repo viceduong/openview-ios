@@ -360,6 +360,8 @@ final class VideoDecoder {
         let screenSize: CGSize
         let matrix: UInt8
         let generation: Int
+        /// When the unit was handed to VideoToolbox (CACurrentMediaTime).
+        let submittedAt: CFTimeInterval
     }
 
     enum Result {
@@ -440,7 +442,8 @@ final class VideoDecoder {
             return .needKeyframe
         }
         let unit = Unit(seq: pkt.seq, rect: pkt.rect, screenSize: pkt.screenSize,
-                        matrix: pkt.colour.matrix, generation: generation)
+                        matrix: pkt.colour.matrix, generation: generation,
+                        submittedAt: CACurrentMediaTime())
         let myEpoch = epoch.value
         let epochBox = epoch
         let frameOut = onFrame

@@ -443,8 +443,11 @@ final class MetalScreenRenderer {
             uploads.needFull()
             return []
         }
+        var regionCount = 0, byteCount = 0
         for b in d.batches {
             for r in b.regions {
+                regionCount += 1
+                byteCount += r.rowBytes * r.h
                 blit.copy(from: b.buffer,
                           sourceOffset: r.offset,
                           sourceBytesPerRow: r.rowBytes,
@@ -457,6 +460,7 @@ final class MetalScreenRenderer {
             }
         }
         blit.endEncoding()
+        RenderStats.shared.uploads(regions: regionCount, bytes: byteCount)
         return buffers
     }
 
@@ -503,7 +507,10 @@ final class MetalScreenRenderer {
         let dw = Int(ds.width), dh = Int(ds.height)
         guard dw > 0, dh > 0, cs > 0 else { return true }
         // Never block main on the GPU: skip this refresh if it is busy.
-        guard inFlight.wait(timeout: .now()) == .success else { return false }
+        guard inFlight.wait(timeout: .now()) == .success else {
+            RenderStats.shared.skipped()
+            return false
+        }
         guard let cb = ctx.commandQueue.makeCommandBuffer() else {
             inFlight.signal()
             return true
@@ -511,8 +518,11 @@ final class MetalScreenRenderer {
         let staged = encodeUploads(cb, uploads)
         encodeVideo(cb, video, uploadsLanded: !staged.isEmpty)
         let sem = inFlight
-        cb.addCompletedHandler { _ in
+        let stats = RenderStats.shared
+        stats.rendered()
+        cb.addCompletedHandler { done in
             uploads?.recycle(staged)
+            stats.gpu(seconds: done.gpuEndTime - done.gpuStartTime)
             sem.signal()
         }
         guard let drawable = layer.nextDrawable() else {
@@ -580,15 +590,22 @@ final class MetalScreenRenderer {
             rp.colorAttachments[0].storeAction = .store
             cb.makeRenderCommandEncoder(descriptor: rp)?.endEncoding()
         }
-        if let onPresented {
-            #if targetEnvironment(simulator)
-            // addPresentedHandler is unavailable in the simulator SDK; the
-            // command buffer completing is the closest stand-in there.
-            cb.addCompletedHandler { _ in onPresented(CACurrentMediaTime()) }
-            #else
-            drawable.addPresentedHandler { d in onPresented(d.presentedTime) }
-            #endif
+        // Every present feeds the pacing stats (present-to-present gaps);
+        // `onPresented` (latency telemetry) rides the same handler.
+        #if targetEnvironment(simulator)
+        // addPresentedHandler is unavailable in the simulator SDK; the
+        // command buffer completing is the closest stand-in there.
+        cb.addCompletedHandler { _ in
+            let t = CACurrentMediaTime()
+            stats.presented(at: t)
+            onPresented?(t)
         }
+        #else
+        drawable.addPresentedHandler { d in
+            stats.presented(at: d.presentedTime)
+            onPresented?(d.presentedTime)
+        }
+        #endif
         cb.present(drawable)
         cb.commit()
         return true
@@ -627,6 +644,7 @@ final class MetalScreenRenderer {
               Int(held.screenSize.height) == current.height,
               let target = videoTarget(cb) else { return }
         lastVideoAt = CACurrentMediaTime()
+        RenderStats.shared.videoComposited()
         // Clip the rect to the framebuffer (the shader places the picture
         // by the unclipped rect).
         let x0 = max(0, Int(held.rect.minX.rounded(.down)))

@@ -103,8 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for recovery instead of leaving the region black. Latency telemetry now
   ends video's decode stage at the VideoToolbox callback
   (`ov_screen_latency_video_decoded`) and its present stage at the Metal
-  presented time of the drawable showing it. Without Metal the app no
-  longer advertises `CAP_H264` (lossless tiles only).
+  presented time of the drawable showing it. Without the Metal compositor
+  the 11.2 `AVSampleBufferDisplayLayer` overlay is used.
+- iOS: Settings > Diagnostics A/B switches against build 11.2 (legacy
+  video layer, no viewport reports, classic caps via the new
+  `ov_screen_mask_caps`), and a 5-second render / network pacing summary
+  in the diagnostic log. Owed control replies (PONG, recovery requests,
+  LTR acks) are all sent at once instead of one per pump.
 
 ## [0.1.0] - 2026-11-14
 

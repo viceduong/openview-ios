@@ -94,6 +94,8 @@ struct RemoteScreenSurface: UIViewRepresentable {
     /// Decoded hardware-video pictures (Metal only), composited by the
     /// renderer at the next display refresh.
     let video: VideoFrameQueue
+    /// The 11.2 H.264 overlay layer (legacy video path; idle otherwise).
+    let legacyVideo: VideoOverlay
     let cursorPos: CGPoint?
     let cursorImage: CGImage?
     let cursorHotspot: CGSize
@@ -103,11 +105,13 @@ struct RemoteScreenSurface: UIViewRepresentable {
     func makeUIView(context: Context) -> RemoteSurfaceView {
         let view = RemoteSurfaceView(input: input)
         view.attachVideo(video)
+        view.attachLegacyVideo(legacyVideo)
         return view
     }
 
     func updateUIView(_ uiView: RemoteSurfaceView, context: Context) {
         uiView.attachVideo(video)
+        uiView.attachLegacyVideo(legacyVideo)
         uiView.setFrame(image, tick: frameTick, size: frameSize, uploads: uploads)
         uiView.setCursorShape(cursorImage, hotspot: cursorHotspot, size: cursorSize)
         if let p = cursorPos {
@@ -148,6 +152,11 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     }
     /// Hardware-video pictures for the renderer (newest wins per refresh).
     weak var video: VideoFrameQueue?
+    /// Legacy (11.2) H.264 overlay, hosted in the zoom container.
+    weak var legacyVideo: VideoOverlay?
+    /// Legacy video: hide the overlay of this generation once the next
+    /// drawable (which holds the lossless refresh) has been presented.
+    var hideVideoAfterPresent: Int?
     let cursorLayer = CALayer()
     let dragRing = CAShapeLayer()
 
@@ -496,6 +505,21 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
         }
     }
 
+    /// Host the legacy H.264 overlay's layer inside the transformed
+    /// container (above the frame image), so it zooms / pans with it
+    /// (11.2 path; the layer stays hidden unless that path is selected).
+    func attachLegacyVideo(_ overlay: VideoOverlay) {
+        guard overlay.layer.superlayer !== container else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        container.addSublayer(overlay.layer)
+        CATransaction.commit()
+        legacyVideo = overlay
+        if frameSize.width > 0 {
+            overlay.layout(in: container.bounds)
+        }
+    }
+
     func setFrame(_ img: CGImage?, tick: UInt64, size: CGSize, uploads: FrameUploadQueue?) {
         self.uploads = uploads
         if size != frameSize && size.width > 0 && size.height > 0 {
@@ -505,6 +529,7 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
             container.bounds = CGRect(origin: .zero, size: size)
             frameLayer.frame = container.bounds
             CATransaction.commit()
+            legacyVideo?.layout(in: container.bounds)
             input.frameSize = size
             if followPreset == nil { followPreset = .openDefault }
             refit()
@@ -529,6 +554,19 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
             // session to stage the whole frame again.
             setNeedsRender()
         }
+        // Legacy video: the frame that carries the lossless refresh after
+        // VIDEO_END is now in the texture / layer: drop the H.264 overlay
+        // together with showing it — with Metal only once the drawable
+        // holding it is presented (renderNow), with the CGImage layer in
+        // this same Core Animation commit (11.2 behaviour).
+        if let gen = legacyVideo?.takePendingHide() {
+            if metal != nil {
+                hideVideoAfterPresent = gen
+                setNeedsRender()
+            } else {
+                legacyVideo?.hide(generation: gen)
+            }
+        }
     }
 
     // MARK: Metal rendering
@@ -546,6 +584,7 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     }
 
     func renderTick() {
+        RenderStats.shared.displayTick()
         guard needsRender else {
             idleRenderTicks += 1
             if idleRenderTicks >= 2 {
@@ -561,6 +600,20 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
     func renderNow() {
         guard let metal, window != nil, scale > 0, bounds.width > 0, bounds.height > 0,
               UIApplication.shared.applicationState != .background else { return }
+        // Legacy video layer (11.2): hide the overlay once the drawable
+        // holding the lossless refresh is on screen.
+        let hide: (() -> Void)?
+        let hideGen = hideVideoAfterPresent
+        if let gen = hideGen, let overlay = legacyVideo {
+            hideVideoAfterPresent = nil
+            hide = { [weak overlay] in
+                DispatchQueue.main.async {
+                    overlay?.hide(generation: gen)
+                }
+            }
+        } else {
+            hide = nil
+        }
         // Latency telemetry: report when this drawable reached the screen
         // (a presented time of 0 = it never was). It holds every tile
         // update and every decoded video picture handed over before
@@ -569,9 +622,10 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
         let report = uploads?.onPresented
         let drawnAt = CACurrentMediaTime()
         let presented: ((CFTimeInterval) -> Void)?
-        if let report {
+        if hide != nil || report != nil {
             presented = { presentedAt in
-                if presentedAt > 0 { report(drawnAt, presentedAt) }
+                hide?()
+                if presentedAt > 0 { report?(drawnAt, presentedAt) }
             }
         } else {
             presented = nil
@@ -582,6 +636,9 @@ final class RemoteSurfaceView: UIView, RemoteKeyCommandTarget {
             // The GPU still has the previous frame: retry at the next
             // refresh (keeps the display link running), nothing lost —
             // the newest video picture keeps waiting in its slot.
+            if hide != nil {
+                hideVideoAfterPresent = hideGen
+            }
             needsRender = true
         }
     }

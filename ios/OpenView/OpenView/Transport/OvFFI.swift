@@ -585,6 +585,20 @@ final class OvScreenBox {
         _ = ov_screen_set_video_caps(ptr, OV_VIDEO_CAP_HEVC | OV_VIDEO_CAP_LTR)
     }
 
+    /// Legacy video layer (11.2): video caps exactly as in 11.2 — H.264
+    /// only, no LTR recovery (CAP_LTR off). After `enableVideo()`, before
+    /// the first `feed`.
+    func disableVideoLtr() {
+        _ = ov_screen_set_video_caps(ptr, 0)
+    }
+
+    /// Diagnostic "Classic caps (11.2)": never advertise CAP_HEVC, CAP_LTR,
+    /// CAP_PALETTE or CAP_VIEWPORT (the 0.1.x viewer set). Before the
+    /// first `feed`.
+    func useClassicCaps() {
+        _ = ov_screen_mask_caps(ptr, OV_CLASSIC_CAPS_MASK)
+    }
+
     /// VideoToolbox returned the picture of video unit `seq`
     /// `decodedAgeUs` ago (latency telemetry: the decode stage ends here).
     /// Session queue only, never from inside a sink.

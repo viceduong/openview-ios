@@ -43,6 +43,7 @@ extension SessionController {
                 // Terminal command channel: screen frames reassemble here.
                 // (Fires under the Rust session lock — never send from
                 // here; PONG replies go out after the pump returns.)
+                self.netStats.record(bytes: payload.count)
                 self.screen.feed(payload)
             case 1:
                 if let text = String(data: payload, encoding: .utf8) {
@@ -221,6 +222,8 @@ extension SessionController {
         videoActive = false
         screenModel.video.end()
         videoDecoder.reset()
+        pendingHideGen = nil
+        lastPerfLogMs = nil
         lastPeerCaps = 0
         sentDesktopFx = false
         relayMode = false
@@ -269,6 +272,7 @@ extension SessionController {
             }
             screen.livenessTick(nowMs: nowMs)
             publishLatency(nowMs: nowMs)
+            logPerfIfDue(nowMs: nowMs)
             // Watchdog: the host sends at least a keepalive every 5 s. A
             // session that heard nothing for longer is dead even if no
             // transport said so (e.g. a VPN dropped the relay and the UDP
@@ -498,8 +502,13 @@ extension SessionController {
     /// only on the next tick), so the peer's RTT is not inflated by 50 ms.
     func sendPongIfOwed() throws {
         guard established, let session else { return }
-        if let pong = screen.takePongReply() {
+        // Everything owed, not just one record: a PONG (the host's RTT /
+        // pacer input) must never wait a whole pump tick behind CAPS,
+        // keyframe / IDR / recover requests or LTR acks. Bounded per call.
+        var sent = 0
+        while sent < 16, let pong = screen.takePongReply() {
             try session.sendRecord(channel: 0, payload: pong)
+            sent += 1
         }
     }
 

@@ -64,6 +64,7 @@ paths below are relative to that folder unless noted.
 | `MetalScreenRenderer.swift`, `RemoteScreen.metal` | `MetalContext`, `FrameUploadQueue`, `MetalScreenRenderer`; scaling, sharpening and YUV video compositing shaders |
 | `RemoteVideo.swift` | `RemoteVideoPacket`, `VideoFormat`, `VideoFrameQueue`, `VideoDecoder` (VTDecompressionSession, H.264 / HEVC) |
 | `VideoPacing.swift` | `VideoFramePacer` (newest-wins slot), `YUVToRGB` (matrix selection); pure, unit-tested |
+| `LegacyVideo.swift` | The 11.2 H.264 overlay path (`H264SampleBuilder`, `VideoOverlay`): fallback and diagnostic A/B |
 | **Input/** | |
 | `RemoteInput.swift` | `InputWire` encoders, `KeyStroke`, `ZoomPreset`, `RemoteInputController`, `PowerGovernor`, `FrameTicker` |
 | `TrackpadTouchRecognizer.swift`, `FlingTracker.swift` | One-finger touch source; scroll inertia (touch and trackpad) |
@@ -547,14 +548,28 @@ regions as H.264 or HEVC (`ov_video_packet.codec` 1 / 2).
    its present stage at the `presentedTime` of the first drawable drawn
    after that callback (the drawable that contains the picture).
 
-**Fallbacks.** No Metal (CGImage path) or no YUV compositor: `CAP_H264` is
-not advertised; the host sends lossless tiles only. VideoToolbox session
-creation failing at runtime: the unit is answered with a recovery request
-(retried on every keyframe, logged with a failure count); meanwhile the
-region keeps its last framebuffer content until motion ends and the
-lossless refresh arrives. (The old `AVSampleBufferDisplayLayer` overlay is
-gone: CAPS go out once per connection, so the app cannot switch to tiles
-mid-session.)
+**Fallbacks.** No Metal or no YUV compositor: the 11.2
+`AVSampleBufferDisplayLayer` overlay path (`LegacyVideo.swift`:
+`H264SampleBuilder`, `VideoOverlay`, hidden once the drawable with the
+lossless refresh is presented) is used instead, H.264 only, no LTR.
+VideoToolbox session creation failing at runtime: the unit is answered
+with a recovery request (retried on every keyframe, logged with a failure
+count); meanwhile the region keeps its last framebuffer content until
+motion ends and the lossless refresh arrives (CAPS go out once per
+connection, so the app cannot switch paths mid-session).
+
+**Diagnostics (Settings > Diagnostics, default off, read at connect).**
+"Legacy video layer (11.2)" forces the overlay path above. "Don't report
+viewport" never sends VIEWPORT. "Classic caps (11.2)" advertises the 0.1.x
+viewer cap set (`ov_screen_mask_caps(OV_CLASSIC_CAPS_MASK)`: no CAP_HEVC /
+CAP_LTR / CAP_PALETTE / CAP_VIEWPORT) and sends no VIEWPORT. The active
+switches and the chosen video path are logged at session start; every 5 s
+the DiagLog gets a `perf` line (`PerfStats.swift`): channel-0 records/s,
+KB/s, max inter-arrival gap, frames delivered, video units / decoded /
+errors / newest-wins drops / decode ms, then display-link ticks, renders,
+renders skipped (GPU busy), presents, max and p95 present-to-present gap,
+GPU time per command buffer (avg / max), uploads per render (rects, KB)
+and video composites.
 
 ### 5.4 Cursor
 

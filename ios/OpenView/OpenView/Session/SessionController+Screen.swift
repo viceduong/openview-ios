@@ -17,12 +17,17 @@ extension SessionController {
             screen.onFramePixels = { [weak self] view in
                 guard let self else { return }
                 uploads.stage(view)
+                self.netStats.frame()
                 let size = CGSize(width: CGFloat(view.width), height: CGFloat(view.height))
-                // (The first frame after VIDEO_END carries the lossless
-                // refresh of the region; it simply overwrites the last
-                // composited video picture in the frame texture.)
+                // The first frame after VIDEO_END carries the lossless
+                // refresh of the region: it overwrites the last composited
+                // video picture in the frame texture; the legacy overlay is
+                // hidden with it (11.2).
+                let hide = self.pendingHideGen
+                self.pendingHideGen = nil
                 self.postScreen {
                     $0.frame = (image: nil, size: size)
+                    if let hide { $0.hideVideoGen = hide }
                 }
             }
         } else {
@@ -34,19 +39,35 @@ extension SessionController {
                       let made = FrameImage.make(width: width, height: height, stride: stride,
                                                  format: format, pixels: pixels) else { return }
                 let img = made.image
+                self.netStats.frame()
                 let size = CGSize(width: CGFloat(img.width), height: CGFloat(img.height))
+                let hide = self.pendingHideGen
+                self.pendingHideGen = nil
                 self.postScreen {
                     $0.frame = (image: img, size: size)
+                    if let hide { $0.hideVideoGen = hide }
                 }
             }
         }
-        // Hardware video for high-motion regions — only on the Metal
-        // path (decoded pictures are composited into the frame texture;
-        // the CGImage fallback stays tiles-only) and only when VideoToolbox
-        // decodes H.264 in hardware (`enableVideo` advertises CAP_H264).
-        // HEVC (CAP_HEVC) on top when the hardware decodes it too.
-        if screenModel.uploads != nil, MetalContext.shared?.supportsVideo == true,
-           RemoteVideoCodec.h264.hardwareDecodable {
+        // Video for high-motion regions. Two paths, picked per connection:
+        //   - VTDecompressionSession + Metal compositing (default): only on
+        //     the Metal path with the YUV compositor, and only when
+        //     VideoToolbox decodes H.264 in hardware. HEVC (CAP_HEVC) on top
+        //     when opted in and the hardware decodes it.
+        //   - the 11.2 AVSampleBufferDisplayLayer overlay (Settings >
+        //     Diagnostics > "Legacy video layer", or no Metal compositor):
+        //     H.264 only, no LTR, exactly the 11.2 video caps.
+        let metalVideo = screenModel.uploads != nil && MetalContext.shared?.supportsVideo == true
+        videoLegacy = AppSettings.diagLegacyVideo || !metalVideo
+        if videoLegacy {
+            if H264SampleBuilder.available {
+                screen.onVideo = { [weak self] packet in
+                    self?.handleLegacyVideo(packet)
+                }
+                screen.enableVideo()
+                screen.disableVideoLtr()
+            }
+        } else if RemoteVideoCodec.h264.hardwareDecodable {
             screen.onVideo = { [weak self] packet in
                 self?.handleVideo(packet)
             }
@@ -57,6 +78,17 @@ extension SessionController {
                 screen.enableVideoHevc()
             }
         }
+        // Diagnostics: the 0.1.x (11.2) viewer cap set.
+        let classicCaps = AppSettings.diagClassicCaps
+        if classicCaps {
+            screen.useClassicCaps()
+        }
+        netStats.reset()
+        _ = RenderStats.shared.takeSummary()
+        lastPerfLogMs = nil
+        DiagLog.shared.log("diag: toggles \(AppSettings.diagSummary); video path "
+            + (videoLegacy ? "legacy AVSampleBufferDisplayLayer" : "VideoToolbox + Metal")
+            + (classicCaps ? "; classic caps" : ""))
         // Remote cursor callbacks (both fire on this queue).
         screen.onCursor = { [weak self] x, y in
             let pos = CGPoint(x: CGFloat(x), y: CGFloat(y))
@@ -158,6 +190,7 @@ extension SessionController {
             }
             return
         }
+        netStats.videoUnit()
         if !videoActive {
             videoActive = true
             videoGen = frames.begin()
@@ -188,6 +221,7 @@ extension SessionController {
     /// present stage ends at the Metal presented time of the drawable that
     /// first shows it).
     func videoDecoded(_ pixelBuffer: CVPixelBuffer, unit: VideoDecoder.Unit, decodedAt: CFTimeInterval) {
+        netStats.videoDecoded(ms: max(0, decodedAt - unit.submittedAt) * 1000)
         screenModel.video.offer(VideoFrameQueue.Frame(pixelBuffer: pixelBuffer,
                                                       rect: unit.rect,
                                                       screenSize: unit.screenSize,
@@ -206,11 +240,72 @@ extension SessionController {
     /// region: drop a dead session and ask the host for recovery.
     func videoDecodeFailed(_ status: OSStatus) {
         Log.render.error("video: decode error \(status, privacy: .public)")
+        netStats.videoError()
         queue.async { [weak self] in
             guard let self, !self.halted else { return }
             self.videoDecoder.sessionFailed(status)
             self.screen.requestVideoIdr()
         }
+    }
+
+    // MARK: Legacy video layer (11.2, session queue)
+
+    /// The 11.2 path, verbatim: one H.264 packet (fires inside
+    /// `screen.feed`): build the sample here, off main, then enqueue it on
+    /// the overlay layer on main. END only marks the generation to hide
+    /// with the next (refresh) frame.
+    func handleLegacyVideo(_ packet: RemoteVideoPacket) {
+        if packet.isEnd {
+            if videoActive {
+                videoActive = false
+                pendingHideGen = videoGen
+            }
+            return
+        }
+        netStats.videoUnit()
+        if !videoActive {
+            videoActive = true
+            videoGen += 1
+            pendingHideGen = nil
+        }
+        let gen = videoGen
+        guard let built = videoSamples.make(packet) else {
+            // Not decodable (no keyframe yet / bad data): ask for an IDR —
+            // deferred, we are still inside ov_screen_feed.
+            requestVideoRecovery()
+            return
+        }
+        let overlay = screenModel.legacyVideo
+        let sample = built.sample
+        let flush = built.formatChanged
+        let rect = packet.rect
+        let size = packet.screenSize
+        DispatchQueue.main.async { [weak self] in
+            overlay.enqueue(sample, rect: rect, screen: size, generation: gen, flush: flush)
+            // Latency telemetry: the display layer decodes and shows it
+            // from here (enqueue time stands in for the present).
+            let now = CACurrentMediaTime()
+            self?.notePresented(drawnAt: now, presentedAt: now)
+        }
+    }
+
+    // MARK: Pacing diagnostics (session queue)
+
+    /// Every 5 s while the session is up: one DiagLog line with the render
+    /// and network counters of the window (PerfStats.swift).
+    func logPerfIfDue(nowMs: Int64) {
+        guard established else { return }
+        guard let last = lastPerfLogMs else {
+            lastPerfLogMs = nowMs
+            return
+        }
+        let elapsed = nowMs - last
+        guard elapsed >= Self.perfLogMs else { return }
+        lastPerfLogMs = nowMs
+        let net = netStats.takeSummary(seconds: Double(elapsed) / 1000,
+                                       droppedTotal: screenModel.video.droppedFrames)
+        let render = RenderStats.shared.takeSummary()
+        DiagLog.shared.log("perf \(elapsed / 1000)s: \(net) | \(render)")
     }
 
     // MARK: Main-thread screen flush
@@ -247,6 +342,15 @@ extension SessionController {
             model.frameTick &+= 1
             if model.frameSize != frame.size { model.frameSize = frame.size }
             markLiveIfNeeded()
+        }
+        if let gen = p.hideVideoGen {
+            // Legacy video layer (11.2).
+            if p.frame != nil {
+                // Hidden by the surface once this frame is presented.
+                model.legacyVideo.requestHide(generation: gen)
+            } else {
+                model.legacyVideo.hide(generation: gen)
+            }
         }
         if let pos = p.cursorPos {
             model.cursorPos = pos

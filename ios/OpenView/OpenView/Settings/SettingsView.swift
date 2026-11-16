@@ -16,6 +16,10 @@ struct SettingsView: View {
     // Display
     @AppStorage(SettingsKey.sharpen) private var sharpen = true
     @AppStorage(SettingsKey.hevcVideo) private var hevcVideo = false
+    // Diagnostics (A/B switches)
+    @AppStorage(SettingsKey.diagLegacyVideo) private var diagLegacyVideo = false
+    @AppStorage(SettingsKey.diagNoViewport) private var diagNoViewport = false
+    @AppStorage(SettingsKey.diagClassicCaps) private var diagClassicCaps = false
     // Input
     @AppStorage(RemoteInputController.cmdAsCtrlDefaultsKey) private var cmdAsCtrl = true
     @AppStorage(RemoteInputController.pointerLockDefaultsKey) private var pointerLock = false
@@ -55,6 +59,7 @@ struct SettingsView: View {
                 session
                 security
                 appearanceSection
+                diagnostics
                 about
             }
             .navigationTitle("Settings")
@@ -225,6 +230,17 @@ struct SettingsView: View {
                 Text("Dark").tag("dark")
             }
             .pickerStyle(.segmented)
+        }
+    }
+
+    /// A/B switches against the 11.2 build (default off; apply on the
+    /// next connection; logged at session start).
+    private var diagnostics: some View {
+        Section(header: Text("Diagnostics"),
+                footer: Text("For comparing against build 11.2. Applies to new connections; the active switches and 5-second render / network stats go to the diagnostic log.")) {
+            Toggle("Legacy video layer (11.2)", isOn: $diagLegacyVideo)
+            Toggle("Don't report viewport", isOn: $diagNoViewport)
+            Toggle("Classic caps (11.2)", isOn: $diagClassicCaps)
         }
     }
 

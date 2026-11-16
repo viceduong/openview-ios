@@ -212,6 +212,18 @@ final class SessionController: ObservableObject {
         })
     var videoActive = false
     var videoGen = 0
+    /// This connection uses the 11.2 AVSampleBufferDisplayLayer video path
+    /// (Settings > Diagnostics, or no Metal compositor): its sample
+    /// builder and the generation whose END waits for the refresh frame.
+    var videoLegacy = false
+    let videoSamples = H264SampleBuilder()
+    var pendingHideGen: Int?
+    /// Pacing diagnostics (PerfStats.swift): network-side counters and
+    /// when the last 5 s summary went to the DiagLog (session queue ms;
+    /// nil = start a new window).
+    let netStats = NetStats()
+    var lastPerfLogMs: Int64?
+    static let perfLogMs: Int64 = 5_000
     /// Last host CAPS seen (CAP_INPUT2 picks the input commands).
     var lastPeerCaps: UInt32 = 0
     /// The desktop-effect wishes went out to this host.
@@ -305,6 +317,14 @@ final class SessionController: ObservableObject {
         }
         input.viewportReporter.send = { [weak self] payload in
             self?.sendCommand(payload)
+        }
+        // Legacy video layer (11.2): the overlay's decoder failed (main):
+        // ask the host for an IDR from the session queue.
+        screenModel.legacyVideo.onFailure = { [weak self] in
+            self?.queue.async { [weak self] in
+                guard let self, !self.halted else { return }
+                self.screen.requestVideoIdr()
+            }
         }
         // Latency telemetry: every presented Metal drawable reports when
         // it was drawn and when it reached the screen.
@@ -431,6 +451,7 @@ final class SessionController: ObservableObject {
         hostSupportsDesktopFx = false
         // No picture of the previous attempt's motion period lands any more.
         screenModel.video.end()
+        screenModel.legacyVideo.hide(generation: screenModel.legacyVideo.generation)
         log("Connecting to \(req.displayName) via \(req.transport.detail)")
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
             self?.handshakeTimedOut(generation: gen)
@@ -780,7 +801,10 @@ final class SessionController: ObservableObject {
     /// the desktop-effect switches.
     func applyPeerCaps(input2: Bool, desktopFx: Bool, viewport: Bool) {
         input.input2 = input2
-        input.viewportReporter.capable = viewport
+        // Diagnostics: "Don't report viewport" (and "Classic caps", which is
+        // the 11.2 viewer: it never sent VIEWPORT) keep the reporter off.
+        input.viewportReporter.capable = viewport && !AppSettings.diagNoViewport
+            && !AppSettings.diagClassicCaps
         if hostSupportsDesktopFx != desktopFx {
             hostSupportsDesktopFx = desktopFx
         }
