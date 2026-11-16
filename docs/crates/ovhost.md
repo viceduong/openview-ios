@@ -421,7 +421,10 @@ in `ovapp`.
 
 The host also handles `KEYFRAME_REQUEST` (the next update is a full frame and
 the next picture an IDR) and `VIDEO_IDR_REQUEST` (the next H.264 picture is an
-IDR).
+IDR). On `VIDEO_IDR_REQUEST` / `VIDEO_RECOVER` (reliable, or a
+`CAP_MEDIA_PLI` viewer's PLI) the capture loop first drops the stale queued
+units (`FrameMailbox::drop_stale_video`), the session drops the video still
+waiting whole in the pacer, and the recovery picture is encoded at once.
 
 ---
 

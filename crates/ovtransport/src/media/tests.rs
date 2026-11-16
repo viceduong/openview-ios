@@ -127,15 +127,51 @@ fn unrecoverable_frame_is_nacked_on_a_short_rtt_and_lost_on_a_long_one() {
     assert_eq!(ev.len(), 2);
     assert_eq!(ev[0], MediaEvent::Video(u.clone()));
     assert_eq!(rx.stats().nack_recovered, 1);
-    // Long RTT: the frame is given up right away, the next one flows.
+    // Long RTT (a retransmission cannot beat the 150 ms deadline): the
+    // frame is given up right away, the next one flows.
     let mut rx = MediaRx::new();
     feed(&mut rx, &m, &[0, 1, 2, 3], t0);
     feed(&mut rx, &later, &[], t0);
     rx.poll(
         t0 + Duration::from_millis(5),
-        Some(Duration::from_millis(80)),
+        Some(Duration::from_millis(130)),
         &mut |_, _| panic!("no nack"),
     );
+    let ev = rx.take_events();
+    assert_eq!(ev[0], MediaEvent::VideoLost { frames: 1 });
+    assert!(matches!(ev[1], MediaEvent::Video(_)));
+}
+
+/// A hole is held at most `clamp(2 x RTT, 50, 150 ms)` from when it became
+/// evident: an unanswered NACK gets a second round inside the deadline,
+/// then the frame is given up and the frames behind it flow.
+#[test]
+fn nack_deadline_allows_a_second_round_then_gives_up() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let rtt = Some(ms(10)); // hold 50 ms
+    let m = fec_encode(&unit(12_000, 3), 0, false, 0.1).unwrap();
+    let mut rx = MediaRx::new();
+    feed(&mut rx, &m, &[0, 1, 2, 3], t0);
+    feed(
+        &mut rx,
+        &fec_encode(&unit(100, 4), 1, false, 0.1).unwrap(),
+        &[],
+        t0,
+    );
+    let mut nacks = Vec::new();
+    for t in [5, 20, 28, 40, 49] {
+        rx.poll(t0 + ms(t), rtt, &mut |f, _| {
+            nacks.push((t, f));
+            true
+        });
+        assert!(rx.take_events().is_empty(), "held at {t} ms");
+    }
+    // First round at 5 ms, the second once 1.5 x RTT + 8 ms passed without
+    // the retransmission (28 + 1.2 x RTT still fits the 50 ms).
+    assert_eq!(nacks, vec![(5, 0), (28, 0)]);
+    assert_eq!(rx.next_deadline(t0 + ms(49)), Some(ms(1)));
+    rx.poll(t0 + ms(50), rtt, &mut |_, _| panic!("no third round"));
     let ev = rx.take_events();
     assert_eq!(ev[0], MediaEvent::VideoLost { frames: 1 });
     assert!(matches!(ev[1], MediaEvent::Video(_)));

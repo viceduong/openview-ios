@@ -122,6 +122,20 @@ impl<T> Pacer<T> {
         None
     }
 
+    /// The items queued in `lane`, oldest first.
+    pub fn iter(&self, lane: Lane) -> impl Iterator<Item = &T> {
+        self.lanes[lane as usize].iter().map(|(_, item)| item)
+    }
+
+    /// Drop the items of `lane` from position `at` on.
+    pub fn truncate(&mut self, lane: Lane, at: usize) {
+        let l = &mut self.lanes[lane as usize];
+        for (size, _) in l.iter().skip(at) {
+            self.bytes -= size;
+        }
+        l.truncate(at);
+    }
+
     /// Drop everything queued.
     pub fn clear(&mut self) {
         self.lanes.iter_mut().for_each(VecDeque::clear);

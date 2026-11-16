@@ -275,3 +275,54 @@ fn would_block_keeps_packets_queued() {
     assert_eq!(n, 3);
     assert_eq!(a.pending_bytes(), 0);
 }
+
+/// An `out` callback collecting the datagrams into `v`.
+fn into(v: &mut Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> io::Result<()> + '_ {
+    move |d| {
+        v.push(d.to_vec());
+        Ok(())
+    }
+}
+
+/// A lost tail packet (nothing after it to be acked) is probed one PTO
+/// (2 x SRTT) after it was sent — before its RTO, without a timeout.
+#[test]
+fn tail_loss_probe_resends_the_last_packet_before_the_rto() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let (mut a, mut b) = (ReliableLink::new(), ReliableLink::new());
+    a.enable();
+    b.enable();
+    let (mut wire, mut acks, mut got) = (Vec::new(), Vec::new(), Vec::new());
+    // One packet across, its ACK back 10 ms later (`lost` = how many of
+    // the last packets never arrive).
+    let mut round = |a: &mut ReliableLink, rec: &[u8], t: Instant, lost: usize| {
+        a.send(rec, t, &mut into(&mut wire)).unwrap();
+        let tail = wire.split_off(wire.len() - lost);
+        for d in wire.drain(..) {
+            b.on_datagram(&d, t, &mut |_| {}, &mut into(&mut acks));
+        }
+        b.end_batch(t, &mut |r| got.push(r.to_vec()), &mut into(&mut acks));
+        for d in acks.drain(..) {
+            a.on_datagram(&d, t + ms(10), &mut |_| {}, &mut |_| Ok(()));
+        }
+        tail
+    };
+    // Round trips of 10 ms: SRTT 10 ms, PTO 20 ms, RTO 30 ms.
+    round(&mut a, b"r0", t0, 0);
+    assert_eq!(a.srtt(), Some(ms(10)));
+    // A 3-packet record; the last packet is lost.
+    let t1 = t0 + ms(10);
+    let tail = round(&mut a, &[5u8; 3000], t1, 1);
+    a.poll(t1 + ms(19), &mut |_| {}, &mut |_| panic!("too early"));
+    let mut probe = Vec::new();
+    a.poll(t1 + ms(20), &mut |_| {}, &mut into(&mut probe));
+    assert_eq!(probe, tail);
+    assert_eq!((a.stats().tail_probes, a.stats().timeouts), (1, 0));
+    // One probe per episode.
+    a.poll(t1 + ms(29), &mut |_| {}, &mut |_| panic!("probed twice"));
+    let mut got = Vec::new();
+    b.on_datagram(&probe[0], t1 + ms(25), &mut |_| {}, &mut |_| Ok(()));
+    b.end_batch(t1 + ms(25), &mut |r| got.push(r.to_vec()), &mut |_| Ok(()));
+    assert_eq!(got, vec![vec![5u8; 3000]]);
+}

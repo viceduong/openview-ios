@@ -265,6 +265,7 @@ Raw mode, before negotiation, is used only by `UdpP2pCarrier`: each record is on
 - Token-bucket pacing: 32 packets deep, refilled at 2·cwnd per srtt.
 - Fast retransmit after 3 SACKs beyond a packet, plus RACK-style time-based loss detection.
 - RTO = srtt + 4·rttvar + 5 ms, clamped to [20 ms, 2 s], with ×2 backoff.
+- Tail loss probe (RFC 8985): when the newest unacked packet is still unacked PTO = max(2·srtt, 10 ms) after it was sent, and that is before the RTO, it is resent once (no window change; one probe until an ACK makes progress). Its ACK, or the SACK hole it reveals, repairs a lost tail without waiting for the RTO.
 
 **Receiver:**
 
@@ -368,10 +369,13 @@ MEDIA encryption:
 | 2 AUDIO | `aseq u32 ‖ audio payload` (ovapp wire form) |
 | 3 FEEDBACK | `base u32 ‖ count u16 ‖ ref_us u32 ‖ count × u16` (arrival delta in 50 µs units, `0xFFFF` = lost); sent every 25 ms, ≤ 500 entries per message |
 | 4 NACK | `frame_id u32 ‖ n u16 ‖ n × idx u16`; n = 0 means the whole frame |
+| 5 PLI | `req u32 ‖ kind u8 (1 keyframe, 2 recover) ‖ seq u64` (viewer → host, only when both peers set `CAP_MEDIA_PLI`): the video chain broke. Carries what `VIDEO_IDR_REQUEST` (`seq` = last unit received) or `VIDEO_RECOVER` (`seq` = the long-term reference held) would. Repeated every srtt (10–100 ms) until a keyframe / recovery picture arrives, for at most 300 ms; repeats keep `req`, a new request increments it, and the host acts once per `req` (newer than the last one seen) |
 
 The FEC ratio is `clamp(0.10 + 4·loss, 0.10, 0.30)` while there is loss, and 0.02 for delta frames after 3 s without loss while the RTT is below the frame interval (sender-side only: the shard format does not change, `m` stays ≥ 1). Feedback drives a GCC-like delay-based controller (start rate 6 Mbps, range 2–200 Mbps). That controller sets the pacer (1.5 × target, reliable lane first) and the rudp window. Details: [ovtransport.md §9–10](crates/ovtransport.md).
 
-A video frame that FEC and NACK cannot repair is reported to the application as `VideoLost`. The viewer then drops P-frames and asks for a way back in on the reliable channel: `VIDEO_RECOVER(ltr_seq)` (opcode `0x29`, both peers `CAP_LTR`; the host answers with a P-frame predicted from that long-term reference) or `VIDEO_IDR_REQUEST` (`0x26`). See [MEDIA_PIPELINE §3.7](MEDIA_PIPELINE.md#37-video-wire-format-codecs-and-loss-recovery).
+NACKs follow a deadline: a frame with a hole (evident once a later frame's shard arrived, plus 4 ms reordering grace) is held at most `clamp(2·RTT, 50 ms, 150 ms)` from then. A NACK goes out only while `now + 1.2·RTT` is before that deadline, at most twice per frame (the second once `1.5·RTT + 8 ms` passed without the retransmission); holes in frames behind the head are NACKed as soon as they are evident. At the deadline the frame is given up and the frames behind it are released. The host resends a frame at most twice.
+
+A video frame that FEC and NACK cannot repair is reported to the application as `VideoLost`. The viewer then drops P-frames and asks for a way back in: `VIDEO_RECOVER(ltr_seq)` (opcode `0x29`, both peers `CAP_LTR`; the host answers with a P-frame predicted from that long-term reference) or `VIDEO_IDR_REQUEST` (`0x26`). With `CAP_MEDIA_PLI` (bit 23, both peers) and the media channel up, the request goes as a repeated PLI datagram instead of a reliable record (which could wait behind a retransmission); without it, as the reliable record only. On either request the host drops the video it has not started sending (whole frames still in the pacer, whose frame ids it reuses so the viewer sees no gap, and encoded units still queued) and encodes the recovery picture at once. See [MEDIA_PIPELINE §3.7](MEDIA_PIPELINE.md#37-video-wire-format-codecs-and-loss-recovery).
 
 ---
 

@@ -53,9 +53,12 @@ typedef void (*ov_opus_sink)(void *user, const uint8_t *packet, size_t len, uint
 // units for CMVideoFormatDescriptionCreateFromH264ParameterSets; otherwise
 // NULL / 0. flags & OV_VIDEO_END: motion over, no picture; the next
 // frame-sink delivery is the lossless refresh, drop the overlay then.
+// flags & OV_VIDEO_SUPERSEDED: a newer picture of the same burst follows;
+// decode it (the reference chain) with kVTDecodeFrame_DoNotOutputFrame.
 // pts_us = host capture time (us since the UNIX epoch).
 #define OV_VIDEO_KEYFRAME 1u
 #define OV_VIDEO_END 2u
+#define OV_VIDEO_SUPERSEDED 4u
 typedef struct ov_video_packet {
     uint64_t seq;
     uint64_t pts_us;

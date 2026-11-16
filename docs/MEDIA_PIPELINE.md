@@ -88,6 +88,7 @@ own (see `TerminalSession::pump`, `Command::Caps` arm in
 | `CAP_LTR` (both) | loss recovery from a long-term reference instead of an IDR (`VIDEO_LTR_ACK` / `VIDEO_RECOVER`, see 3.7) |
 | `CAP_RUDP` | the UDP carrier switches to reliable framing |
 | `CAP_DIRECT` + `CAP_MEDIA` (both sides) | direct UDP path, delay-based congestion control, unreliable media channel |
+| `CAP_MEDIA_PLI` + `CAP_MEDIA` (both) | video recovery requests as repeated PLI datagrams on the media channel (see 3.7) |
 
 A default desktop viewer advertises:
 
@@ -430,6 +431,18 @@ starts with a keyframe), never inside one.
    `VIDEO_RECOVERY` unit, whatever seqs were lost. Every other rule
    (keyframes resync, `Stale`, `VIDEO_END`) is unchanged; a keyframe or
    `VIDEO_END` forgets every LTR on both sides.
+
+**Fast recovery path.** On the direct path with both peers
+`CAP_MEDIA_PLI`, the viewer sends `VIDEO_RECOVER` / `VIDEO_IDR_REQUEST` as
+a PLI datagram on the media channel instead (repeated about every RTT
+until the recovery picture arrives, at most 300 ms; the host acts once per
+request), so the request never waits behind a reliable-channel
+retransmission. On any recovery request the host drops the video it has
+not started sending — encoded units still in the mailbox up to the first
+keyframe / recovery picture, and whole frames still in the pacer (their
+media frame ids are reused, so the media receiver sees no gap) — and
+encodes the recovery picture at once. The viewer is already waiting for
+that picture, so the skipped seqs cost nothing.
 
 LTR pictures are ordinary in-stream H.264 / HEVC syntax (long-term
 reference marking), so any standard decoder decodes the stream; a viewer

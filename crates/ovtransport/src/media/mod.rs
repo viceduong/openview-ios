@@ -9,9 +9,11 @@
 //!   (control, input, clipboard, tiles, `VIDEO_END`, IDR requests);
 //! - the **media** channel — H.264 access units (Reed–Solomon FEC per
 //!   frame) and Opus packets as independent, individually authenticated
-//!   datagrams. A lost video frame that FEC cannot repair is NACKed (short
-//!   RTT) or dropped (the viewer then asks for an IDR); a lost audio packet
-//!   is concealed by the decoder (Opus in-band FEC / PLC).
+//!   datagrams. A lost video frame that FEC cannot repair is NACKed while
+//!   a retransmission can still arrive within its deadline (held at most
+//!   `clamp(2 x RTT, 50, 150 ms)`, two rounds), else dropped (the viewer
+//!   then asks for a recovery picture); a lost audio packet is concealed
+//!   by the decoder (Opus in-band FEC / PLC).
 //!
 //! # Wire format (direct path only; all integers big-endian)
 //!
@@ -42,6 +44,14 @@
 //!                    (arrival - ref_us) / 50 us, 0xFFFF = not received
 //! 4 NACK:         04 | frame_id u32 | n u16 | n x idx u16  (n = 0: resend
 //!                    every data shard)
+//! 5 PLI:          05 | req u32 | kind u8 (1 keyframe, 2 recover) | seq u64
+//!                    (CAP_MEDIA_PLI; viewer -> host): the video chain broke —
+//!                    what VIDEO_IDR_REQUEST (seq = the last unit received) /
+//!                    VIDEO_RECOVER (seq = the long-term reference held) say
+//!                    on the reliable channel. Repeated about every RTT until
+//!                    the recovery picture arrives (at most PLI_REPEAT_FOR);
+//!                    repeats keep `req`, a new request increments it, and
+//!                    the host acts once per `req`
 //! ```
 //!
 //! # Keys, nonces, replay
@@ -78,6 +88,7 @@ pub(crate) const M_VIDEO: u8 = 1;
 pub(crate) const M_AUDIO: u8 = 2;
 pub(crate) const M_FEEDBACK: u8 = 3;
 pub(crate) const M_NACK: u8 = 4;
+pub(crate) const M_PLI: u8 = 5;
 
 /// VIDEO shard header bytes (type .. flags).
 pub(crate) const SHARD_HEADER: usize = 1 + 4 + 2 + 2 + 2 + 4 + 1;
@@ -118,7 +129,7 @@ pub(crate) fn fec_ratio(loss: f64) -> f64 {
 /// - loss above [`LOSS_CLEAN`]: [`fec_ratio`] (10 % + 4 x loss, up to 30 %);
 /// - clean for at least [`FEC_CLEAN_HOLD`] (`clean_for`) **and** the RTT
 ///   below the frame interval (a NACK round trip repairs a loss before
-///   the next frame is due, like the receiver's own NACK rule):
+///   the next frame is due, so a repair is not even a visible stall):
 ///   [`FEC_FLOOR`] — except keyframes, which are rare and the costliest to
 ///   lose, and keep [`FEC_MIN`];
 /// - otherwise [`FEC_MIN`].
@@ -428,6 +439,57 @@ pub(crate) fn parse_nack(p: &[u8]) -> Option<(u32, Vec<u16>)> {
     ))
 }
 
+/// What a viewer whose video chain broke asks for (a PLI message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PictureRequest {
+    /// A keyframe; `have_seq` = the last video unit received.
+    Keyframe {
+        /// The `seq` of the last video unit received.
+        have_seq: u64,
+    },
+    /// A recovery picture predicted from the long-term reference `ltr_seq`.
+    Recover {
+        /// The long-term reference the viewer holds.
+        ltr_seq: u64,
+    },
+}
+
+/// How long a viewer repeats one PLI at most (the viewer's own retry,
+/// `KEYFRAME_RETRY`, escalates after this).
+pub(crate) const PLI_REPEAT_FOR: Duration = Duration::from_millis(300);
+/// Bounds of the PLI repeat interval (about one RTT in between).
+pub(crate) const PLI_EVERY_MIN: Duration = Duration::from_millis(10);
+pub(crate) const PLI_EVERY_MAX: Duration = Duration::from_millis(100);
+
+/// A PLI message (request number `req`).
+pub(crate) fn pli_msg(req: u32, r: PictureRequest) -> Vec<u8> {
+    let (kind, seq) = match r {
+        PictureRequest::Keyframe { have_seq } => (1u8, have_seq),
+        PictureRequest::Recover { ltr_seq } => (2, ltr_seq),
+    };
+    let mut p = Vec::with_capacity(14);
+    p.push(M_PLI);
+    p.extend_from_slice(&req.to_be_bytes());
+    p.push(kind);
+    p.extend_from_slice(&seq.to_be_bytes());
+    p
+}
+
+/// Parse a PLI message (type byte included).
+pub(crate) fn parse_pli(p: &[u8]) -> Option<(u32, PictureRequest)> {
+    if p.len() < 14 || p[0] != M_PLI {
+        return None;
+    }
+    let req = u32::from_be_bytes(p[1..5].try_into().ok()?);
+    let seq = u64::from_be_bytes(p[6..14].try_into().ok()?);
+    let r = match p[5] {
+        1 => PictureRequest::Keyframe { have_seq: seq },
+        2 => PictureRequest::Recover { ltr_seq: seq },
+        _ => return None,
+    };
+    Some((req, r))
+}
+
 /// An AUDIO message.
 pub(crate) fn audio_msg(aseq: u32, payload: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(5 + payload.len());
@@ -453,6 +515,10 @@ pub enum MediaEvent {
         /// How many frames were lost.
         frames: u32,
     },
+    /// Host side (PLI): the viewer's video chain broke — answer like the
+    /// reliable `VIDEO_IDR_REQUEST` / `VIDEO_RECOVER`. Video queued but
+    /// not yet sent was already dropped (it can only be undecodable now).
+    PictureLoss(PictureRequest),
     /// One audio payload; `lost` packets before it never arrived (conceal
     /// them before decoding this one).
     Audio {
@@ -500,9 +566,56 @@ struct Asm {
     shards: Vec<Option<Vec<u8>>>,
     have: usize,
     unit: Option<Vec<u8>>,
-    nacked: Option<Instant>,
-    nack_deadline: Option<Instant>,
+    /// When a later frame first arrived while this one was incomplete (its
+    /// hole became evident): the NACK deadline counts from here.
+    gap_seen: Option<Instant>,
+    nack: NackState,
     retx: bool,
+}
+
+/// NACK rounds of one frame.
+#[derive(Debug, Default, Clone, Copy)]
+struct NackState {
+    rounds: u8,
+    /// A retransmission may still arrive until then.
+    wait: Option<Instant>,
+}
+
+/// What [`nack_step`] decided for an incomplete frame.
+enum NackStep {
+    /// A NACK is out (or was just sent): keep holding the frame.
+    Wait,
+    /// The deadline cannot be met: give the frame up.
+    GiveUp,
+}
+
+/// The deadline NACK rule for a frame whose hole became evident at `hole`:
+/// the frame may be held for `clamp(2 x RTT, NACK_HOLD_MIN, NACK_HOLD_MAX)`
+/// from there; a NACK (at most [`NACK_ROUNDS`]) goes out only while its
+/// retransmission can still land in time (`now + 1.2 x RTT` before the
+/// deadline). `send` sends it (false = could not).
+fn nack_step(
+    st: &mut NackState,
+    hole: Instant,
+    now: Instant,
+    rtt: Duration,
+    send: impl FnOnce() -> bool,
+) -> NackStep {
+    if st.wait.is_some_and(|t| now < t) {
+        return NackStep::Wait;
+    }
+    let hold_until = hole + (rtt * 2).clamp(NACK_HOLD_MIN, NACK_HOLD_MAX);
+    if st.rounds < NACK_ROUNDS && now + rtt.mul_f64(1.2) < hold_until && send() {
+        st.rounds += 1;
+        st.wait = Some((now + rtt.mul_f64(1.5) + NACK_SLACK).min(hold_until));
+        return NackStep::Wait;
+    }
+    if st.rounds > 0 && now < hold_until {
+        // A retransmission is still on its way: wait for it, no longer.
+        st.wait = Some(hold_until);
+        return NackStep::Wait;
+    }
+    NackStep::GiveUp
 }
 
 /// How long after evidence that a frame finished sending (a later frame's
@@ -510,6 +623,15 @@ struct Asm {
 pub(crate) const REORDER_GRACE: Duration = Duration::from_millis(4);
 /// A frame with no later evidence is given up after this.
 pub(crate) const FRAME_TIMEOUT: Duration = Duration::from_millis(150);
+/// Bounds of how long a frame with a hole is held for NACK repair (2 x RTT
+/// in between): what a retransmission may cost in added latency before
+/// the frame is better given up (and the stream recovered).
+pub(crate) const NACK_HOLD_MIN: Duration = Duration::from_millis(50);
+pub(crate) const NACK_HOLD_MAX: Duration = Duration::from_millis(150);
+/// NACK rounds per frame (the sender resends a frame at most this often).
+pub(crate) const NACK_ROUNDS: u8 = 2;
+/// Slack on top of 1.5 x RTT before a NACK round counts as unanswered.
+const NACK_SLACK: Duration = Duration::from_millis(8);
 /// Frames held at most (beyond: the oldest is given up).
 const MAX_FRAMES: usize = 96;
 /// Shard / unit bytes held across all incomplete frames at most (beyond:
@@ -530,12 +652,8 @@ pub struct MediaRx {
     first_seen: Option<Instant>,
     /// When `next` became the head (for frames never seen at all).
     head_since: Option<Instant>,
-    /// Inter-frame arrival interval (EWMA, seconds).
-    frame_interval: f64,
-    last_frame_start: Option<Instant>,
-    /// A head frame never seen at all was NACKed (whole-frame resend).
-    head_nacked: Option<u32>,
-    head_nack_deadline: Option<Instant>,
+    /// NACK rounds for a head frame never seen at all (whole-frame resend).
+    head_nack: NackState,
     audio_next: Option<u32>,
     events: VecDeque<MediaEvent>,
     stats: MediaRxStats,
@@ -547,7 +665,7 @@ impl Default for MediaRx {
     }
 }
 
-fn seq_after(a: u32, b: u32) -> bool {
+pub(crate) fn seq_after(a: u32, b: u32) -> bool {
     // a strictly after b (wrapping)
     a != b && a.wrapping_sub(b) < 1 << 31
 }
@@ -561,10 +679,7 @@ impl MediaRx {
             later_seen: None,
             first_seen: None,
             head_since: None,
-            frame_interval: 1.0 / 30.0,
-            last_frame_start: None,
-            head_nacked: None,
-            head_nack_deadline: None,
+            head_nack: NackState::default(),
             audio_next: None,
             events: VecDeque::new(),
             stats: MediaRxStats::default(),
@@ -584,11 +699,6 @@ impl MediaRx {
     /// Whether events are waiting.
     pub fn has_events(&self) -> bool {
         !self.events.is_empty()
-    }
-
-    /// The smoothed interval between video frames.
-    pub fn frame_interval(&self) -> Duration {
-        Duration::from_secs_f64(self.frame_interval)
     }
 
     /// One AUDIO message (type byte included).
@@ -643,7 +753,7 @@ impl MediaRx {
             self.later_seen = Some(now);
         }
         let is_new = !self.frames.contains_key(&s.frame_id);
-        let asm = self.frames.entry(s.frame_id).or_insert_with(|| Asm {
+        self.frames.entry(s.frame_id).or_insert_with(|| Asm {
             k: s.k,
             m: s.m,
             unit_len: s.unit_len,
@@ -652,23 +762,24 @@ impl MediaRx {
             shards: vec![None; usize::from(s.k) + usize::from(s.m)],
             have: 0,
             unit: None,
-            nacked: None,
-            nack_deadline: None,
+            gap_seen: None,
+            nack: NackState::default(),
             retx: false,
         });
         if is_new {
-            if let Some(t) = self.last_frame_start {
-                let dt = now
-                    .saturating_duration_since(t)
-                    .as_secs_f64()
-                    .clamp(0.004, 0.25);
-                self.frame_interval = 0.9 * self.frame_interval + 0.1 * dt;
-            }
-            self.last_frame_start = Some(now);
             if s.frame_id == next && self.first_seen.is_none() {
                 self.first_seen = Some(now);
             }
+            // A new frame: every older incomplete one is done sending.
+            for (&f, a) in self.frames.iter_mut() {
+                if seq_after(s.frame_id, f) && a.unit.is_none() && a.gap_seen.is_none() {
+                    a.gap_seen = Some(now);
+                }
+            }
         }
+        let Some(asm) = self.frames.get_mut(&s.frame_id) else {
+            return;
+        };
         if (asm.k, asm.m, asm.unit_len, asm.s) != (s.k, s.m, s.unit_len, s.data.len()) {
             self.stats.bad += 1;
             return;
@@ -716,6 +827,7 @@ impl MediaRx {
         self.head_since = Some(now);
         self.first_seen = self.frames.contains_key(&id).then_some(now);
         self.later_seen = self.frames.keys().any(|&f| seq_after(f, id)).then_some(now);
+        self.head_nack = NackState::default();
     }
 
     fn lost(&mut self, frames: u32) {
@@ -736,8 +848,10 @@ impl MediaRx {
         self.set_head(next.wrapping_add(1), now);
     }
 
-    /// Release complete frames in order and decide about incomplete ones.
-    /// `rtt` = the link's smoothed RTT; `nack` sends a NACK for a frame
+    /// Release complete frames in order and decide about incomplete ones
+    /// (the deadline NACK rule, [`nack_step`]: frames behind a hole wait at
+    /// most `clamp(2 x RTT, 50, 150 ms)` for its repair). `rtt` = the link's
+    /// smoothed RTT (`None`: no NACKs); `nack` sends a NACK for a frame
     /// (returns false when it could not be sent). Call after every receive
     /// batch and at [`next_deadline`](Self::next_deadline).
     pub fn poll(
@@ -746,6 +860,11 @@ impl MediaRx {
         rtt: Option<Duration>,
         nack: &mut dyn FnMut(u32, &[u16]) -> bool,
     ) {
+        let mut send = |stats: &mut MediaRxStats, f: u32, idx: &[u16]| {
+            let sent = nack(f, idx);
+            stats.nacks += u64::from(sent);
+            sent
+        };
         loop {
             let Some(next) = self.next else { return };
             let complete = self.frames.get(&next).is_some_and(|a| a.unit.is_some());
@@ -764,7 +883,7 @@ impl MediaRx {
             let started = self.first_seen.or(self.head_since).unwrap_or(now);
             let timed_out = now >= started + FRAME_TIMEOUT;
             if !(evidence || timed_out) {
-                return;
+                break;
             }
             if !evidence
                 && !self.frames.keys().any(|&f| seq_after(f, next))
@@ -773,45 +892,43 @@ impl MediaRx {
                 // Nothing at all is pending (the stream paused): no loss.
                 return;
             }
-            let interval = self.frame_interval();
-            let asm = self.frames.get_mut(&next);
-            let nack_ok = rtt.is_some_and(|r| r < interval);
-            match asm {
-                Some(a) if a.nack_deadline.is_some_and(|d| now < d) => return, // waiting
-                Some(a) if nack_ok && a.nacked.is_none() => {
-                    let missing: Vec<u16> = (0..a.k as usize + a.m as usize)
-                        .filter(|&i| a.shards.get(i).is_some_and(Option::is_none))
-                        .take(usize::from(a.k).saturating_sub(a.have))
-                        .map(|i| i as u16)
-                        .collect();
-                    if nack(next, &missing) {
-                        self.stats.nacks += 1;
-                        a.nacked = Some(now);
-                        a.nack_deadline = Some(
-                            now + rtt.unwrap_or_default().mul_f64(1.5) + Duration::from_millis(8),
-                        );
-                        return;
-                    }
-                    self.give_up_head(now);
+            let Some(rtt) = rtt else {
+                self.give_up_head(now);
+                continue;
+            };
+            let stats = &mut self.stats;
+            let step = match self.frames.get_mut(&next) {
+                Some(a) => {
+                    let hole = *a.gap_seen.get_or_insert(now);
+                    let missing = missing_shards(a);
+                    nack_step(&mut a.nack, hole, now, rtt, || send(stats, next, &missing))
                 }
-                None if nack_ok && self.head_nacked != Some(next) => {
-                    if nack(next, &[]) {
-                        self.stats.nacks += 1;
-                        self.head_nacked = Some(next);
-                        self.head_nack_deadline = Some(
-                            now + rtt.unwrap_or_default().mul_f64(1.5) + Duration::from_millis(8),
-                        );
-                        return;
-                    }
-                    self.give_up_head(now);
+                None => {
+                    let hole = self.head_since.unwrap_or(now);
+                    nack_step(&mut self.head_nack, hole, now, rtt, || {
+                        send(stats, next, &[])
+                    })
                 }
-                None if self.head_nacked == Some(next)
-                    && self.head_nack_deadline.is_some_and(|d| now < d) =>
-                {
-                    return;
-                }
-                _ => self.give_up_head(now),
+            };
+            match step {
+                NackStep::Wait => break,
+                NackStep::GiveUp => self.give_up_head(now),
             }
+        }
+        // Holes behind the head are NACKed as soon as they are evident (not
+        // only once they reach the head); giving up stays in frame order.
+        let (Some(rtt), Some(head)) = (rtt, self.next) else {
+            return;
+        };
+        let stats = &mut self.stats;
+        for (&f, a) in self.frames.iter_mut() {
+            let evident = a.gap_seen.is_some_and(|t| now >= t + REORDER_GRACE);
+            if f == head || a.unit.is_some() || !evident {
+                continue;
+            }
+            let hole = a.gap_seen.unwrap_or(now);
+            let missing = missing_shards(a);
+            let _ = nack_step(&mut a.nack, hole, now, rtt, || send(stats, f, &missing));
         }
     }
 
@@ -821,27 +938,42 @@ impl MediaRx {
         if self.frames.get(&next).is_some_and(|a| a.unit.is_some()) {
             return Some(Duration::ZERO);
         }
+        // Only future instants: a decision already due was taken by the
+        // last poll (or is waiting on a later one).
         let mut d: Option<Instant> = None;
-        let mut take = |t: Instant| d = Some(d.map_or(t, |x: Instant| x.min(t)));
+        let mut take = |t: Instant| {
+            if t > now {
+                d = Some(d.map_or(t, |x: Instant| x.min(t)));
+            }
+        };
         if let Some(t) = self.later_seen {
             take(t + REORDER_GRACE);
         }
         if !self.frames.is_empty() {
             take(self.first_seen.or(self.head_since).unwrap_or(now) + FRAME_TIMEOUT);
         }
-        if let Some(a) = self.frames.get(&next) {
-            if let Some(t) = a.nack_deadline {
-                take(t);
+        for a in self.frames.values().filter(|a| a.unit.is_none()) {
+            match (a.nack.wait, a.gap_seen) {
+                (Some(t), _) => take(t),
+                (None, Some(t)) => take(t + REORDER_GRACE),
+                _ => {}
             }
         }
-        if let Some(t) = self
-            .head_nack_deadline
-            .filter(|_| self.head_nacked == Some(next))
-        {
+        if let Some(t) = self.head_nack.wait {
             take(t);
         }
         d.map(|t| t.saturating_duration_since(now))
     }
+}
+
+/// The shard indices a NACK for `a` asks for: as many missing ones as it
+/// still needs (data shards first).
+fn missing_shards(a: &Asm) -> Vec<u16> {
+    (0..usize::from(a.k) + usize::from(a.m))
+        .filter(|&i| a.shards.get(i).is_some_and(Option::is_none))
+        .take(usize::from(a.k).saturating_sub(a.have))
+        .map(|i| i as u16)
+        .collect()
 }
 
 /// Rebuild a frame's unit from >= k shards. `(unit, needed recovery)`.

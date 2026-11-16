@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::cc::CcStats;
-use crate::media::{FecController, MediaKeys, MediaRx, MediaRxStats, ReplayWindow};
+use crate::media::{FecController, MediaKeys, MediaRx, MediaRxStats, PictureRequest, ReplayWindow};
 
 /// Media sender keying (session-wide: survives path changes).
 pub(super) struct MediaTx {
@@ -23,6 +23,13 @@ pub(super) struct SentFrame {
     pub(super) resends: u8,
 }
 
+/// Viewer: a PLI being repeated until the recovery picture arrives.
+pub(super) struct PliRepeat {
+    pub(super) msg: Vec<u8>,
+    pub(super) next: Instant,
+    pub(super) until: Instant,
+}
+
 /// Sender-side media counters.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct MediaStats {
@@ -38,6 +45,10 @@ pub struct MediaStats {
     pub shards_resent: u64,
     /// Audio packets sent.
     pub audio_tx: u64,
+    /// PLI messages sent (repeats included).
+    pub pli_tx: u64,
+    /// PLI messages received (repeats included).
+    pub pli_rx: u64,
     /// Congestion feedback messages sent.
     pub feedback_tx: u64,
     /// Media datagrams that failed authentication.
@@ -71,6 +82,13 @@ pub(super) struct MediaState {
     pub(super) sent_bytes: usize,
     /// Adaptive video FEC (parity ratio per frame).
     pub(super) fec: FecController,
+    /// Viewer: the PLI being repeated, and the last request number used.
+    pub(super) pli: Option<PliRepeat>,
+    pub(super) pli_req: u32,
+    /// Host: the newest PLI request number acted on, and the request
+    /// waiting for [`take_media_events`](super::DirectEngine::take_media_events).
+    pub(super) pli_seen: Option<u32>,
+    pub(super) picture_request: Option<PictureRequest>,
     pub(super) stats: MediaStats,
 }
 
@@ -94,6 +112,10 @@ impl MediaState {
             sent: VecDeque::new(),
             sent_bytes: 0,
             fec: FecController::new(),
+            pli: None,
+            pli_req: 0,
+            pli_seen: None,
+            picture_request: None,
             stats: MediaStats::default(),
         }
     }

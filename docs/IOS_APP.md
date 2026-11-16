@@ -517,7 +517,12 @@ regions as H.264 or HEVC (`ov_video_packet.codec` 1 / 2).
    `VTDecompressionSession` (`kVTDecompressionPropertyKey_RealTime`, output
    `420YpCbCr8BiPlanarVideoRange` or `FullRange` to match the stream,
    IOSurface-backed, Metal-compatible). Each unit is decoded
-   asynchronously (`_EnableAsynchronousDecompression`).
+   asynchronously (`_EnableAsynchronousDecompression`). A unit flagged
+   `OV_VIDEO_SUPERSEDED` (a newer one of the same burst follows: frames
+   released together after a repaired loss) is decoded with
+   `_DoNotOutputFrame` too: it keeps the reference chain intact, but only
+   the burst's newest picture reaches the screen, so a short stall resumes
+   at the live picture instead of fast-forwarding through the backlog.
 3. VideoToolbox thread: the decoded `CVPixelBuffer` goes into
    `VideoFrameQueue`, a newest-wins slot (`VideoFramePacer`): at most one
    picture waits, a newer one replaces it (counted as dropped). A picture

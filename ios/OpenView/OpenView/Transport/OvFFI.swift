@@ -572,6 +572,7 @@ final class OvScreenBox {
                 ptsUs: p.pts_us,
                 isKeyframe: (p.flags & 1) != 0,
                 isEnd: (p.flags & 2) != 0,
+                isSuperseded: (p.flags & 4) != 0,
                 codec: RemoteVideoCodec.from(wire: p.codec),
                 rect: CGRect(x: CGFloat(p.x), y: CGFloat(p.y),
                              width: CGFloat(p.w), height: CGFloat(p.h)),

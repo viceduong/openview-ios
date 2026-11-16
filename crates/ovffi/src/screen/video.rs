@@ -12,6 +12,10 @@ pub const OV_VIDEO_KEYFRAME: u32 = 1;
 /// delivery carries the lossless refresh of `x, y, w, h`, after which the
 /// shell removes its video overlay.
 pub const OV_VIDEO_END: u32 = 2;
+/// [`OvVideoPacket::flags`]: a newer picture of the same burst follows —
+/// decode this unit (the reference chain needs it) without presenting it
+/// (VideoToolbox `kVTDecodeFrame_DoNotOutputFrame`).
+pub const OV_VIDEO_SUPERSEDED: u32 = 4;
 
 /// One H.264 access unit for the shell, laid out for C (`ov_video_packet`
 /// in shim.h). All pointers are valid only for the duration of the callback.
@@ -31,7 +35,8 @@ pub struct OvVideoPacket {
     pub seq: u64,
     /// Host capture time, microseconds since the UNIX epoch.
     pub pts_us: u64,
-    /// [`OV_VIDEO_KEYFRAME`], [`OV_VIDEO_END`], or 0.
+    /// [`OV_VIDEO_KEYFRAME`] or [`OV_VIDEO_END`] (or 0), plus
+    /// [`OV_VIDEO_SUPERSEDED`].
     pub flags: u32,
     /// Left edge of the picture in the framebuffer.
     pub x: u32,
@@ -179,6 +184,10 @@ impl OvScreen {
                 OV_VIDEO_END
             } else if keyframe {
                 OV_VIDEO_KEYFRAME
+            } else {
+                0
+            } | if h.flags & ovapp::video::VIDEO_SUPERSEDED != 0 {
+                OV_VIDEO_SUPERSEDED
             } else {
                 0
             },

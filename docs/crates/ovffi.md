@@ -602,13 +602,24 @@ carries video with FEC and Opus over unreliable datagrams. Media events are
 converted into **channel-0 commands delivered through the session's record
 sink**:
 
-- each complete access unit becomes `VIDEO_UNIT`
+- each complete access unit becomes `VIDEO_UNIT`; one that a later unit of
+  the same delivery batch follows (no loss or `VIDEO_END` in between) gets
+  the local header flag `VIDEO_SUPERSEDED`, which the screen passes on as
+  `OV_VIDEO_SUPERSEDED` (a burst released at once shows as its newest
+  picture, not as a fast-forward)
 - lost frames become `MEDIA_GAP{kind=video}`
 - each Opus packet becomes `AUDIO`, preceded by `MEDIA_GAP{kind=audio}` if
   packets were lost
 
 The shell therefore needs no extra code: they reach `ov_screen_feed` like
 any other channel-0 record.
+
+Picture requests: when both CAPS carry `CAP_MEDIA_PLI`, a
+`VIDEO_IDR_REQUEST` / `VIDEO_RECOVER` the shell passes to
+`ov_session_send_record` (from `ov_screen_take_pong_reply`) goes out as a
+repeated PLI on the media channel when that is up — before encryption, so
+no record sequence number is used — and as the reliable record otherwise.
+A delivered keyframe / recovery unit stops the repeats.
 
 ### 7.4 Screen sinks
 
@@ -634,7 +645,7 @@ it.
 | Field | Meaning |
 |---|---|
 | `seq`, `pts_us` | Unit sequence. Host capture time in µs since the UNIX epoch. |
-| `flags` | `OV_VIDEO_KEYFRAME (1)`: IDR, so `sps`/`pps` are set. `OV_VIDEO_END (2)`: motion is over and there is no picture. The next frame-sink delivery is the lossless refresh, after which the overlay should be removed. |
+| `flags` | `OV_VIDEO_KEYFRAME (1)`: IDR, so `sps`/`pps` are set. `OV_VIDEO_END (2)`: motion is over and there is no picture. The next frame-sink delivery is the lossless refresh, after which the overlay should be removed. `OV_VIDEO_SUPERSEDED (4)`: a newer picture of the same burst follows; decode the unit (the reference chain needs it) without outputting it (`kVTDecodeFrame_DoNotOutputFrame`). |
 | `x, y, w, h` | Where the (even-sized) picture sits inside the `screen_w × screen_h` framebuffer |
 | `sps/sps_len`, `pps/pps_len` | Raw parameter-set NAL units (no start code) on keyframes. NULL/0 otherwise. |
 | `data/data_len` | **AVCC**: each NAL has a 4-byte big-endian length prefix. Parameter sets and AUDs are removed. Ready for a `CMSampleBuffer` with `nalUnitHeaderLength` 4. |
@@ -799,7 +810,7 @@ directly.
 | `screen_dirty_rects_cover_lossy_refined_and_cached_tiles` | dirty rects for lossy, refined and cached tiles |
 | `screen_passes_opus_through_and_advertises_cap_opus` | Opus pass-through and CAP_OPUS |
 | `datagram_transport_recovers_loss_with_reliable_framing` | reliable-UDP loss recovery |
-| `screen_passes_h264_through_and_advertises_cap_h264` | H.264 pass-through, CAP_H264, IDR requests |
+| `screen_passes_h264_through_and_advertises_cap_h264` | H.264 pass-through, CAP_H264, IDR requests, `OV_VIDEO_SUPERSEDED` |
 | `screen_decodes_lz4_frames` | LZ4 frames |
 
 **`src/tests/lan.rs`** — `ios_datagram_mode_survives_a_lossy_lan_to_a_host_lan_port`:
@@ -838,6 +849,8 @@ direct paths through the C sinks) against a desktop host (`TerminalSession`
 | `ffi_client_upgrades_to_direct_path` | Upgrade from relay to a direct path |
 | `ffi_client_survives_relay_loss_on_the_direct_path` | Relay loss while direct |
 | `ffi_client_receives_the_media_channel` | Media channel → `VIDEO_UNIT`/`AUDIO` via the record sink |
+
+`src/media.rs` (unit tests): all but the newest unit of a delivery batch are flagged superseded (a loss or `VIDEO_END` ends the burst); a recovery request becomes a PLI only when both peers set `CAP_MEDIA_PLI`.
 
 ---
 

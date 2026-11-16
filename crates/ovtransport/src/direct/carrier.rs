@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::{DirectEngine, DirectIo, DirectState, DirectStats, MediaStats};
 use crate::carrier::{Carrier, CarrierStats, RawSock, TransportError};
-use crate::media::{MediaEvent, MediaKeys};
+use crate::media::{MediaEvent, MediaKeys, PictureRequest};
 
 /// The direct-path UDP sockets (IPv4 and, when available, IPv6), unconnected
 /// and non-blocking. A host binds them once on its fixed direct port and
@@ -324,6 +324,27 @@ impl DirectCarrier {
             self.stats.record_sent(unit.len());
         }
         ok
+    }
+
+    /// See [`DirectEngine::request_picture`] (`false` = send the reliable
+    /// request).
+    pub fn request_picture(&mut self, r: PictureRequest) -> bool {
+        let mut io = SockIo {
+            primary: &mut *self.primary,
+            sockets: &self.sockets,
+            paths: &self.paths,
+        };
+        self.engine.request_picture(r, Instant::now(), &mut io)
+    }
+
+    /// See [`DirectEngine::picture_arrived`].
+    pub fn picture_arrived(&mut self) {
+        self.engine.picture_arrived();
+    }
+
+    /// See [`DirectEngine::drop_queued_video`].
+    pub fn drop_queued_video(&mut self) -> usize {
+        self.engine.drop_queued_video()
     }
 
     /// Send an AUDIO payload on the media channel (`false` = send it

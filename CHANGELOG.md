@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Smoother recovery from packet loss on cellular and other lossy direct
+  connections: after a short stall the picture resumes at the live image
+  instead of fast-forwarding through the frames that piled up (iOS shows
+  only the newest of a burst; the others are still decoded), lost video is
+  retransmitted only while that can still beat a 50-150 ms deadline (two
+  rounds, then the stream recovers instead of waiting), the recovery
+  request travels on the media channel and is repeated until answered
+  (`CAP_MEDIA_PLI`, bit 23; older peers keep the reliable request), the host
+  drops the not-yet-sent stale video and encodes the recovery picture at
+  once, and a lost last packet on the reliable channel is re-sent after
+  about two round trips instead of waiting for the retransmission timeout.
 - Input wakes the host's capture: every injected input event pulls the
   next capture in to the active frame interval and keeps the full capture
   rate for 750 ms (the idle governor no longer lets a reaction wait up to

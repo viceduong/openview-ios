@@ -29,7 +29,13 @@
 //! bursts (at most `BURST` packets back to back, refilled at 2 x cwnd per
 //! smoothed RTT); a packet is retransmitted when three later packets were
 //! selectively acked (fast retransmit) or its RTO expires (RTO from a
-//! Jacobson/Karels RTT estimate, exponential backoff).
+//! Jacobson/Karels RTT estimate, exponential backoff). A tail loss (the
+//! last packets of a burst, with nothing after them to be acked) is probed
+//! first (RFC 8985 tail loss probe): when the newest unacked packet is
+//! still unacked a probe timeout (PTO = max(2 x SRTT, 10 ms)) after it went
+//! out, and that is before the RTO, it is sent once more — its ACK (or the
+//! SACK hole it reveals) repairs the tail; the window is left alone and the
+//! RTO stays the backstop.
 //!
 //! # Negotiation (backward compatible)
 //!
@@ -77,6 +83,8 @@ const DUP_THRESH: u32 = 3;
 const INIT_RTO: Duration = Duration::from_millis(200);
 const MIN_RTO: Duration = Duration::from_millis(20);
 const MAX_RTO: Duration = Duration::from_secs(2);
+/// Floor of the tail-loss probe timeout (RFC 8985 §7.2).
+const MIN_PTO: Duration = Duration::from_millis(10);
 /// ACK at least every this many data packets inside one receive batch.
 const ACK_EVERY: u32 = 16;
 
@@ -108,6 +116,8 @@ pub struct LinkStats {
     pub fast_retransmits: u64,
     /// Retransmission timeouts.
     pub timeouts: u64,
+    /// Tail-loss probes (the newest unacked packet resent before its RTO).
+    pub tail_probes: u64,
     /// ACK packets sent.
     pub acks_sent: u64,
     /// ACK packets received.
@@ -161,6 +171,8 @@ pub struct ReliableLink {
     highest_sacked: Option<u32>,
     /// Send time of the most recently sent packet known delivered (RACK).
     rack_sent_at: Option<Instant>,
+    /// A probe is out and no ACK made progress since (one per episode).
+    tlp_out: bool,
     // ---- receiver ----
     rcv_next: u32,
     ooo: BTreeMap<u32, (u8, Vec<u8>)>,
@@ -211,6 +223,7 @@ impl ReliableLink {
             last_refill: None,
             highest_sacked: None,
             rack_sent_at: None,
+            tlp_out: false,
             rcv_next: 0,
             ooo: BTreeMap::new(),
             reasm: Vec::new(),
@@ -491,6 +504,9 @@ impl ReliableLink {
                 self.highest_sacked = Some(seq);
             }
         }
+        if newly > 0 {
+            self.tlp_out = false;
+        }
         // Window growth (Reno; an external controller owns it when governed).
         if newly > 0 && !self.governed {
             if self.cwnd < self.ssthresh {
@@ -589,6 +605,7 @@ impl ReliableLink {
     /// framed records held for the switch-over, and send what the window
     /// allows. Call on every send/poll.
     pub fn poll(&mut self, now: Instant, deliver: &mut dyn FnMut(&[u8]), out: Out<'_>) {
+        self.tail_probe(now, out);
         let rto = self.rto;
         let mut expired = 0;
         for slot in self.inflight.iter_mut() {
@@ -619,6 +636,47 @@ impl ReliableLink {
         }
         self.release(now, deliver);
         self.drive(now, out);
+    }
+
+    /// The probe timeout: max(2 x SRTT, [`MIN_PTO`]) — the receiver ACKs at
+    /// the end of every receive batch (no delayed ACK to allow for).
+    fn pto(&self) -> Option<Duration> {
+        self.srtt.map(|s| (s * 2).max(MIN_PTO))
+    }
+
+    /// When the tail-loss probe is due: one PTO after the newest unacked
+    /// packet went out (its ACK is overdue by then), unless one was probed
+    /// since the last ACK progress or the RTO comes first anyway (a steady
+    /// RTT keeps the RTO close to SRTT; jitter inflates it, and that is when
+    /// the probe pays off).
+    fn tlp_due_at(&self) -> Option<Instant> {
+        if self.tlp_out {
+            return None;
+        }
+        let mut sent = self.inflight.iter().flatten().map(|s| s.sent_at);
+        let first = sent.next()?;
+        let (oldest, newest) = sent.fold((first, first), |(lo, hi), t| (lo.min(t), hi.max(t)));
+        let at = newest + self.pto()?;
+        let rto_at = oldest + self.rto;
+        (at < rto_at).then_some(at)
+    }
+
+    /// RFC 8985 tail-loss probe: resend the newest unacked packet once
+    /// (no window reduction; Karn: its ACK gives no RTT sample).
+    fn tail_probe(&mut self, now: Instant, out: Out<'_>) {
+        if self.tlp_due_at().is_none_or(|at| now < at) {
+            return;
+        }
+        let Some(s) = self.inflight.iter_mut().rev().flatten().next() else {
+            return;
+        };
+        if out(&s.pkt).is_ok() {
+            s.sent_at = now;
+            s.retx += 1;
+            self.tlp_out = true;
+            self.stats.retransmits += 1;
+            self.stats.tail_probes += 1;
+        }
     }
 
     /// Finish a receive batch: send the owed ACK, release whole records in
@@ -717,6 +775,9 @@ impl ReliableLink {
         let mut take = |x: Duration| d = Some(d.map_or(x, |y| y.min(x)));
         if let Some(s) = self.inflight.iter().flatten().map(|s| s.sent_at).min() {
             take((s + self.rto).saturating_duration_since(now));
+        }
+        if let Some(t) = self.tlp_due_at() {
+            take(t.saturating_duration_since(now));
         }
         if !self.queue.is_empty() && (self.outstanding as f64) < self.cwnd {
             take(Duration::from_millis(1));

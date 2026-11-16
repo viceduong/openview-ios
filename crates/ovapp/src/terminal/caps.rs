@@ -136,6 +136,15 @@ pub const CAP_PALETTE: u32 = 1 << 21;
 /// (still sent). A viewer sends VIEWPORT only to a host that set it. Part
 /// of [`LOCAL_CAPS`].
 pub const CAP_VIEWPORT: u32 = 1 << 22;
+/// [`Command::Caps`] bit (both directions, with [`CAP_MEDIA`]): "I speak
+/// media-channel picture requests" — while the media channel is up, a
+/// viewer whose video chain broke sends what `VIDEO_IDR_REQUEST` /
+/// `VIDEO_RECOVER` would say as a PLI datagram (`ovtransport::media`),
+/// repeated about every RTT, instead of a reliable record that may queue
+/// behind a retransmission; a host answers it once per request and first
+/// drops the video it has not sent yet. Used only when both peers set it;
+/// part of [`LOCAL_CAPS`].
+pub const CAP_MEDIA_PLI: u32 = 1 << 23;
 /// What every build supports (tiles + zstd decode in pure Rust; every UDP
 /// carrier understands the reliable framing). The session advertises this
 /// plus `crate::audio::audio_caps` (Opus with the `opus` feature); see
@@ -152,4 +161,5 @@ pub const LOCAL_CAPS: u32 = CAP_TILES
     | CAP_TIMING
     | CAP_LTR
     | CAP_PALETTE
-    | CAP_VIEWPORT;
+    | CAP_VIEWPORT
+    | CAP_MEDIA_PLI;

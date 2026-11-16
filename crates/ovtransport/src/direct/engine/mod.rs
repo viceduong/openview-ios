@@ -692,6 +692,10 @@ impl DirectEngine {
         if let Some(x) = self.media.as_ref().and_then(|m| m.rx.next_deadline(now)) {
             take(x);
         }
+        let pli = self.media.as_ref().and_then(|m| m.pli.as_ref());
+        if let Some(p) = pli.filter(|_| self.media_ready()) {
+            take(p.next.min(p.until).saturating_duration_since(now));
+        }
         if self.on_direct {
             take((self.last_primary_tx + PRIMARY_KEEPALIVE).saturating_duration_since(now));
         }

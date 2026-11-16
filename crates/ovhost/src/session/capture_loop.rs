@@ -319,12 +319,16 @@ pub(super) fn capture_loop(
             caps & ovapp::terminal::CAP_HEVC != 0,
             caps & ovapp::terminal::CAP_LTR != 0,
         );
+        // A recovery request: the queued P-frames are undecodable now —
+        // drop them, and encode the recovery picture right away.
         let fb = ctl.video_fb.take();
         if fb.recover.is_some() {
+            mailbox.drop_stale_video();
             next_capture = Instant::now();
         }
         video.apply_feedback(fb);
         if ctl.video_idr.swap(false, Ordering::Relaxed) {
+            mailbox.drop_stale_video();
             video.request_idr();
             next_capture = Instant::now();
         }

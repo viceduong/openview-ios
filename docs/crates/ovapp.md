@@ -226,7 +226,7 @@ On receive, the stride of a delta is implied as `width * bpp`.
 | Off | Size | Field |
 |---|---|---|
 | 0 | 8 | `seq` u64 (consecutive per host session, END markers included) |
-| 8 | 1 | `flags`: `VIDEO_KEYFRAME = 1`, `VIDEO_END = 2`, `VIDEO_LTR = 4` (marked long-term reference, `CAP_LTR`), `VIDEO_RECOVERY = 8` (predicted only from the LTR named in `VIDEO_RECOVER`); unknown bits ignored |
+| 8 | 1 | `flags`: `VIDEO_KEYFRAME = 1`, `VIDEO_END = 2`, `VIDEO_LTR = 4` (marked long-term reference, `CAP_LTR`), `VIDEO_RECOVERY = 8` (predicted only from the LTR named in `VIDEO_RECOVER`); `VIDEO_SUPERSEDED = 0x80` is local only (never sent by a host: the iOS session sets it on a media-channel unit a newer one of the same delivery burst follows); unknown bits ignored |
 | 9 | 1 | `codec` (`CODEC_H264 = 1`, `CODEC_HEVC = 2` only to a `CAP_HEVC` viewer; anything else is rejected) |
 | 10 | 8 | rect `u16 x, y, w, h` (coded picture placement) |
 | 18 | 4 | `screen_w` u32 |
@@ -284,11 +284,12 @@ largest DEFLATE expansion), so a small payload cannot claim a huge allocation.
 | 20 | `CAP_LTR` | long-term-reference loss recovery: viewer sends VIDEO_LTR_ACK / VIDEO_RECOVER, host marks LTRs and answers with a `VIDEO_RECOVERY` P-frame (or an IDR); part of `LOCAL_CAPS`, used when both set it |
 | 21 | `CAP_PALETTE` | decodes palette bands (band codec 4 in a Packed container, see 4.3); every build (pure Rust), part of `LOCAL_CAPS` |
 | 22 | `CAP_VIEWPORT` | host: acts on VIEWPORT (visible tiles first, the rest deferred); a viewer sends VIEWPORT only to a host that set it; part of `LOCAL_CAPS` |
+| 23 | `CAP_MEDIA_PLI` | with `CAP_MEDIA`: while the media channel is up, a viewer sends its VIDEO_IDR_REQUEST / VIDEO_RECOVER as a repeated PLI datagram (`ovtransport::media`) instead of the reliable record; the host acts on it once per request; part of `LOCAL_CAPS`, used when both set it |
 
 The caps sets are built up as follows:
 
 - `LOCAL_CAPS = TILES | ZSTD | KEYFRAME | RUDP | INPUT2 | LZ4 | BANDS | MOVE |
-  BYE | TIMING | LTR | PALETTE | VIEWPORT`.
+  BYE | TIMING | LTR | PALETTE | VIEWPORT | MEDIA_PLI`.
 - `VIEWER_W2_CAPS = LOSSY | CACHE`.
 - `audio::audio_caps()` returns `OPUS | AUDIO10` with the `opus` feature, and
   `0` otherwise.
@@ -396,7 +397,11 @@ After a successful decode of a `VIDEO_LTR` unit the viewer sends
 LTR forgotten, IDR request); a loss (gap, torn unit, MEDIA_GAP) only
 `mark_broken` (LTR recovery stays possible). A `VIDEO_RECOVERY` unit
 resyncs a viewer waiting on its `VIDEO_RECOVER`. Requests use the same
-300 ms rate limit. `VideoRxStats` records (besides `idr_requests`,
+300 ms rate limit. With `CAP_MEDIA_PLI` (both peers) and the media channel
+up, a request goes as a repeated PLI on the media channel
+(`DirectCarrier::request_picture`) and no reliable record is sent (a late
+reliable copy could only be answered twice); a delivered keyframe /
+recovery picture stops the repeats (`picture_arrived`). `VideoRxStats` records (besides `idr_requests`,
 `recover_requests`, `ltr_acks`):
 
 - capture-to-paint latency, computed as `unix_micros() - pts_us` and kept
@@ -415,6 +420,9 @@ resyncs a viewer waiting on its `VIDEO_RECOVER`. Requests use the same
 - `pump_media()` maps transport events:
   - `MediaEvent::Video` -> `on_video_unit`
   - `VideoLost` -> broken chain plus an IDR request
+  - `PictureLoss(r)` (host, the viewer's PLI) -> `VIDEO_IDR_REQUEST` /
+    `VIDEO_RECOVER` to the hook, as if received reliably (a reliable one
+    also calls `drop_queued_video` on the direct carrier)
   - `Audio{lost, payload}` -> `MEDIA_GAP(audio)` (when `lost > 0`), then
     `AUDIO`, both delivered to the hook
 - `transport_rate()` and `transport_queue_delay()` expose the direct-path
@@ -837,6 +845,11 @@ These are the decision rules in `submit_ex` (the full narrative is in
   `VIDEO_END` always precedes the region's lossless refresh.
 - When both a video unit and a screen update are eligible, `take()`
   alternates between them.
+- `drop_stale_video()` (a recovery request arrived; `ovhost`'s capture
+  loop calls it before encoding the recovery picture) drops the queued
+  plain P-frames ahead of the first keyframe / recovery picture /
+  `VIDEO_END`; they count as taken for the barrier. Their seqs never reach
+  the viewer, which accepts the recovery picture whatever came before it.
 - An optional `Notify` callback fires on every put. `ovhost` wires it to a
   `netwait::Waker`.
 

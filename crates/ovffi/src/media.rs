@@ -2,7 +2,16 @@
 //! datagrams): negotiation from the CAPS records and delivery to the shell
 //! as ordinary channel-0 commands.
 
+use ovapp::video::{VIDEO_END, VIDEO_KEYFRAME, VIDEO_RECOVERY, VIDEO_SUPERSEDED};
+use ovtransport::media::{MediaEvent, PictureRequest};
+
+use crate::direct::FfiDirectIo;
 use crate::session::Inner;
+
+/// `VideoHeader::flags` inside a media-channel unit.
+fn unit_flags(unit: &[u8]) -> u8 {
+    unit.get(8).copied().unwrap_or(0)
+}
 
 /// The CAPS flags of a channel-0 CAPS record payload.
 pub(crate) fn caps_of(channel: u8, payload: &[u8]) -> Option<u32> {
@@ -30,25 +39,99 @@ pub(crate) fn maybe_enable_media(g: &mut Inner) {
     }
 }
 
+/// A VIDEO_IDR_REQUEST / VIDEO_RECOVER the shell sends while both CAPS
+/// carry CAP_MEDIA_PLI goes out as a repeated PLI on the media channel
+/// instead, when that is up (`true` = sent there; nothing goes reliably).
+pub(crate) fn send_picture_request(g: &mut Inner, channel: u8, payload: &[u8]) -> bool {
+    let Some(r) = picture_request(g.local_caps, g.peer_caps, channel, payload) else {
+        return false;
+    };
+    let Some(dir) = g.direct.as_mut() else {
+        return false;
+    };
+    let mut io = FfiDirectIo {
+        transport: &mut g.transport,
+        sink: g.direct_send_sink,
+    };
+    dir.engine
+        .request_picture(r, std::time::Instant::now(), &mut io)
+}
+
+/// The PLI an outgoing record becomes: a channel-0 VIDEO_IDR_REQUEST /
+/// VIDEO_RECOVER when both CAPS (`local`, `peer`) carry CAP_MEDIA_PLI.
+fn picture_request(
+    local: Option<u32>,
+    peer: Option<u32>,
+    channel: u8,
+    payload: &[u8],
+) -> Option<PictureRequest> {
+    use ovapp::terminal::{Command, OpCode, CAP_MEDIA_PLI};
+    let ops = [OpCode::VideoIdrRequest as u8, OpCode::VideoRecover as u8];
+    let pli = local
+        .zip(peer)
+        .is_some_and(|(l, p)| l & p & CAP_MEDIA_PLI != 0);
+    if channel != 0 || !pli || !payload.first().is_some_and(|op| ops.contains(op)) {
+        return None;
+    }
+    match ovapp::terminal::decode(payload) {
+        Ok(Command::VideoIdrRequest { have_seq }) => Some(PictureRequest::Keyframe { have_seq }),
+        Ok(Command::VideoRecover { ltr_seq }) => Some(PictureRequest::Recover { ltr_seq }),
+        _ => None,
+    }
+}
+
+/// Which video units of one delivery batch a newer picture in the same
+/// batch supersedes: those followed, with no loss and no VIDEO_END in
+/// between, by another unit. A burst (a hole repaired, frames released
+/// together) then reaches the screen as its newest picture instead of a
+/// fast-forward; the others are still decoded.
+fn superseded(events: &[MediaEvent]) -> Vec<bool> {
+    let mut out = vec![false; events.len()];
+    let mut newer = false;
+    for (i, e) in events.iter().enumerate().rev() {
+        match e {
+            MediaEvent::Video(u) if unit_flags(u) & VIDEO_END != 0 => newer = false,
+            MediaEvent::Video(_) => {
+                out[i] = newer;
+                newer = true;
+            }
+            MediaEvent::VideoLost { .. } => newer = false,
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Hand what the media channel delivered to the shell's record sink
 /// as channel-0 commands `ov_screen_feed` understands: a VIDEO_UNIT per
-/// complete access unit, a MEDIA_GAP for frames / audio packets lost for
-/// good, an AUDIO per Opus packet — so the Swift side needs no change.
+/// complete access unit (flagged `VIDEO_SUPERSEDED` when a newer one of the
+/// batch follows), a MEDIA_GAP for frames / audio packets lost for good,
+/// an AUDIO per Opus packet — so the Swift side needs no change.
 pub(crate) fn deliver_media(g: &mut Inner) {
     let Some(dir) = g.direct.as_mut() else { return };
     let events = dir.engine.take_media_events();
+    let way_back = |e: &MediaEvent| matches!(e, MediaEvent::Video(u) if unit_flags(u) & (VIDEO_KEYFRAME | VIDEO_RECOVERY) != 0);
+    if events.iter().any(way_back) {
+        dir.engine.picture_arrived();
+    }
     let Some(f) = g.record_sink.f else { return };
     let user = g.record_sink.user;
     let emit = |p: &[u8]| f(user, 0, p.as_ptr(), p.len());
-    for ev in events {
+    let superseded = superseded(&events);
+    for (ev, superseded) in events.into_iter().zip(superseded) {
         match ev {
-            ovtransport::media::MediaEvent::Video(unit) => {
+            MediaEvent::Video(unit) => {
                 let mut p = Vec::with_capacity(1 + unit.len());
                 p.push(ovapp::terminal::OpCode::VideoUnit as u8);
                 p.extend_from_slice(&unit);
+                if superseded {
+                    if let Some(flags) = p.get_mut(1 + 8) {
+                        *flags |= VIDEO_SUPERSEDED;
+                    }
+                }
                 emit(&p);
             }
-            ovtransport::media::MediaEvent::VideoLost { frames } => {
+            MediaEvent::VideoLost { frames } => {
                 emit(&ovapp::terminal::encode(
                     &ovapp::terminal::Command::MediaGap {
                         kind: ovapp::terminal::GAP_VIDEO,
@@ -57,7 +140,9 @@ pub(crate) fn deliver_media(g: &mut Inner) {
                     },
                 ));
             }
-            ovtransport::media::MediaEvent::Audio { lost, payload } => {
+            // Host-bound only (a viewer never receives a PLI).
+            MediaEvent::PictureLoss(_) => {}
+            MediaEvent::Audio { lost, payload } => {
                 if lost > 0 {
                     let per = match ovapp::audio::parse_audio_frame(&payload) {
                         Ok((_, ovapp::audio::AudioPayload::Opus { samples, .. })) => samples,
@@ -79,5 +164,53 @@ pub(crate) fn deliver_media(g: &mut Inner) {
                 emit(&p);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recovery request becomes a PLI only when both peers set
+    /// CAP_MEDIA_PLI (an older host keeps getting the reliable record).
+    #[test]
+    fn picture_requests_go_on_the_media_channel_only_with_the_cap() {
+        use ovapp::terminal::{encode, Command, CAP_MEDIA, CAP_MEDIA_PLI};
+        let rec = encode(&Command::VideoRecover { ltr_seq: 5 });
+        let both = Some(CAP_MEDIA | CAP_MEDIA_PLI);
+        let old = Some(CAP_MEDIA);
+        let want = Some(PictureRequest::Recover { ltr_seq: 5 });
+        assert_eq!(picture_request(both, both, 0, &rec), want);
+        assert_eq!(picture_request(both, old, 0, &rec), None);
+        assert_eq!(picture_request(old, both, 0, &rec), None);
+        assert_eq!(picture_request(both, None, 0, &rec), None);
+        let idr = encode(&Command::VideoIdrRequest { have_seq: 9 });
+        assert_eq!(
+            picture_request(both, both, 0, &idr),
+            Some(PictureRequest::Keyframe { have_seq: 9 })
+        );
+        let ack = encode(&Command::VideoLtrAck { seq: 5 });
+        assert_eq!(picture_request(both, both, 0, &ack), None);
+    }
+
+    /// All but the newest unit of a burst are superseded; a loss or a
+    /// VIDEO_END in between ends the burst.
+    #[test]
+    fn superseded_marks_all_but_the_newest_of_a_batch() {
+        let v = |flags: u8| {
+            let mut u = vec![0u8; 40];
+            u[8] = flags;
+            MediaEvent::Video(u)
+        };
+        let lost = MediaEvent::VideoLost { frames: 1 };
+        let audio = MediaEvent::Audio {
+            lost: 0,
+            payload: Vec::new(),
+        };
+        let batch = [v(0), audio, v(0), v(0), lost, v(0), v(VIDEO_END), v(1)];
+        assert_eq!(
+            superseded(&batch),
+            [true, false, true, false, false, false, false, false]
+        );
     }
 }

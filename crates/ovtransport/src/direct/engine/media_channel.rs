@@ -4,11 +4,11 @@
 use std::time::{Duration, Instant};
 
 use super::super::link::{apply_rate, rudp_out, Link, LinkCc, Paced};
-use super::super::media_state::{MediaState, SentFrame};
+use super::super::media_state::{MediaState, PliRepeat, SentFrame};
 use super::super::*;
 use super::DirectEngine;
 use crate::cc::{Lane, PacketReport};
-use crate::media::{self, MediaEvent, MediaKeys};
+use crate::media::{self, MediaEvent, MediaKeys, PictureRequest};
 
 impl DirectEngine {
     /// Both peers advertised `CAP_MEDIA`: switch the direct link to the v2
@@ -104,12 +104,122 @@ impl DirectEngine {
     }
 
     /// Media received since the last call (video units in frame order,
-    /// losses, audio packets).
+    /// losses, audio packets, the viewer's newest picture request).
     pub fn take_media_events(&mut self) -> Vec<MediaEvent> {
-        self.media
-            .as_mut()
-            .map(|m| m.rx.take_events())
-            .unwrap_or_default()
+        let Some(m) = self.media.as_mut() else {
+            return Vec::new();
+        };
+        let mut ev = m.rx.take_events();
+        ev.extend(m.picture_request.take().map(MediaEvent::PictureLoss));
+        ev
+    }
+
+    /// Viewer (both peers set `CAP_MEDIA_PLI`): ask for a way back into the
+    /// video stream on the media channel — a PLI now, repeated about every
+    /// RTT until [`picture_arrived`](Self::picture_arrived) or
+    /// [`media::PLI_REPEAT_FOR`] (a new request replaces it). `false` =
+    /// media not ready: send the reliable request instead.
+    pub fn request_picture(
+        &mut self,
+        r: PictureRequest,
+        now: Instant,
+        io: &mut dyn DirectIo,
+    ) -> bool {
+        if !self.media_ready() {
+            return false;
+        }
+        let Some(ms) = self.media.as_mut() else {
+            return false;
+        };
+        ms.pli_req = ms.pli_req.wrapping_add(1);
+        ms.pli = Some(PliRepeat {
+            msg: media::pli_msg(ms.pli_req, r),
+            next: now,
+            until: now + media::PLI_REPEAT_FOR,
+        });
+        self.send_pli(now, io);
+        true
+    }
+
+    /// Viewer: the keyframe / recovery picture arrived — stop repeating the
+    /// PLI.
+    pub fn picture_arrived(&mut self) {
+        if let Some(m) = self.media.as_mut() {
+            m.pli = None;
+        }
+    }
+
+    /// Send the pending PLI when its repeat is due (and media is ready).
+    fn send_pli(&mut self, now: Instant, io: &mut dyn DirectIo) {
+        if !self.media_ready() {
+            return;
+        }
+        let (Some(link), Some(ms)) = (self.link.as_mut(), self.media.as_mut()) else {
+            return;
+        };
+        let MediaState { pli, tx, stats, .. } = ms;
+        let Some(p) = pli.as_mut() else { return };
+        if now >= p.until {
+            *pli = None;
+            return;
+        }
+        let Some(cc) = link.cc.as_mut().filter(|_| now >= p.next) else {
+            return;
+        };
+        let every = link
+            .rudp
+            .srtt()
+            .unwrap_or(media::PLI_EVERY_MAX)
+            .clamp(media::PLI_EVERY_MIN, media::PLI_EVERY_MAX);
+        let _ = cc.send_now(Some(tx), now, link.path, &Paced::Media(p.msg.clone()), io);
+        p.next = now + every;
+        stats.pli_tx += 1;
+        link.last_tx = now;
+    }
+
+    /// Host: drop the video frames still waiting whole in the pacer (no
+    /// shard sent yet) — after a recovery request they are undecodable at
+    /// the viewer and only delay the recovery picture. Their frame ids are
+    /// handed out again, so the viewer sees no gap. Nothing is dropped when
+    /// a keyframe is among them. Returns the frames dropped.
+    pub fn drop_queued_video(&mut self) -> usize {
+        let (Some(link), Some(ms)) = (self.link.as_mut(), self.media.as_mut()) else {
+            return 0;
+        };
+        let Some(cc) = link.cc.as_mut() else { return 0 };
+        let shard = |p: &Paced| match p {
+            Paced::Media(m) => media::parse_shard(m).map(|s| (s.frame_id, s.idx, s.flags)),
+            Paced::Rudp(_) => None,
+        };
+        let Some((at, first)) = cc
+            .pacer
+            .iter(Lane::Media)
+            .enumerate()
+            .find_map(|(i, p)| shard(p).filter(|s| s.1 == 0).map(|s| (i, s.0)))
+        else {
+            return 0;
+        };
+        let keyframe = cc
+            .pacer
+            .iter(Lane::Media)
+            .skip(at)
+            .any(|p| shard(p).is_some_and(|s| s.2 & media::SHARD_KEYFRAME != 0));
+        if keyframe {
+            return 0;
+        }
+        cc.pacer.truncate(Lane::Media, at);
+        let n = ms.next_frame.wrapping_sub(first);
+        ms.next_frame = first;
+        while ms
+            .sent
+            .back()
+            .is_some_and(|f| !media::seq_after(first, f.id))
+        {
+            if let Some(f) = ms.sent.pop_back() {
+                ms.sent_bytes -= f.msgs.iter().map(Vec::len).sum::<usize>();
+            }
+        }
+        n as usize
     }
 
     /// Send one video unit (`VideoHeader || Annex-B`) on the media channel:
@@ -226,6 +336,7 @@ impl DirectEngine {
             return;
         };
         let tseq = u32::from_be_bytes(d[2..6].try_into().unwrap_or([0; 4]));
+        let mut purge = false;
         match d[1] {
             media::KIND_RUDP => {
                 if let Some(cc) = link.cc.as_mut() {
@@ -294,7 +405,7 @@ impl DirectEngine {
                         {
                             ms.stats.nack_rx += 1;
                             if let Some(sf) = ms.sent.iter_mut().find(|s| s.id == f) {
-                                if sf.resends < 2 {
+                                if sf.resends < media::NACK_ROUNDS {
                                     sf.resends += 1;
                                     let want: Vec<usize> = if idx.is_empty() {
                                         (0..usize::from(sf.k)).collect()
@@ -314,10 +425,26 @@ impl DirectEngine {
                             }
                         }
                     }
+                    Some(&media::M_PLI) => match media::parse_pli(&pt) {
+                        Some((req, r)) => {
+                            ms.stats.pli_rx += 1;
+                            // Repeats (and stale reorders) of a request
+                            // already acted on are ignored.
+                            if ms.pli_seen.is_none_or(|s| media::seq_after(req, s)) {
+                                ms.pli_seen = Some(req);
+                                ms.picture_request = Some(r);
+                                purge = true;
+                            }
+                        }
+                        None => ms.stats.bad_rx += 1,
+                    },
                     _ => ms.stats.bad_rx += 1,
                 }
             }
             _ => {}
+        }
+        if purge {
+            self.drop_queued_video();
         }
     }
 
@@ -348,6 +475,7 @@ impl DirectEngine {
                 .is_ok()
             });
         }
+        self.send_pli(now, io);
         self.pace(now, io);
     }
 }

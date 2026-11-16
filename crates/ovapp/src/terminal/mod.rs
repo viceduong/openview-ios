@@ -158,7 +158,7 @@ pub use caps::{
     LOCAL_CAPS, VIEWER_W2_CAPS,
 };
 pub use caps::{CAP_HEVC, CAP_LTR};
-pub use caps::{CAP_PALETTE, CAP_VIEWPORT};
+pub use caps::{CAP_MEDIA_PLI, CAP_PALETTE, CAP_VIEWPORT};
 pub(crate) use command::candidate_kind;
 pub use command::{
     Command, MonitorInfo, MouseButton, OpCode, PointerAction, PointerKind, WheelAccumulator,

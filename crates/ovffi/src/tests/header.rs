@@ -208,6 +208,10 @@ fn shared_constants_match() {
         i64::from(crate::OV_VIDEO_END)
     );
     assert_eq!(
+        header_define("OV_VIDEO_SUPERSEDED"),
+        i64::from(crate::OV_VIDEO_SUPERSEDED)
+    );
+    assert_eq!(
         header_define("OV_ERR_PANIC"),
         i64::from(crate::OV_ERR_PANIC)
     );

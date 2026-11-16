@@ -85,6 +85,11 @@ pub const VIDEO_LTR: u8 = 1 << 2;
 /// only from it or newer ones). A viewer waiting for recovery resumes
 /// decoding here instead of waiting for a keyframe.
 pub const VIDEO_RECOVERY: u8 = 1 << 3;
+/// [`VideoHeader::flags`], local only (never sent by a host): set by the
+/// viewer's session on a media-channel unit that a newer picture of the
+/// same delivery burst follows — decode it (the reference chain), but only
+/// the newest needs presenting.
+pub const VIDEO_SUPERSEDED: u8 = 1 << 7;
 /// Wire size of a `VIDEO_BEGIN` payload (without the opcode).
 pub(crate) const VIDEO_HEADER_LEN: usize = 38;
 /// Video access units queued in the mailbox at most; past this the host

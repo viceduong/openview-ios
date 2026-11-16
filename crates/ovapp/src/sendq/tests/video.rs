@@ -5,7 +5,7 @@ use super::*;
 use crate::terminal::CAP_H264;
 use crate::video::{
     EncodedAu, EncoderFactory, MotionConfig, VideoDecode, VideoEncode, VideoSession, CODEC_H264,
-    VIDEO_END, VIDEO_KEYFRAME,
+    VIDEO_END, VIDEO_KEYFRAME, VIDEO_RECOVERY,
 };
 
 fn vunit(seq: u64, flags: u8) -> EncodedFrame {
@@ -70,6 +70,23 @@ fn mailbox_keeps_video_fifo_and_orders_updates_after_it() {
         recs.last(),
         Some(Outgoing::Frame(Command::FrameEnd(4)))
     ));
+}
+
+/// A recovery request drops the queued P-frames ahead of the first
+/// recovery point; a screen update queued behind them is not held up.
+#[test]
+fn mailbox_drops_stale_video_on_a_recovery_request() {
+    let mb = FrameMailbox::default();
+    mb.push_video(vunit(0, 0));
+    mb.push_video(vunit(1, 0));
+    mb.put(frame(10, 4)); // barrier = 2
+    mb.push_video(vunit(2, VIDEO_RECOVERY));
+    mb.push_video(vunit(3, 0));
+    assert_eq!(mb.drop_stale_video(), 2);
+    assert_eq!(mb.drop_stale_video(), 0, "the recovery picture stays");
+    let order: Vec<(bool, u64)> =
+        std::iter::from_fn(|| mb.take().map(|f| (f.video.is_some(), f.seq))).collect();
+    assert_eq!(order, [(true, 2), (false, 10), (true, 3)]);
 }
 
 /// Masked tiles never go out as tiles; the refresh sends the whole

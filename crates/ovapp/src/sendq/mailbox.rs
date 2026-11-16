@@ -254,6 +254,27 @@ impl FrameMailbox {
         }
     }
 
+    /// The viewer asked for a recovery picture: drop the queued video it
+    /// can no longer decode — the plain P-frames ahead of the first
+    /// keyframe / recovery picture / `VIDEO_END` (that one and everything
+    /// after it stay), so the recovery picture encoded next is not stuck
+    /// behind them. Their seqs never reach the viewer, which waits for the
+    /// recovery picture anyway. Returns how many were dropped.
+    pub fn drop_stale_video(&self) -> usize {
+        let Ok(mut s) = self.slot.lock() else {
+            return 0;
+        };
+        let stale = |u: &EncodedFrame| {
+            u.video
+                .is_some_and(|h| !(h.is_keyframe() || h.is_recovery() || h.is_end()))
+        };
+        let n = s.video.iter().take_while(|u| stale(u)).count();
+        s.video.drain(..n);
+        // Dropped counts as taken for the screen-update barrier.
+        s.video_taken += n as u64;
+        n
+    }
+
     /// Latency stamps of the capture being encoded: every update put
     /// (or video unit pushed) until the next call carries them, with its
     /// encode-done time stamped at the hand-off. The capture thread sets

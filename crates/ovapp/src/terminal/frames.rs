@@ -14,7 +14,8 @@ use crate::video::DecodedTo;
 use super::session::PendingFrame;
 use super::{
     compress_frame, Command, FrameCodec, TerminalSession, VideoRxStats, CAP_H264, CAP_HEVC,
-    CAP_KEYFRAME, CAP_LTR, KEYFRAME_RETRY, MAX_LATENCY_SAMPLES, MAX_QUEUED_FRAMES, VIDEO_STALL_GAP,
+    CAP_KEYFRAME, CAP_LTR, CAP_MEDIA_PLI, KEYFRAME_RETRY, MAX_LATENCY_SAMPLES, MAX_QUEUED_FRAMES,
+    VIDEO_STALL_GAP,
 };
 
 impl TerminalSession {
@@ -324,6 +325,12 @@ impl TerminalSession {
             VideoVerdict::Deliver => {
                 self.video_stats.units += 1;
                 self.video_stats.bytes += data.len() as u64;
+                if header.is_keyframe() || header.is_recovery() {
+                    // The way back in arrived: stop repeating the PLI.
+                    if let Some(d) = self.carrier.direct_mut() {
+                        d.picture_arrived();
+                    }
+                }
                 if self.latency_on {
                     self.latency
                         .on_received(KIND_VIDEO, header.seq, Instant::now());
@@ -470,18 +477,32 @@ impl TerminalSession {
             return;
         }
         self.last_idr_request = Some(now);
-        let ltr = self.local_caps & self.peer_caps.unwrap_or(0) & CAP_LTR != 0;
-        match self.video_rx.request(ltr) {
-            crate::video::VideoRequest::Recover { ltr_seq } => {
-                if self.send(&Command::VideoRecover { ltr_seq }).is_ok() {
-                    self.video_stats.recover_requests += 1;
-                }
-            }
+        let caps = self.local_caps & self.peer_caps.unwrap_or(0);
+        let (pli, cmd) = match self.video_rx.request(caps & CAP_LTR != 0) {
+            crate::video::VideoRequest::Recover { ltr_seq } => (
+                ovtransport::media::PictureRequest::Recover { ltr_seq },
+                Command::VideoRecover { ltr_seq },
+            ),
             crate::video::VideoRequest::Idr => {
                 let have_seq = self.last_video_seq;
-                if self.send(&Command::VideoIdrRequest { have_seq }).is_ok() {
-                    self.video_stats.idr_requests += 1;
-                }
+                (
+                    ovtransport::media::PictureRequest::Keyframe { have_seq },
+                    Command::VideoIdrRequest { have_seq },
+                )
+            }
+        };
+        // CAP_MEDIA_PLI: a repeated PLI on the media channel when it is up
+        // (no reliable copy — it could only arrive late and be answered
+        // twice); the reliable record otherwise.
+        let on_media = caps & CAP_MEDIA_PLI != 0
+            && self
+                .carrier
+                .direct_mut()
+                .is_some_and(|d| d.request_picture(pli));
+        if on_media || self.send(&cmd).is_ok() {
+            match cmd {
+                Command::VideoRecover { .. } => self.video_stats.recover_requests += 1,
+                _ => self.video_stats.idr_requests += 1,
             }
         }
     }

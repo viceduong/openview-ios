@@ -73,6 +73,10 @@ struct RemoteVideoPacket {
     let isKeyframe: Bool
     /// Motion over: no picture; the next frame-sink image is the refresh.
     let isEnd: Bool
+    /// A newer picture of the same burst follows (OV_VIDEO_SUPERSEDED):
+    /// decode it for the reference chain, but do not output it — a burst
+    /// shows as its newest picture, not as a fast-forward.
+    let isSuperseded: Bool
     /// nil = a codec this build does not know (dropped, recovery asked).
     let codec: RemoteVideoCodec?
     /// Where the picture goes, in frame (remote screen) pixels.
@@ -438,11 +442,16 @@ final class VideoDecoder {
         let epochBox = epoch
         let frameOut = onFrame
         let errorOut = onError
+        let superseded = pkt.isSuperseded
+        var decodeFlags: VTDecodeFrameFlags = [._EnableAsynchronousDecompression]
+        if superseded {
+            decodeFlags.insert(._DoNotOutputFrame)
+        }
         var infoOut = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sample,
-            flags: [._EnableAsynchronousDecompression],
+            flags: decodeFlags,
             infoFlagsOut: &infoOut
         ) { decodeStatus, flags, imageBuffer, _, _ in
             guard epochBox.value == myEpoch else { return } // an older session
@@ -451,9 +460,10 @@ final class VideoDecoder {
                 return
             }
             guard let imageBuffer else {
-                // Dropped by the decoder without an error: nothing to show,
-                // the reference chain is intact.
-                if !flags.contains(.frameDropped) {
+                // Not output on purpose (superseded), or dropped by the
+                // decoder without an error: nothing to show, the reference
+                // chain is intact.
+                if !superseded && !flags.contains(.frameDropped) {
                     errorOut(-1)
                 }
                 return

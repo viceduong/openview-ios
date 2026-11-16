@@ -1469,6 +1469,18 @@ fn screen_passes_h264_through_and_advertises_cap_h264() {
             0
         );
         assert_eq!(GOT.lock().unwrap().len(), before + 1);
+        // A unit a newer one of its burst supersedes: decoded, not shown.
+        let superseded = header(13, ovapp::video::VIDEO_SUPERSEDED);
+        let cmd = Command::VideoUnit {
+            header: superseded,
+            data: p_frame.to_vec(),
+        };
+        assert_eq!(feed(screen, &cmd), 0);
+        assert_eq!(
+            GOT.lock().unwrap().last().map(|g| g.flags),
+            Some(crate::OV_VIDEO_SUPERSEDED)
+        );
+        let before = before + 1;
         // A media gap breaks the chain: IDR requested, P-frames dropped.
         while reply(screen).is_some() {}
         std::thread::sleep(ovapp::terminal::KEYFRAME_RETRY);
@@ -1480,13 +1492,13 @@ fn screen_passes_h264_through_and_advertises_cap_h264() {
         assert_eq!(feed(screen, &gap), 0);
         assert_eq!(
             reply(screen),
-            Some(Command::VideoIdrRequest { have_seq: 12 })
+            Some(Command::VideoIdrRequest { have_seq: 13 })
         );
         assert_eq!(
             feed(
                 screen,
                 &Command::VideoUnit {
-                    header: header(13, 0),
+                    header: header(14, 0),
                     data: p_frame.to_vec()
                 }
             ),

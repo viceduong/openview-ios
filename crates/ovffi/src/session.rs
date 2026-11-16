@@ -18,7 +18,7 @@ use crate::callbacks::{
 };
 use crate::direct::FfiDirect;
 use crate::error::{err_from_transport, OV_ERR_PANIC};
-use crate::media::{caps_of, maybe_enable_media};
+use crate::media::{caps_of, maybe_enable_media, send_picture_request};
 use crate::pump::{pump_inner, send_record_bytes};
 use crate::transport::{FfiDatagramCarrier, Transport};
 
@@ -351,9 +351,9 @@ pub unsafe extern "C" fn ov_session_send_record(
         };
         lock(s)
             .and_then(|mut g| {
-                let Some(session) = g.session.as_mut() else {
+                if g.session.is_none() {
                     return Err(-2);
-                };
+                }
                 // Reject before encrypting: an oversized record would consume a
                 // send sequence number and then fail on the carrier, desyncing
                 // the peer permanently.
@@ -362,6 +362,14 @@ pub unsafe extern "C" fn ov_session_send_record(
                 {
                     return Err(-1);
                 }
+                // Before encrypting: a request diverted to the media
+                // channel must not consume a record sequence number.
+                if send_picture_request(&mut g, channel, payload) {
+                    return Ok(0);
+                }
+                let Some(session) = g.session.as_mut() else {
+                    return Err(-2);
+                };
                 let record = session.encrypt_record(channel, payload);
                 if matches!(g.transport, Transport::None) {
                     return Err(-2);

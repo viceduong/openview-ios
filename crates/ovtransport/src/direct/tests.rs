@@ -275,6 +275,7 @@ fn run_media(frames: u32, loss_pct: &dyn Fn(u32) -> u64) -> MediaRun {
                         audio += 1;
                         audio_lost += lost;
                     }
+                    MediaEvent::PictureLoss(_) => {}
                 }
             }
         }
@@ -477,6 +478,57 @@ fn relayless_direct_path_survives_a_stall() {
         "given up once silent past the grace"
     );
     assert!(h.take_events().iter().any(|e| e.contains("relay gone")));
+}
+
+/// A viewer's PLI reaches the host once per request (repeats ignored),
+/// drops the video still queued whole in the pacer and rewinds the frame
+/// ids, so the next (recovery) frame follows without a gap.
+#[test]
+fn pli_purges_queued_video_and_is_acted_on_once() {
+    let t0 = Instant::now();
+    let (mut h, mut v) = media_pair(t0);
+    let (mut hio, mut vio) = (MemIo::default(), MemIo::default());
+    let unit = |tag: u8| vec![tag; 20_000];
+    for tag in 0..3 {
+        assert!(h.send_media_video(&unit(tag), tag == 0, t0, &mut hio));
+    }
+    let req = media::PictureRequest::Recover { ltr_seq: 7 };
+    assert!(v.request_picture(req, t0, &mut vio));
+    for d in std::mem::take(&mut vio.direct) {
+        h.on_direct(0, &d, t0, &mut hio, &mut |_| {});
+    }
+    assert_eq!(h.take_media_events(), vec![MediaEvent::PictureLoss(req)]);
+    assert!(h.send_media_video(&unit(9), false, t0, &mut hio));
+    // A repeat about an RTT later (100 ms without an RTT sample) is ignored.
+    let t1 = t0 + media::PLI_EVERY_MAX;
+    v.poll(t1, &mut vio, &mut |_| {});
+    let mut got = Vec::new();
+    let mut now = t1;
+    while now < t1 + Duration::from_secs(1) {
+        for d in std::mem::take(&mut vio.direct) {
+            h.on_direct(0, &d, now, &mut hio, &mut |_| {});
+        }
+        h.poll(now, &mut hio, &mut |_| {});
+        for d in std::mem::take(&mut hio.direct) {
+            v.on_direct(0, &d, now, &mut vio, &mut |_| {});
+        }
+        v.poll(now, &mut vio, &mut |_| {});
+        got.extend(v.take_media_events());
+        assert!(h.take_media_events().is_empty(), "acted on once");
+        v.picture_arrived();
+        now += Duration::from_millis(1);
+    }
+    assert_eq!(
+        got,
+        vec![MediaEvent::Video(unit(0)), MediaEvent::Video(unit(9))]
+    );
+    assert_eq!(
+        (
+            v.media_stats().unwrap().pli_tx,
+            h.media_stats().unwrap().pli_rx
+        ),
+        (2, 2)
+    );
 }
 
 /// A replayed or forged media datagram is dropped.

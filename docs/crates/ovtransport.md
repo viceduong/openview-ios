@@ -31,7 +31,7 @@ The crate exports five carrier types plus the direct engine, and `pub mod ws`, t
 | `inmem` | `src/inmem.rs` | re-exported | `InMemoryCarrier::pair()` |
 | `tcp` | `src/tcp.rs` | re-exported | `TcpCarrier`: `[u16 BE len][body]` framing over a non-blocking `TcpStream` |
 | `udp` | `src/udp.rs` | re-exported | `UdpP2pCarrier`: connected UDP socket with 4 MiB buffers, runs `rudp` |
-| `rudp` | `src/rudp/mod.rs` (+ `tests.rs`) | `pub mod` | `ReliableLink`: fragmentation, SACK, fast retransmit and RACK, RTO, Reno window or an external window, token-bucket pacing, in-order delivery, raw→framed switch-over |
+| `rudp` | `src/rudp/mod.rs` (+ `tests.rs`) | `pub mod` | `ReliableLink`: fragmentation, SACK, fast retransmit and RACK, tail loss probe, RTO, Reno window or an external window, token-bucket pacing, in-order delivery, raw→framed switch-over |
 | `tunnel` | `src/tunnel.rs` | re-exported | relay tunnel framing `[kind][u16 BE len][payload]`, `FrameReader`, `encode_frame`, frame kinds |
 | `relay` | `src/relay/mod.rs` (+ `tests.rs`) | re-exported (`RelayTunnelCarrier`, `TunnelRole`, `BridgeWriter`, `ReadWake`; `WsEndpoint` with `ws-client`) | `RelayTunnelCarrier`: `connect` / `connect_host` / `connect_ws` / `connect_bridge`, CONNECT/O/A/XT control lines, tunnel frames, auto-PONG, `dial_tcp` |
 | `relay::watch` | `src/relay/watch.rs` | private | read-waker thread (`ov-relay-watch`), hand-declared `poll` / `WSAPoll` (`wait_readable_any`) |
@@ -45,7 +45,7 @@ The crate exports five carrier types plus the direct engine, and `pub mod ws`, t
 | | `src/direct/wire.rs` | | probe and relay-marker encoding, `session_direct_key` |
 | | `src/direct/carrier.rs` | | `DirectCarrier` and `DirectSockets` over real sockets |
 | | `src/direct/tests.rs` | | unit tests |
-| `media` | `src/media/mod.rs` (+ `tests.rs`) | `pub mod` | v2 datagram header, media AEAD keys, replay window, Reed-Solomon video shards, NACK and audio messages, `MediaRx` reassembly |
+| `media` | `src/media/mod.rs` (+ `tests.rs`) | `pub mod` | v2 datagram header, media AEAD keys, replay window, Reed-Solomon video shards, NACK, PLI and audio messages, `MediaRx` reassembly (deadline NACKs) |
 | `cc` | `src/cc/mod.rs` (+ `feedback.rs`, `gcc.rs`, `pacer.rs`, `tests.rs`) | `pub mod` | TWCC-style feedback (`feedback.rs`), a GCC-like delay-based rate controller (`Gcc`, `gcc.rs`), two-lane `Pacer` (`pacer.rs`) |
 
 ## 3. The `Carrier` trait (`carrier.rs`)
@@ -145,11 +145,12 @@ The record layer requires ordered, lossless delivery. Raw UDP with 4 KiB records
 | Pacing | Token bucket: `BURST` = 32 tokens deep, refilled at `2 × cwnd / srtt` (srtt defaults to 50 ms, floor 200 µs). Disabled in governed mode. |
 | RTT / RTO | Jacobson/Karels: `srtt = 7/8·srtt + 1/8·r`, `rttvar = 3/4·rttvar + 1/4·|srtt−r|`, `RTO = srtt + 4·rttvar + 5 ms`, clamped to [`MIN_RTO` 20 ms, `MAX_RTO` 2 s]. `INIT_RTO` is 200 ms. Samples come only from packets never retransmitted (Karn). |
 | Fast retransmit | A packet is lost if `DUP_THRESH` = 3 later packets were SACKed, **or** (RACK-style) a packet sent more than `max(srtt/4, 1 ms)` after it has already been delivered. Each packet is retransmitted at most once per srtt. Loss halves cwnd (to at least `MIN_CWND`) once per recovery episode, which lasts until `next_seq − 1` is acked. |
+| Tail loss probe | RFC 8985: when the newest in-flight packet is still unacked `PTO = max(2 × srtt, MIN_PTO 10 ms)` after it was sent and that comes before the RTO, `poll()` resends it once (Karn: no RTT sample; no window change). One probe per episode, re-armed by ACK progress; counted in `tail_probes` (and `retransmits`). A steady RTT keeps the RTO near srtt (the RTO fires first); jitter inflates `rttvar` and the RTO, which is when the probe saves time. |
 | RTO | `poll()` retransmits every in-flight packet older than the RTO (at most `BURST` per call unless governed). Then `ssthresh = cwnd/2` and `cwnd = max(MIN_CWND, cwnd/4)`. The RTO backs off ×2, capped at `min(MAX_RTO, 4 × computed RTO)`. Any fresh cumulative progress resets the backoff. |
 | Governed mode | `set_governed_cwnd(packets)` hands the window to an external controller (`cc::Gcc` through `direct::apply_rate`). Loss no longer shrinks the window, the token bucket is off, and RTO retransmissions are unlimited per poll. |
 | Send errors | `WouldBlock` keeps the packet queued. Any other error is treated as a loss, and the RTO recovers it. |
 
-`next_deadline(now)` returns the earliest of: the oldest in-flight packet's RTO, 1 ms if data is queued and the window has room, or the release timeout for held records.
+`next_deadline(now)` returns the earliest of: the oldest in-flight packet's RTO, the tail-loss probe, 1 ms if data is queued and the window has room, or the release timeout for held records.
 
 ### 5.4 Negotiation
 
@@ -438,6 +439,7 @@ The client sends with `c2s` and the server with `s2c`. `enable_media` is idempot
 | `2` | AUDIO | `02 ‖ aseq u32 ‖ AUDIO payload` (payload in `ovapp::audio` wire form) |
 | `3` | FEEDBACK | `03 ‖ base u32 ‖ count u16 ‖ ref_us u32 ‖ count × u16` — each entry is `(arrival − ref_us) / 50 µs`, `0xFFFF` = not received, at most 500 entries per message |
 | `4` | NACK | `04 ‖ frame_id u32 ‖ n u16 ‖ n × idx u16` — `n = 0` means resend every data shard; at most 512 indices |
+| `5` | PLI | `05 ‖ req u32 ‖ kind u8 (1 keyframe, 2 recover) ‖ seq u64` — viewer → host picture request (see below) |
 
 The "video unit" is `VideoHeader (38 B, ovapp::video) ‖ Annex-B access unit`. See [ovapp.md](ovapp.md) for that header.
 
@@ -452,7 +454,7 @@ The "video unit" is `VideoHeader (38 B, ovapp::video) ‖ Annex-B access unit`. 
 - `fec_ratio(loss) = clamp(0.10 + 4 × loss, 0.10, 0.30)` (`FEC_MIN` / `FEC_MAX`). The loss value is the controller's measured loss rate (1 s window).
 - The ratio a frame gets is `adaptive_fec_ratio`, driven per frame by the sender's `FecController` (clean-since timer, smoothed send interval):
   - loss > `LOSS_CLEAN` (0.2 %): `fec_ratio(loss)`, at once, and the clean timer restarts;
-  - clean for `FEC_CLEAN_HOLD` (3 s) **and** srtt < frame interval (a NACK round trip fits, the receiver's own NACK rule): `FEC_FLOOR` = 2 % for delta frames — `m` is still at least 1, so this only trims large frames (a 100 KB frame: 9 -> 2 recovery shards);
+  - clean for `FEC_CLEAN_HOLD` (3 s) **and** srtt < frame interval (a NACK round trip fits before the next frame is due): `FEC_FLOOR` = 2 % for delta frames — `m` is still at least 1, so this only trims large frames (a 100 KB frame: 9 -> 2 recovery shards);
   - otherwise (keyframes, RTT unknown or too long, not yet settled): `FEC_MIN`.
 - `DirectEngine::fec_ratio()` / `MediaStats::fec_ratio` report the ratio of the last frame sent.
 
@@ -475,16 +477,18 @@ It then decides:
 | Situation | Action |
 |---|---|
 | A paused stream (nothing pending at all) | not counted as a loss |
-| RTT < smoothed frame interval, not yet NACKed | NACK the missing data indices (only as many as still needed); wait `1.5 × RTT + 8 ms` |
-| Head frame never seen at all, same RTT condition | NACK with `n = 0` (whole frame); same wait |
-| Otherwise | give up: emit `VideoLost { frames }` (consecutive losses are merged). The app stops decoding P-frames and requests an IDR |
+| RTT known, fewer than `NACK_ROUNDS` (2) NACKs, `now + 1.2 × RTT` before the deadline | NACK the missing data indices (only as many as still needed); wait `1.5 × RTT + 8 ms` (at most until the deadline) |
+| Head frame never seen at all, same condition | NACK with `n = 0` (whole frame); same wait |
+| NACKed, deadline not reached | wait for the retransmission until the deadline |
+| Otherwise | give up: emit `VideoLost { frames }` (consecutive losses are merged) and release what follows. The app stops decoding P-frames and asks for a recovery picture |
+
+The deadline is `clamp(2 × RTT, NACK_HOLD_MIN 50 ms, NACK_HOLD_MAX 150 ms)` after the hole became evident: when a later frame's first shard arrived (`gap_seen`), or when the head became the head for a frame never seen. Incomplete frames **behind** the head are NACKed by the same rule as soon as their hole is evident (plus `REORDER_GRACE`), so a burst across several frames is repaired in parallel; giving up stays in frame order. `next_deadline` only reports future instants (a decision already due was taken by the last `poll`).
 
 **Bounds.**
 
 - At most `MAX_FRAMES` = 96 frames are held.
 - Incomplete frames may hold at most `MAX_BUFFERED` = 4 × `MAX_UNIT` = 16 MiB of shard and unit bytes. Past either limit the oldest frames are given up, so a peer that streams shards it never completes cannot grow the receiver without bound.
 - A frame_id more than 512 ahead of the head flushes everything before it as lost.
-- The frame interval is an EWMA (α 0.1) of first-shard arrival gaps, clamped to 4–250 ms per sample.
 
 **Audio.** `Audio { lost, payload }`, where `lost` counts the gap in `aseq` (gaps of 1000 or more resync silently). Late or duplicate packets are dropped and counted in `audio_late`.
 
@@ -493,7 +497,10 @@ It then decides:
 | Call | Behaviour |
 |---|---|
 | `send_media_video` | FEC-encodes into the pacer's **media** lane and remembers the frame for NACK retransmission: up to `SENT_FRAMES` 32 frames, `SENT_BYTES` 8 MiB, `SENT_AGE` 500 ms |
-| NACK received | resends the requested shards with the RETX flag on the **reliable** lane, at most 2 times per frame |
+| NACK received | resends the requested shards with the RETX flag on the **reliable** lane, at most `NACK_ROUNDS` (2) times per frame |
+| `request_picture` (viewer) | sends a PLI now and repeats it every `srtt` (clamped to `PLI_EVERY_MIN` 10 ms – `PLI_EVERY_MAX` 100 ms; 100 ms before an RTT sample) until `picture_arrived()` or `PLI_REPEAT_FOR` 300 ms (the viewer's own retry escalates after that); a new request increments `req` and replaces it. `false` when media is not ready (send the reliable request) |
+| PLI received (host) | acted on once per `req` (newer than the last one seen; repeats and reorders ignored): `drop_queued_video()`, then `take_media_events()` yields `MediaEvent::PictureLoss(PictureRequest)` |
+| `drop_queued_video` | drops the video frames waiting **whole** in the pacer's media lane (no shard sent yet; a partly sent frame finishes), forgets them for NACK and hands their frame ids out again, so the receiver sees no gap. Nothing is dropped when one of them is a keyframe. The app calls it for a reliable `VIDEO_IDR_REQUEST` / `VIDEO_RECOVER` too |
 | `send_media_audio` | sent immediately, unpaced |
 | Feedback, NACK, rudp ACKs | sent immediately, charged to the pacer budget |
 | Return value | both `send_media_*` calls return `false` when media is not ready (not on direct, link not confirmed, or v2 off); the caller then sends the data through the reliable record stream |
@@ -501,7 +508,7 @@ It then decides:
 **API.**
 
 - `media_ready()`, `cc_target()`, `cc_queue_delay()`, `fec_ratio()`, `take_media_events()`.
-- `media_stats()` returns `MediaStats`: frames, shards, and parity sent; NACKs; resends; audio; feedback; `bad_rx` (authentication failures); `replayed_rx`; rx stats; cc stats; target, loss, FEC ratio, queue delay.
+- `media_stats()` returns `MediaStats`: frames, shards, and parity sent; NACKs; resends; audio; PLIs sent / received; feedback; `bad_rx` (authentication failures); `replayed_rx`; rx stats; cc stats; target, loss, FEC ratio, queue delay.
 
 ## 10. Congestion control and pacing — `cc/`
 
@@ -589,12 +596,12 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `CONNECT_TIMEOUT` / `TX_SOFT_CAP` / `WRITE_STALL_TIMEOUT` / `READ_BUDGET` | 10 s / 256 KiB / 20 s / 1 MiB | `relay/mod.rs` |
 | `WATCH_POLL` | 200 ms | `relay/watch.rs` |
 | `MAX_INBOUND` / `OUT_CHUNK` / `MAX_HEAD` (WebSocket client) | 4 MiB / 64 KiB / 16 KiB | `relay/ws_client.rs` |
-| rudp `MAX_PAYLOAD`, `BURST`, `RELEASE_TIMEOUT`, `INIT_CWND`, `MIN_CWND`, `MAX_CWND`, `RCV_WINDOW`, `DUP_THRESH`, `INIT_RTO`, `MIN_RTO`, `MAX_RTO`, `ACK_EVERY` | 1200, 32, 300 ms, 32, 4, 8192, 16384, 3, 200 ms, 20 ms, 2 s, 16 | `rudp/mod.rs` |
+| rudp `MAX_PAYLOAD`, `BURST`, `RELEASE_TIMEOUT`, `INIT_CWND`, `MIN_CWND`, `MAX_CWND`, `RCV_WINDOW`, `DUP_THRESH`, `INIT_RTO`, `MIN_RTO`, `MAX_RTO`, `MIN_PTO`, `ACK_EVERY` | 1200, 32, 300 ms, 32, 4, 8192, 16384, 3, 200 ms, 20 ms, 2 s, 10 ms, 16 | `rudp/mod.rs` |
 | `PROBE_INTERVAL`, `PROBE_ROUND`, `REPROBE_AFTER`, `REPROBE_MAX` | 100 ms, 4 s, 1 s, 10 s | `direct/mod.rs` |
 | `KEEPALIVE`, `DEAD_AFTER`, `DEAD_AFTER_RELAYLESS`, `PRIMARY_KEEPALIVE`, `REBIND_AFTER`, `REBIND_INTERVAL` | 250 ms, 3 s, 15 s, 5 s, 1 s, 500 ms | `direct/mod.rs` |
 | `DACK_INTERVAL`, `DACK_EVERY`, `REPLAY_LIMIT`, `PENDING_LIMIT` | 50 ms, 64, 64 MiB, 65 536 | `direct/mod.rs` |
 | `MAX_PATHS` / `GOVERNED_CWND_FLOOR` | 256 / 256 | `direct/carrier.rs` / `direct/link.rs` |
-| `MAX_SHARD`, `MAX_UNIT`, `MAX_DATA_SHARDS`, `REPLAY_WINDOW`, `FEC_MIN`/`FEC_MAX`, `FEC_FLOOR`, `LOSS_CLEAN`, `FEC_CLEAN_HOLD`, `REORDER_GRACE`, `FRAME_TIMEOUT`, `MAX_FRAMES`, `MAX_BUFFERED` | 1136, 4 MiB, 3693, 4096, 0.10/0.30, 0.02, 0.002, 3 s, 4 ms, 150 ms, 96, 16 MiB | `media/mod.rs` |
+| `MAX_SHARD`, `MAX_UNIT`, `MAX_DATA_SHARDS`, `REPLAY_WINDOW`, `FEC_MIN`/`FEC_MAX`, `FEC_FLOOR`, `LOSS_CLEAN`, `FEC_CLEAN_HOLD`, `REORDER_GRACE`, `FRAME_TIMEOUT`, `NACK_HOLD_MIN`/`NACK_HOLD_MAX`, `NACK_ROUNDS`, `MAX_FRAMES`, `MAX_BUFFERED`, `PLI_REPEAT_FOR`, `PLI_EVERY_MIN`/`PLI_EVERY_MAX` | 1136, 4 MiB, 3693, 4096, 0.10/0.30, 0.02, 0.002, 3 s, 4 ms, 150 ms, 50/150 ms, 2, 96, 16 MiB, 300 ms, 10/100 ms | `media/mod.rs` |
 | `FEEDBACK_INTERVAL`, `FEEDBACK_UNIT_US`, `FEEDBACK_MAX`, `PACING_GAIN`, `START_RATE`, `MIN_RATE`, `MAX_RATE`, `LOSS_HIGH`, `TREND_WINDOW` | 25 ms, 50 µs, 500, 1.5, 6 Mbps, 2 Mbps, 200 Mbps, 10 %, 20 | `cc/mod.rs` |
 
 ## 12. Error handling
@@ -626,11 +633,11 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `udp.rs` | `udp_roundtrip_and_stats`, `udp_poll_recv_empty_returns_zero`, `udp_close_then_closed_error` |
 | `tunnel.rs` | single frame, byte-at-a-time feeds, multiple frames per feed, offset compaction across 1000 frames, max size, oversize latch, unknown-kind latch, encode rejects |
 | `relay/tests.rs` | fake-relay ping/pong and attach, DATA round trip, `wait_attached` (late attach, park timeout → `Closed`, no verdict → `Ok(false)`), full send buffer without blocking mode, queue-and-drain order under a stalled reader, read-waker coalescing, rejection → `Closed` |
-| `rudp/tests.rs` | lossless in-order with no retransmits; 5/10/30 % loss with reordering stays in order and exact; datagrams stay within the MTU budget; raw mode is byte-identical and switches on framed input; framed records wait for raw records sent before the switch; `WouldBlock` keeps packets queued |
+| `rudp/tests.rs` | lossless in-order with no retransmits; 5/10/30 % loss with reordering stays in order and exact; datagrams stay within the MTU budget; raw mode is byte-identical and switches on framed input; framed records wait for raw records sent before the switch; `WouldBlock` keeps packets queued; a lost tail packet is probed before its RTO (no timeout, one probe) |
 | `ws.rs` | RFC 6455 accept-key example, SHA-1 vectors, 7/16/64-bit length encodings, unmasking at any offset and split, deframer round trips for any split, bad frames rejected |
 | `relay/ws_client.rs` | upgrade-response validation, loopback pair connected, pump bridges a scripted server |
-| `direct/tests.rs` | probe round trip and tamper, marker vs record header, key asymmetry, unarmed pass-through, promote-then-demote keeps order both ways (direct socket killed mid-session), media frames survive 3 % and 1 % random loss (FEC, NACK, audio gaps, feedback, records alongside), adaptive FEC drops to the floor on a clean link and ramps back up when 3 % loss starts (no frame lost), NAT rebinding moves the link (relay gone), relay-less stall survives up to 15 s, media replay and forgery rejected, media over loopback sockets, foreign probe rejected, unacked records replayed on demotion, a path blocked for 20 s is picked up by the re-probes once it opens (live migration, records in order), a network change re-probes at once |
-| `media/tests.rs` | directional, domain-separated keys; seal/open/tamper; replay window; FEC recovery in order; NACK on short RTT vs loss on long RTT; wholly lost frame detected from the next frame; paused stream is not a loss; audio gaps and late packets; malformed shards (including inconsistent k / m); incomplete frames bounded in memory; adaptive FEC decision table and controller (hold, instant ramp-up, determinism, frame interval vs RTT) |
+| `direct/tests.rs` | probe round trip and tamper, marker vs record header, key asymmetry, unarmed pass-through, promote-then-demote keeps order both ways (direct socket killed mid-session), media frames survive 3 % and 1 % random loss (FEC, NACK, audio gaps, feedback, records alongside), adaptive FEC drops to the floor on a clean link and ramps back up when 3 % loss starts (no frame lost), NAT rebinding moves the link (relay gone), relay-less stall survives up to 15 s, a PLI drops the video queued whole in the pacer (frame ids reused, no gap) and is acted on once per request, media replay and forgery rejected, media over loopback sockets, foreign probe rejected, unacked records replayed on demotion, a path blocked for 20 s is picked up by the re-probes once it opens (live migration, records in order), a network change re-probes at once |
+| `media/tests.rs` | directional, domain-separated keys; seal/open/tamper; replay window; FEC recovery in order; NACK on short RTT vs loss on long RTT; NACK deadline (second round inside it, then give up and release); wholly lost frame detected from the next frame; paused stream is not a loss; audio gaps and late packets; malformed shards (including inconsistent k / m); incomplete frames bounded in memory; adaptive FEC decision table and controller (hold, instant ramp-up, determinism, frame interval vs RTT) |
 | `cc/tests.rs` | converges near a 20 Mbps capacity with a short queue; 1/3/5 % random loss does not collapse the rate; paced video bursts do not halve the estimate; idle Wi-Fi jitter does not collapse the estimate (a 300 KB burst after 60 s idle in < 400 ms); 25 % loss backs off; feedback round trip with holes; pacer spreading and lane priority |
 
 ### Integration tests (`tests/`)

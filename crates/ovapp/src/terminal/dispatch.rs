@@ -191,12 +191,15 @@ impl TerminalSession {
                     }
                 }
                 // KEYFRAME_REQUEST is viewer->host state for the capture
-                // loop: pure pass-through to the hook (so is
-                // VIDEO_IDR_REQUEST / VIDEO_LTR_ACK / VIDEO_RECOVER).
-                Command::KeyframeRequest { .. }
-                | Command::VideoIdrRequest { .. }
-                | Command::VideoLtrAck { .. }
-                | Command::VideoRecover { .. } => {}
+                // loop: pure pass-through to the hook (so are
+                // VIDEO_LTR_ACK and the recovery requests, which also drop
+                // the video still queued on the media channel).
+                Command::KeyframeRequest { .. } | Command::VideoLtrAck { .. } => {}
+                Command::VideoIdrRequest { .. } | Command::VideoRecover { .. } => {
+                    if let Some(d) = self.carrier.direct_mut() {
+                        d.drop_queued_video();
+                    }
+                }
                 Command::VideoBegin {
                     header,
                     compressed_len,
@@ -411,6 +414,22 @@ impl TerminalSession {
                     self.video_rx.mark_broken();
                     if self.video_dec.is_some() {
                         self.request_video_idr();
+                    }
+                }
+                // Host: the viewer's PLI (the engine already dropped the
+                // queued video) reaches the hook as the reliable request.
+                ovtransport::media::MediaEvent::PictureLoss(r) => {
+                    self.stats.cmds_rx += 1;
+                    let cmd = match r {
+                        ovtransport::media::PictureRequest::Keyframe { have_seq } => {
+                            Command::VideoIdrRequest { have_seq }
+                        }
+                        ovtransport::media::PictureRequest::Recover { ltr_seq } => {
+                            Command::VideoRecover { ltr_seq }
+                        }
+                    };
+                    if let Some(hook) = self.on_cmd.as_mut() {
+                        hook(&cmd);
                     }
                 }
                 ovtransport::media::MediaEvent::Audio { lost, payload } => {
