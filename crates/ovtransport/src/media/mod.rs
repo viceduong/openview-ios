@@ -49,9 +49,10 @@
 //!                    what VIDEO_IDR_REQUEST (seq = the last unit received) /
 //!                    VIDEO_RECOVER (seq = the long-term reference held) say
 //!                    on the reliable channel. Repeated about every RTT until
-//!                    the recovery picture arrives (at most PLI_REPEAT_FOR);
-//!                    repeats keep `req`, a new request increments it, and
-//!                    the host acts once per `req`
+//!                    the recovery picture arrives (at most PLI_REPEAT_FOR,
+//!                    then once on the reliable channel); repeats keep
+//!                    `req`, a new request increments it, and the host acts
+//!                    once per `req`
 //! ```
 //!
 //! # Keys, nonces, replay
@@ -519,6 +520,10 @@ pub enum MediaEvent {
     /// reliable `VIDEO_IDR_REQUEST` / `VIDEO_RECOVER`. Video queued but
     /// not yet sent was already dropped (it can only be undecodable now).
     PictureLoss(PictureRequest),
+    /// Viewer side: the PLI repeats ran out ([`PLI_REPEAT_FOR`]) with no
+    /// way back in arriving — send the request once on the reliable
+    /// channel (`VIDEO_IDR_REQUEST` / `VIDEO_RECOVER`).
+    PictureUnanswered(PictureRequest),
     /// One audio payload; `lost` packets before it never arrived (conceal
     /// them before decoding this one).
     Audio {

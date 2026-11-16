@@ -396,12 +396,15 @@ After a successful decode of a `VIDEO_LTR` unit the viewer sends
 `VIDEO_LTR_ACK(seq)`. A decoder error calls `VideoRx::mark_corrupt` (every
 LTR forgotten, IDR request); a loss (gap, torn unit, MEDIA_GAP) only
 `mark_broken` (LTR recovery stays possible). A `VIDEO_RECOVERY` unit
-resyncs a viewer waiting on its `VIDEO_RECOVER`. Requests use the same
+resyncs the viewer whatever seqs were lost, as long as it holds a decoded
+LTR (also a late answer after an escalation, or a second one after a
+gap). Requests use the same
 300 ms rate limit. With `CAP_MEDIA_PLI` (both peers) and the media channel
 up, a request goes as a repeated PLI on the media channel
-(`DirectCarrier::request_picture`) and no reliable record is sent (a late
-reliable copy could only be answered twice); a delivered keyframe /
-recovery picture stops the repeats (`picture_arrived`). `VideoRxStats` records (besides `idr_requests`,
+(`DirectCarrier::request_picture`); a delivered keyframe / recovery
+picture stops the repeats (`picture_arrived`). Only when the repeats run
+out unanswered (`MediaEvent::PictureUnanswered`) and the chain is still
+broken does the same request go once as the reliable record. `VideoRxStats` records (besides `idr_requests`,
 `recover_requests`, `ltr_acks`):
 
 - capture-to-paint latency, computed as `unix_micros() - pts_us` and kept

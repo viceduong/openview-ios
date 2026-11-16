@@ -91,7 +91,7 @@ pub const VIDEO_RECOVERY: u8 = 1 << 3;
 /// the newest needs presenting.
 pub const VIDEO_SUPERSEDED: u8 = 1 << 7;
 /// Wire size of a `VIDEO_BEGIN` payload (without the opcode).
-pub(crate) const VIDEO_HEADER_LEN: usize = 38;
+pub const VIDEO_HEADER_LEN: usize = 38;
 /// Video access units queued in the mailbox at most; past this the host
 /// skips encoding a capture (the link is the bottleneck) instead of piling
 /// up a backlog it may not drop.
@@ -390,7 +390,8 @@ pub struct VideoRx {
     /// The newest LTR-marked unit decoded since the last keyframe (the
     /// decoder still holds it as a long-term reference).
     ltr_held: Option<u64>,
-    /// A `VIDEO_RECOVER` for this LTR is outstanding.
+    /// A `VIDEO_RECOVER` for this LTR was sent and no recovery picture
+    /// arrived yet (retries ask for an IDR).
     recovering: Option<u64>,
     /// Units dropped while waiting for a keyframe.
     pub dropped: u64,
@@ -431,9 +432,11 @@ impl VideoRx {
         if self.synced && in_order {
             return VideoVerdict::Deliver;
         }
-        if h.is_recovery() && self.recovering.is_some() {
-            // Predicted only from the LTR we named: decodable whatever was
-            // lost in between.
+        if h.is_recovery() && self.ltr_held.is_some() {
+            // Predicted only from an LTR the host knows we hold (we acked or
+            // named it; the decoder kept its references since): decodable
+            // whatever was lost in between — also a late answer to an
+            // earlier request, after a resync or an escalation to an IDR.
             self.synced = true;
             self.recovering = None;
             self.recovered += 1;
@@ -490,19 +493,15 @@ impl VideoRx {
     /// What to ask the host for now that the chain is broken. `ltr` = both
     /// peers advertised [`crate::terminal::CAP_LTR`]. A recovery that was
     /// already asked for and did not arrive (the caller rate-limits
-    /// requests, so this is the retry) escalates to an IDR.
+    /// requests, so this is the retry) escalates to an IDR — and so does
+    /// every retry until a keyframe or a recovery picture arrives.
     pub fn request(&mut self, ltr: bool) -> VideoRequest {
         match (ltr, self.ltr_held, self.recovering) {
             (true, Some(seq), None) => {
                 self.recovering = Some(seq);
                 VideoRequest::Recover { ltr_seq: seq }
             }
-            _ => {
-                // Give up on LTR recovery until the next keyframe.
-                self.ltr_held = None;
-                self.recovering = None;
-                VideoRequest::Idr
-            }
+            _ => VideoRequest::Idr,
         }
     }
 }

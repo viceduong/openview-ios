@@ -6,11 +6,31 @@ use ovapp::video::{VIDEO_END, VIDEO_KEYFRAME, VIDEO_RECOVERY, VIDEO_SUPERSEDED};
 use ovtransport::media::{MediaEvent, PictureRequest};
 
 use crate::direct::FfiDirectIo;
+use crate::pump::send_record_bytes;
 use crate::session::Inner;
 
 /// `VideoHeader::flags` inside a media-channel unit.
 fn unit_flags(unit: &[u8]) -> u8 {
     unit.get(8).copied().unwrap_or(0)
+}
+
+/// Whether a media-channel unit is a way back in for request `r` that the
+/// shell's screen accepts: a keyframe with its parameter sets in-band (the
+/// screen refuses others), or — answering a `VIDEO_RECOVER` only — a
+/// recovery picture (an IDR request may mean the decoder's references are
+/// gone).
+fn answers(r: PictureRequest, unit: &[u8]) -> bool {
+    use ovapp::video::{AccessUnit, VideoCodec, VIDEO_HEADER_LEN};
+    let flags = unit_flags(unit);
+    if flags & VIDEO_KEYFRAME != 0 {
+        // `VideoHeader::codec` follows the flags.
+        let codec = unit.get(9).and_then(|&c| VideoCodec::from_wire(c));
+        let data = unit.get(VIDEO_HEADER_LEN..);
+        return codec.zip(data).is_some_and(|(codec, data)| {
+            AccessUnit::from_annexb_codec(codec, data).has_param_sets(codec)
+        });
+    }
+    flags & VIDEO_RECOVERY != 0 && matches!(r, PictureRequest::Recover { .. })
 }
 
 /// The CAPS flags of a channel-0 CAPS record payload.
@@ -80,6 +100,17 @@ fn picture_request(
     }
 }
 
+/// Send picture request `r` as its reliable record (VIDEO_IDR_REQUEST /
+/// VIDEO_RECOVER on channel 0).
+fn send_reliable_request(g: &mut Inner, r: PictureRequest) {
+    let payload = ovapp::terminal::encode(&ovapp::terminal::Command::from(r));
+    let Some(session) = g.session.as_mut() else {
+        return;
+    };
+    let record = session.encrypt_record(0, &payload);
+    let _ = send_record_bytes(g, &record);
+}
+
 /// Which video units of one delivery batch a newer picture in the same
 /// batch supersedes: those followed, with no loss and no VIDEO_END in
 /// between, by another unit. A burst (a hole repaired, frames released
@@ -110,9 +141,22 @@ fn superseded(events: &[MediaEvent]) -> Vec<bool> {
 pub(crate) fn deliver_media(g: &mut Inner) {
     let Some(dir) = g.direct.as_mut() else { return };
     let events = dir.engine.take_media_events();
-    let way_back = |e: &MediaEvent| matches!(e, MediaEvent::Video(u) if unit_flags(u) & (VIDEO_KEYFRAME | VIDEO_RECOVERY) != 0);
-    if events.iter().any(way_back) {
+    let answered = |r: PictureRequest| {
+        events
+            .iter()
+            .any(|e| matches!(e, MediaEvent::Video(u) if answers(r, u)))
+    };
+    // Stop repeating the PLI only for a picture that gets the screen back in.
+    if dir.engine.picture_pending().is_some_and(answered) {
         dir.engine.picture_arrived();
+    }
+    // The PLI repeats went unanswered: the same request once reliably.
+    let unanswered = events.iter().find_map(|e| match e {
+        MediaEvent::PictureUnanswered(r) => Some(*r),
+        _ => None,
+    });
+    if let Some(r) = unanswered.filter(|&r| !answered(r)) {
+        send_reliable_request(g, r);
     }
     let Some(f) = g.record_sink.f else { return };
     let user = g.record_sink.user;
@@ -140,8 +184,9 @@ pub(crate) fn deliver_media(g: &mut Inner) {
                     },
                 ));
             }
-            // Host-bound only (a viewer never receives a PLI).
-            MediaEvent::PictureLoss(_) => {}
+            // Host-bound only (a viewer never receives a PLI); handled
+            // above.
+            MediaEvent::PictureLoss(_) | MediaEvent::PictureUnanswered(_) => {}
             MediaEvent::Audio { lost, payload } => {
                 if lost > 0 {
                     let per = match ovapp::audio::parse_audio_frame(&payload) {
@@ -191,6 +236,37 @@ mod tests {
         );
         let ack = encode(&Command::VideoLtrAck { seq: 5 });
         assert_eq!(picture_request(both, both, 0, &ack), None);
+    }
+
+    /// Only a picture the screen accepts stops the PLI repeats: a recovery
+    /// answers a `VIDEO_RECOVER` but not an IDR request; a keyframe needs
+    /// its parameter sets.
+    #[test]
+    fn only_an_acceptable_picture_answers_the_request() {
+        use ovapp::video::{VideoHeader, CODEC_H264};
+        let unit = |flags: u8, annexb: &[u8]| {
+            let h = VideoHeader {
+                flags,
+                codec: CODEC_H264,
+                ..VideoHeader::default()
+            };
+            let mut u = Vec::new();
+            h.encode(annexb.len() as u32, &mut u);
+            u.extend_from_slice(annexb);
+            u
+        };
+        let nal = |t: u8| [0, 0, 0, 1, t, 0xAA];
+        let idr = [nal(7), nal(8), nal(5)].concat();
+        let (key, rec) = (
+            PictureRequest::Keyframe { have_seq: 1 },
+            PictureRequest::Recover { ltr_seq: 1 },
+        );
+        assert!(answers(key, &unit(VIDEO_KEYFRAME, &idr)));
+        assert!(answers(rec, &unit(VIDEO_KEYFRAME, &idr)));
+        assert!(!answers(key, &unit(VIDEO_KEYFRAME, &nal(5))));
+        assert!(answers(rec, &unit(VIDEO_RECOVERY, &nal(1))));
+        assert!(!answers(key, &unit(VIDEO_RECOVERY, &nal(1))));
+        assert!(!answers(rec, &unit(0, &nal(1))));
     }
 
     /// All but the newest unit of a burst are superseded; a loss or a

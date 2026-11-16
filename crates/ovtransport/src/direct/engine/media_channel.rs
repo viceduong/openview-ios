@@ -104,21 +104,24 @@ impl DirectEngine {
     }
 
     /// Media received since the last call (video units in frame order,
-    /// losses, audio packets, the viewer's newest picture request).
+    /// losses, audio packets, the viewer's newest picture request, a PLI
+    /// that went unanswered).
     pub fn take_media_events(&mut self) -> Vec<MediaEvent> {
         let Some(m) = self.media.as_mut() else {
             return Vec::new();
         };
         let mut ev = m.rx.take_events();
         ev.extend(m.picture_request.take().map(MediaEvent::PictureLoss));
+        ev.extend(m.pli_unanswered.take().map(MediaEvent::PictureUnanswered));
         ev
     }
 
     /// Viewer (both peers set `CAP_MEDIA_PLI`): ask for a way back into the
     /// video stream on the media channel — a PLI now, repeated about every
     /// RTT until [`picture_arrived`](Self::picture_arrived) or
-    /// [`media::PLI_REPEAT_FOR`] (a new request replaces it). `false` =
-    /// media not ready: send the reliable request instead.
+    /// [`media::PLI_REPEAT_FOR`] (a new request replaces it; running out
+    /// yields [`MediaEvent::PictureUnanswered`]). `false` = media not
+    /// ready: send the reliable request instead.
     pub fn request_picture(
         &mut self,
         r: PictureRequest,
@@ -132,7 +135,9 @@ impl DirectEngine {
             return false;
         };
         ms.pli_req = ms.pli_req.wrapping_add(1);
+        ms.pli_unanswered = None;
         ms.pli = Some(PliRepeat {
+            req: r,
             msg: media::pli_msg(ms.pli_req, r),
             next: now,
             until: now + media::PLI_REPEAT_FOR,
@@ -146,7 +151,13 @@ impl DirectEngine {
     pub fn picture_arrived(&mut self) {
         if let Some(m) = self.media.as_mut() {
             m.pli = None;
+            m.pli_unanswered = None;
         }
+    }
+
+    /// Viewer: the PLI being repeated (`None` = none outstanding).
+    pub fn picture_pending(&self) -> Option<PictureRequest> {
+        self.media.as_ref()?.pli.as_ref().map(|p| p.req)
     }
 
     /// Send the pending PLI when its repeat is due (and media is ready).
@@ -157,9 +168,16 @@ impl DirectEngine {
         let (Some(link), Some(ms)) = (self.link.as_mut(), self.media.as_mut()) else {
             return;
         };
-        let MediaState { pli, tx, stats, .. } = ms;
+        let MediaState {
+            pli,
+            pli_unanswered,
+            tx,
+            stats,
+            ..
+        } = ms;
         let Some(p) = pli.as_mut() else { return };
         if now >= p.until {
+            *pli_unanswered = Some(p.req);
             *pli = None;
             return;
         }

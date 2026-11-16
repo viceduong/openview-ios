@@ -157,10 +157,12 @@ fn video_rx_escalates_to_an_idr() {
     rx.decoded(&hdr(0, VIDEO_KEYFRAME | VIDEO_LTR));
     rx.mark_broken();
     assert_eq!(rx.request(true), VideoRequest::Recover { ltr_seq: 0 });
-    // The recovery did not arrive by the next (rate-limited) request.
+    // The recovery did not arrive by the next (rate-limited) request,
+    // nor by the one after.
     assert_eq!(rx.request(true), VideoRequest::Idr);
-    // A recovery picture now (stale answer) is not trusted.
-    assert_eq!(rx.accept(&hdr(3, VIDEO_RECOVERY)), VideoVerdict::Drop);
+    assert_eq!(rx.request(true), VideoRequest::Idr);
+    // The late recovery picture is still decodable (the LTR is held).
+    assert_eq!(rx.accept(&hdr(3, VIDEO_RECOVERY)), VideoVerdict::Deliver);
     assert_eq!(rx.accept(&hdr(4, VIDEO_KEYFRAME)), VideoVerdict::Deliver);
     // A decoder failure forgets every LTR: IDR only.
     rx.accept(&hdr(5, VIDEO_LTR));
@@ -173,6 +175,25 @@ fn video_rx_escalates_to_an_idr() {
     rx.decoded(&hdr(0, VIDEO_KEYFRAME | VIDEO_LTR));
     rx.accept(&hdr(1, VIDEO_END));
     assert_eq!(rx.ltr_held(), None);
+}
+
+/// A second recovery picture after a gap (stale P-frames purged by the
+/// host between two answers) resyncs again instead of freezing.
+#[test]
+fn video_rx_takes_a_recovery_picture_after_a_gap() {
+    let mut rx = VideoRx::new();
+    rx.accept(&hdr(0, VIDEO_KEYFRAME | VIDEO_LTR));
+    rx.decoded(&hdr(0, VIDEO_KEYFRAME | VIDEO_LTR));
+    assert_eq!(rx.accept(&hdr(2, 0)), VideoVerdict::Drop);
+    assert_eq!(rx.request(true), VideoRequest::Recover { ltr_seq: 0 });
+    assert_eq!(rx.accept(&hdr(3, VIDEO_RECOVERY)), VideoVerdict::Deliver);
+    // 4..=6 purged: the answer to the retry follows with a gap.
+    assert_eq!(rx.accept(&hdr(7, VIDEO_RECOVERY)), VideoVerdict::Deliver);
+    assert_eq!(rx.accept(&hdr(8, 0)), VideoVerdict::Deliver);
+    assert_eq!(rx.recovered, 2);
+    // No LTR held (decoder reset): a recovery picture is undecodable.
+    rx.mark_corrupt();
+    assert_eq!(rx.accept(&hdr(10, VIDEO_RECOVERY)), VideoVerdict::Drop);
 }
 
 // ---------------------------------------------------------------------------

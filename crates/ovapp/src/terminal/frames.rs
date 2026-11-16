@@ -478,22 +478,18 @@ impl TerminalSession {
         }
         self.last_idr_request = Some(now);
         let caps = self.local_caps & self.peer_caps.unwrap_or(0);
-        let (pli, cmd) = match self.video_rx.request(caps & CAP_LTR != 0) {
-            crate::video::VideoRequest::Recover { ltr_seq } => (
-                ovtransport::media::PictureRequest::Recover { ltr_seq },
-                Command::VideoRecover { ltr_seq },
-            ),
-            crate::video::VideoRequest::Idr => {
-                let have_seq = self.last_video_seq;
-                (
-                    ovtransport::media::PictureRequest::Keyframe { have_seq },
-                    Command::VideoIdrRequest { have_seq },
-                )
+        let pli = match self.video_rx.request(caps & CAP_LTR != 0) {
+            crate::video::VideoRequest::Recover { ltr_seq } => {
+                ovtransport::media::PictureRequest::Recover { ltr_seq }
             }
+            crate::video::VideoRequest::Idr => ovtransport::media::PictureRequest::Keyframe {
+                have_seq: self.last_video_seq,
+            },
         };
+        let cmd = Command::from(pli);
         // CAP_MEDIA_PLI: a repeated PLI on the media channel when it is up
-        // (no reliable copy — it could only arrive late and be answered
-        // twice); the reliable record otherwise.
+        // (the reliable copy only if no answer arrives while it repeats —
+        // `MediaEvent::PictureUnanswered`); the reliable record otherwise.
         let on_media = caps & CAP_MEDIA_PLI != 0
             && self
                 .carrier

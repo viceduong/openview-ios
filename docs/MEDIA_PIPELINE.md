@@ -427,16 +427,17 @@ starts with a keyframe), never inside one.
    the slot holding `s` (`UseLTRFrame = 1<<slot | 1<<16`: later pictures
    reference nothing older), flagged `VIDEO_RECOVERY`. When no slot holds
    `s` (overwritten, encoder re-created, MFT without LTR) it sends an IDR.
-5. A viewer waiting after a `VIDEO_RECOVER` resumes at the first
-   `VIDEO_RECOVERY` unit, whatever seqs were lost. Every other rule
+5. A viewer holding a decoded LTR resumes at any `VIDEO_RECOVERY` unit,
+   whatever seqs were lost (the host predicts only from LTRs the viewer
+   acknowledged or named — also a late answer after an escalation). Every other rule
    (keyframes resync, `Stale`, `VIDEO_END`) is unchanged; a keyframe or
    `VIDEO_END` forgets every LTR on both sides.
 
 **Fast recovery path.** On the direct path with both peers
 `CAP_MEDIA_PLI`, the viewer sends `VIDEO_RECOVER` / `VIDEO_IDR_REQUEST` as
 a PLI datagram on the media channel instead (repeated about every RTT
-until the recovery picture arrives, at most 300 ms; the host acts once per
-request), so the request never waits behind a reliable-channel
+until the recovery picture arrives, at most 300 ms, then once as the
+reliable record if still unanswered; the host acts once per request), so the request never waits behind a reliable-channel
 retransmission. On any recovery request the host drops the video it has
 not started sending — encoded units still in the mailbox up to the first
 keyframe / recovery picture, and whole frames still in the pacer (their
@@ -566,7 +567,8 @@ Plain zstd payloads made of several frames are decoded in parallel by
   `VIDEO_IDR_REQUEST` (rate-limited to one per 300 ms; an unanswered
   recover escalates to an IDR request). A decoder error always asks for an
   IDR.
-- A `VIDEO_RECOVERY` unit after a `VIDEO_RECOVER` re-syncs the chain.
+- A `VIDEO_RECOVERY` unit re-syncs the chain whenever a decoded long-term
+  reference is held.
 - A decoded `VIDEO_LTR` unit is acknowledged with `VIDEO_LTR_ACK`.
 - A unit older than one already seen -> `Stale`. It lost the race between
   the media and reliable channels and is dropped silently.

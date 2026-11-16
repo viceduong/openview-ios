@@ -420,16 +420,17 @@ impl TerminalSession {
                 // queued video) reaches the hook as the reliable request.
                 ovtransport::media::MediaEvent::PictureLoss(r) => {
                     self.stats.cmds_rx += 1;
-                    let cmd = match r {
-                        ovtransport::media::PictureRequest::Keyframe { have_seq } => {
-                            Command::VideoIdrRequest { have_seq }
-                        }
-                        ovtransport::media::PictureRequest::Recover { ltr_seq } => {
-                            Command::VideoRecover { ltr_seq }
-                        }
-                    };
+                    let cmd = Command::from(r);
                     if let Some(hook) = self.on_cmd.as_mut() {
                         hook(&cmd);
+                    }
+                }
+                // Viewer: no answer to the PLI repeats (all lost on a
+                // static screen, say) — the same request once reliably,
+                // unless a way back in arrived meanwhile.
+                ovtransport::media::MediaEvent::PictureUnanswered(r) => {
+                    if self.video_rx.is_broken() {
+                        let _ = self.send(&Command::from(r));
                     }
                 }
                 ovtransport::media::MediaEvent::Audio { lost, payload } => {

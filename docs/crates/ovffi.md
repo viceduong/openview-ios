@@ -619,7 +619,10 @@ Picture requests: when both CAPS carry `CAP_MEDIA_PLI`, a
 `ov_session_send_record` (from `ov_screen_take_pong_reply`) goes out as a
 repeated PLI on the media channel when that is up — before encryption, so
 no record sequence number is used — and as the reliable record otherwise.
-A delivered keyframe / recovery unit stops the repeats.
+A unit the screen will accept as the way back in stops the repeats (a
+keyframe with its parameter sets; a recovery picture only for a
+`VIDEO_RECOVER`); when the repeats run out unanswered the session sends the
+same request once as the reliable record.
 
 ### 7.4 Screen sinks
 

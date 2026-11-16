@@ -25,6 +25,7 @@ pub(super) struct SentFrame {
 
 /// Viewer: a PLI being repeated until the recovery picture arrives.
 pub(super) struct PliRepeat {
+    pub(super) req: PictureRequest,
     pub(super) msg: Vec<u8>,
     pub(super) next: Instant,
     pub(super) until: Instant,
@@ -85,6 +86,9 @@ pub(super) struct MediaState {
     /// Viewer: the PLI being repeated, and the last request number used.
     pub(super) pli: Option<PliRepeat>,
     pub(super) pli_req: u32,
+    /// Viewer: a PLI whose repeats ran out unanswered, waiting for
+    /// [`take_media_events`](super::DirectEngine::take_media_events).
+    pub(super) pli_unanswered: Option<PictureRequest>,
     /// Host: the newest PLI request number acted on, and the request
     /// waiting for [`take_media_events`](super::DirectEngine::take_media_events).
     pub(super) pli_seen: Option<u32>,
@@ -114,6 +118,7 @@ impl MediaState {
             fec: FecController::new(),
             pli: None,
             pli_req: 0,
+            pli_unanswered: None,
             pli_seen: None,
             picture_request: None,
             stats: MediaStats::default(),

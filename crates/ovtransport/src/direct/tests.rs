@@ -275,7 +275,7 @@ fn run_media(frames: u32, loss_pct: &dyn Fn(u32) -> u64) -> MediaRun {
                         audio += 1;
                         audio_lost += lost;
                     }
-                    MediaEvent::PictureLoss(_) => {}
+                    MediaEvent::PictureLoss(_) | MediaEvent::PictureUnanswered(_) => {}
                 }
             }
         }
@@ -529,6 +529,28 @@ fn pli_purges_queued_video_and_is_acted_on_once() {
         ),
         (2, 2)
     );
+}
+
+/// A PLI whose repeats run out with no way back in arriving is handed
+/// back once, for the reliable request.
+#[test]
+fn unanswered_pli_is_handed_back_once() {
+    let t0 = Instant::now();
+    let (_h, mut v) = media_pair(t0);
+    let mut vio = MemIo::default();
+    let req = media::PictureRequest::Keyframe { have_seq: 3 };
+    assert!(v.request_picture(req, t0, &mut vio));
+    assert_eq!(v.picture_pending(), Some(req));
+    v.poll(t0 + media::PLI_REPEAT_FOR / 2, &mut vio, &mut |_| {});
+    assert!(v.take_media_events().is_empty());
+    v.poll(t0 + media::PLI_REPEAT_FOR, &mut vio, &mut |_| {});
+    assert_eq!(v.picture_pending(), None);
+    assert_eq!(
+        v.take_media_events(),
+        vec![MediaEvent::PictureUnanswered(req)]
+    );
+    v.poll(t0 + media::PLI_REPEAT_FOR * 2, &mut vio, &mut |_| {});
+    assert!(v.take_media_events().is_empty());
 }
 
 /// A replayed or forged media datagram is dropped.

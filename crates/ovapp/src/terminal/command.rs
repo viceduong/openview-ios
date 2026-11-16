@@ -657,6 +657,20 @@ pub enum Command {
     Timing(crate::latency::FrameTiming),
 }
 
+/// A media-channel PLI as the reliable request it stands for.
+impl From<ovtransport::media::PictureRequest> for Command {
+    fn from(r: ovtransport::media::PictureRequest) -> Self {
+        match r {
+            ovtransport::media::PictureRequest::Keyframe { have_seq } => {
+                Self::VideoIdrRequest { have_seq }
+            }
+            ovtransport::media::PictureRequest::Recover { ltr_seq } => {
+                Self::VideoRecover { ltr_seq }
+            }
+        }
+    }
+}
+
 /// One entry of a [`Command::MonitorsInfo`] payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorInfo {
