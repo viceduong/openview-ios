@@ -134,9 +134,6 @@ pub struct OvScreen {
     /// ([`ov_screen_latency_video_decoded`]): delivery then only marks
     /// video "received", and the decode stage ends at the shell's decoder.
     video_decode_timing: bool,
-    /// CAPS bits never advertised ([`ov_screen_mask_caps`]: the shell's
-    /// "classic caps" diagnostic).
-    caps_mask: u32,
 }
 
 impl OvScreen {
@@ -182,7 +179,6 @@ impl OvScreen {
             clock: ovapp::latency::ClockProbe::new(),
             latency: ovapp::latency::LatencyTracker::new(),
             video_decode_timing: false,
-            caps_mask: 0,
         }
     }
 
@@ -245,7 +241,7 @@ impl OvScreen {
             // the media channel (video FEC + Opus over unreliable datagrams).
             flags |= ovapp::terminal::CAP_DIRECT | ovapp::terminal::CAP_MEDIA;
         }
-        flags & !self.caps_mask
+        flags
     }
 
     /// Queue a 9-byte control record for [`ov_screen_take_pong_reply`].
@@ -321,35 +317,6 @@ pub unsafe extern "C" fn ov_screen_set_opus_stereo(s: *mut OvScreen, on: i32) ->
             return -1;
         };
         screen.opus_stereo = on != 0;
-        0
-    })
-}
-
-/// [`ov_screen_mask_caps`] mask that leaves the 0.1.x viewer cap set (no
-/// `CAP_HEVC`, `CAP_LTR`, `CAP_PALETTE`, `CAP_VIEWPORT`).
-pub const OV_CLASSIC_CAPS_MASK: u32 = ovapp::terminal::CAP_HEVC
-    | ovapp::terminal::CAP_LTR
-    | ovapp::terminal::CAP_PALETTE
-    | ovapp::terminal::CAP_VIEWPORT;
-
-/// Never advertise the CAPS bits in `mask` (call before the first screen
-/// command; replaces any earlier mask, 0 = none). A diagnostic for A/B
-/// tests against an older viewer's cap set: e.g. `CAP_HEVC | CAP_LTR |
-/// CAP_PALETTE | CAP_VIEWPORT` (bits 19..=22) gives the 0.1.x set. Returns
-/// 0, or -1 on a null handle.
-///
-/// # Safety
-/// `s` must be null or a live handle from [`ov_screen_new`], not used
-/// concurrently.
-#[no_mangle]
-pub unsafe extern "C" fn ov_screen_mask_caps(s: *mut OvScreen, mask: u32) -> i32 {
-    ffi_guard!(OV_ERR_PANIC, {
-        // SAFETY: `s` is null or a live screen with no concurrent use
-        // (caller contract).
-        let Some(screen) = (unsafe { s.as_mut() }) else {
-            return -1;
-        };
-        screen.caps_mask = mask;
         0
     })
 }

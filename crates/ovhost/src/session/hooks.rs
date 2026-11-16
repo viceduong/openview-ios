@@ -11,7 +11,6 @@ use tracing::{debug, info, trace, warn};
 
 use super::wake::InputWake;
 use super::SharedClipboard;
-use crate::disable::Feature;
 use crate::input::{self, VirtualScreen};
 use crate::{clipboard_os, desktop_fx, settings, speaker};
 
@@ -232,11 +231,8 @@ impl HostHooks {
                             }
                         }
                     }
-                    // The reaction is on its way: capture at full rate now
-                    // (unless `OPENVIEW_DISABLE=boost`).
-                    if !crate::disable::has(Feature::Boost) {
-                        input_wake.notify();
-                    }
+                    // The reaction is on its way: capture at full rate now.
+                    input_wake.notify();
                 }
                 Command::Echo(p) => trace!("echo {} bytes", p.len()),
                 Command::Ping(_) => {} // auto-replied by the pump
@@ -268,11 +264,8 @@ impl HostHooks {
                 | Command::FrameEnd(_) => {}
                 // CAPS: what the viewer can decode. The pump already
                 // answered with ours; the capture thread picks the mode up.
-                // Disabled features (`OPENVIEW_DISABLE`) are masked out
-                // here, so nothing downstream acts on them.
                 Command::Caps { flags } => {
-                    let flags = crate::disable::get().mask_caps(*flags);
-                    peer_caps.store(flags, Ordering::Relaxed);
+                    peer_caps.store(*flags, Ordering::Relaxed);
                     debug!(
                         "viewer caps {flags:#x} (tiles {}, zstd {}, h264 {})",
                         flags & ovapp::terminal::CAP_TILES != 0,
@@ -401,12 +394,8 @@ impl HostHooks {
                     h,
                     scale_milli,
                 } => {
-                    // `OPENVIEW_DISABLE=viewport`: ignored (no priority, no
-                    // deferral).
                     let packed = pack_viewport(*x, *y, *w, *h);
-                    if !crate::disable::has(Feature::Viewport)
-                        && viewport.swap(packed, Ordering::Relaxed) != packed
-                    {
+                    if viewport.swap(packed, Ordering::Relaxed) != packed {
                         trace!("viewport {w}x{h} at ({x},{y}), scale {scale_milli}/1000");
                     }
                 }

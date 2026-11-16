@@ -335,13 +335,6 @@ final class VideoFrameQueue {
         defer { lock.unlock() }
         return pacer.take()
     }
-
-    /// Frames decoded but replaced before a display refresh took them.
-    var droppedFrames: UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return pacer.dropped
-    }
 }
 
 // MARK: - Decoder
@@ -360,8 +353,6 @@ final class VideoDecoder {
         let screenSize: CGSize
         let matrix: UInt8
         let generation: Int
-        /// When the unit was handed to VideoToolbox (CACurrentMediaTime).
-        let submittedAt: CFTimeInterval
     }
 
     enum Result {
@@ -442,8 +433,7 @@ final class VideoDecoder {
             return .needKeyframe
         }
         let unit = Unit(seq: pkt.seq, rect: pkt.rect, screenSize: pkt.screenSize,
-                        matrix: pkt.colour.matrix, generation: generation,
-                        submittedAt: CACurrentMediaTime())
+                        matrix: pkt.colour.matrix, generation: generation)
         let myEpoch = epoch.value
         let epochBox = epoch
         let frameOut = onFrame

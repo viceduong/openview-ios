@@ -225,10 +225,6 @@ pub(super) fn capture_loop(
     });
     // High-motion regions as H.264 (only to a CAP_H264 viewer).
     let mut video = ovapp::video::VideoSession::new(video_encoder_factory(), VIDEO_FPS);
-    // `OPENVIEW_DISABLE=stable`: per-motion-rect encoder sizing.
-    if crate::disable::has(crate::disable::Feature::Stable) {
-        video.set_fixed_surface(false);
-    }
     // Benches: `--video-bpp` raises the area-based bitrate budget.
     if let Some(&bpp) = VIDEO_BPP.get() {
         video.set_bits_per_pixel(bpp);

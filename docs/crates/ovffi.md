@@ -34,7 +34,7 @@ Module map (`crates/ovffi/src/`):
 | `screen/feed.rs`, `screen/framebuffer.rs`, `screen/latency.rs`, `screen/liveness.rs`, `screen/sinks.rs`, `screen/video.rs` | Command decode and routing; zero-copy framebuffer access; latency telemetry (`ov_screen_latency_*`, `OvLatencyStats`); keepalive and watchdog; screen sink types and setters; H.264 pass-through |
 | `tests/mod.rs` | Tests through the C entry points |
 
-The header and the crate export the same 57 `ov_*` symbols; `src/tests/header.rs`
+The header and the crate export the same 62 `ov_*` symbols; `src/tests/header.rs`
 fails `cargo test -p ovffi` when they drift apart (it also checks the
 `ov_video_packet` and `ov_latency_stats` field order and the shared constants). Swift calls all of
 them except `ov_identity_fingerprint` and `ov_identity_free`.
@@ -444,6 +444,8 @@ int32_t ov_session_on_direct_datagram(OvSession*, uint32_t path_id, const uint8_
 int32_t ov_session_direct_state(OvSession*);        // 0 relay, 1 probing, 2 direct, -1 null
 int64_t ov_session_direct_deadline_ms(OvSession*);  // ms to next needed pump, -1 none
 int64_t ov_session_direct_path(OvSession*);         // active path_id or -1
+int32_t ov_session_direct_network_changed(OvSession*); // re-probe now / REBIND
+int32_t ov_session_direct_take_event(OvSession*, char *out, size_t cap); // path event line, 0 = none
 int32_t ov_screen_set_direct_capable(OvScreen*, int32_t on);
 ```
 

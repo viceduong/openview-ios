@@ -44,6 +44,9 @@ pub struct DirectEngine {
     candidates: Vec<u32>,
     reprobe_at: Option<Instant>,
     reprobe_delay: Duration,
+    /// Probe rounds that failed since the last promotion (only the first
+    /// is logged; the count goes into the eventual success line).
+    failed_rounds: u32,
     commit_nonce: [u8; 16],
     stats: DirectStats,
     pub(super) events: Vec<String>,
@@ -78,6 +81,7 @@ impl DirectEngine {
             candidates: Vec::new(),
             reprobe_at: None,
             reprobe_delay: REPROBE_AFTER,
+            failed_rounds: 0,
             commit_nonce: rand16(),
             stats: DirectStats::default(),
             events: Vec::new(),
@@ -167,6 +171,26 @@ impl DirectEngine {
         self.begin_round(now);
     }
 
+    /// Viewer: the local network changed (interface, address, VPN): any
+    /// earlier probe result is stale. On the relay, probe again now with
+    /// the backoff reset; on the direct path, send a REBIND at once so the
+    /// host follows a new source address without waiting for silence.
+    pub fn network_changed(&mut self, now: Instant, io: &mut dyn DirectIo) {
+        if self.is_server || !self.armed || self.candidates.is_empty() {
+            return;
+        }
+        self.reprobe_delay = REPROBE_AFTER;
+        let p = probe(&self.key, P_REBIND, &self.commit_nonce, self.now_us(now));
+        match self.link.as_mut() {
+            None => self.begin_round(now),
+            Some(link) => {
+                link.last_rebind = Some(now);
+                let _ = io.direct_send(link.path, &p);
+                self.stats.rebinds += 1;
+            }
+        }
+    }
+
     fn begin_round(&mut self, now: Instant) {
         if self.candidates.is_empty() {
             return;
@@ -234,6 +258,7 @@ impl DirectEngine {
         self.direct_since = Some(now);
         self.stats.promotions += 1;
         self.reprobe_delay = REPROBE_AFTER;
+        self.failed_rounds = 0;
         let path = self.link.as_ref().map_or(0, |l| l.path);
         self.events.push(format!(
             "direct path#{path} active (relay kept as fallback)"
@@ -463,12 +488,19 @@ impl DirectEngine {
                 self.stats.probe_rtt_us = rtt;
                 self.probe = None;
                 self.link = Some(self.make_link(path, now, false));
+                let retried = match self.failed_rounds {
+                    0 => String::new(),
+                    n => format!(", after {n} unanswered round(s)"),
+                };
                 self.events.push(format!(
-                    "probe answered on path#{path} (rtt {:.2} ms)",
+                    "probe answered on path#{path} (rtt {:.2} ms{retried})",
                     rtt as f64 / 1000.0
                 ));
                 let c = probe(&self.key, P_COMMIT, &self.commit_nonce, self.now_us(now));
                 let _ = io.direct_send(path, &c);
+                if let Some(l) = self.link.as_mut() {
+                    l.last_rebind = Some(now);
+                }
                 self.promote(now, io);
             }
             _ => {}
@@ -509,8 +541,14 @@ impl DirectEngine {
         }
         if failed_round {
             self.probe = None;
-            self.events
-                .push("no candidate answered; staying on relay".into());
+            self.failed_rounds += 1;
+            if self.failed_rounds == 1 {
+                self.events.push(format!(
+                    "no answer from {} candidate(s); staying on relay, re-probing (backoff to {} s)",
+                    self.candidates.len(),
+                    REPROBE_MAX.as_secs()
+                ));
+            }
             self.reprobe_at = Some(now + self.reprobe_delay);
             self.reprobe_delay = (self.reprobe_delay * 2).min(REPROBE_MAX);
         }
@@ -544,25 +582,27 @@ impl DirectEngine {
             // Viewer: a silent link may mean our NAT / VPN mapping changed
             // (the host's replies go to the old one): tell the host where we
             // are now, authenticated.
-            if let Some(c) = commit.as_ref().filter(|_| link.confirmed) {
-                let silent = now.saturating_duration_since(link.last_rx) >= REBIND_AFTER;
-                if silent
-                    && link
-                        .last_rebind
-                        .is_none_or(|t| now.saturating_duration_since(t) >= REBIND_INTERVAL)
+            if let Some(c) = commit.as_ref() {
+                let since = |t: Option<Instant>, d: Duration| {
+                    t.is_none_or(|t| now.saturating_duration_since(t) >= d)
+                };
+                if !link.confirmed {
+                    // Until the host answers on the path, repeat the COMMIT
+                    // (a lost one would otherwise leave the host deaf to
+                    // the path while we already send on it).
+                    if since(link.last_rebind, KEEPALIVE) {
+                        link.last_rebind = Some(now);
+                        let _ = io.direct_send(path, c);
+                    }
+                } else if now.saturating_duration_since(link.last_rx) >= REBIND_AFTER
+                    && since(link.last_rebind, REBIND_INTERVAL)
                 {
                     link.last_rebind = Some(now);
-                    let _ = c;
                     let _ = io.direct_send(path, &probe(&key, P_REBIND, &self.commit_nonce, t_now));
                     self.stats.rebinds += 1;
                 }
             }
             if idle || dack_due {
-                if idle && !link.confirmed {
-                    if let Some(c) = &commit {
-                        let _ = io.direct_send(path, c);
-                    }
-                }
                 let mut m = Vec::with_capacity(9);
                 m.push(K_DACK);
                 m.extend_from_slice(&delivered.to_be_bytes());
@@ -625,11 +665,13 @@ impl DirectEngine {
                 DEAD_AFTER
             };
             take((l.last_rx + dead_after).saturating_duration_since(now));
-            if !self.is_server && l.confirmed {
-                let mut due = l.last_rx + REBIND_AFTER;
-                if let Some(t) = l.last_rebind {
-                    due = due.max(t + REBIND_INTERVAL);
-                }
+            if !self.is_server {
+                let due = if l.confirmed {
+                    let due = l.last_rx + REBIND_AFTER;
+                    l.last_rebind.map_or(due, |t| due.max(t + REBIND_INTERVAL))
+                } else {
+                    l.last_rebind.map_or(now, |t| t + KEEPALIVE)
+                };
                 take(due.saturating_duration_since(now));
             }
             if l.dacked != self.delivered {

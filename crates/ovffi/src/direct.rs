@@ -6,11 +6,11 @@
 //! not freed while the call runs.
 
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 use ovtransport::TransportError;
 
-use crate::cabi::bytes;
+use crate::cabi::{bytes, copy_str};
 use crate::callbacks::{DirectPathSink, DirectSendSink, Sink};
 use crate::error::OV_ERR_PANIC;
 use crate::session::{lock, Inner, OvSession};
@@ -18,6 +18,8 @@ use crate::transport::Transport;
 
 /// Max datagrams queued from the shell's direct paths between pumps.
 const DIRECT_INBOUND_CAP: usize = 65_536;
+/// Max path-event lines kept for the shell (oldest dropped).
+const DIRECT_EVENTS_CAP: usize = 32;
 
 /// The direct-path engine over shell-owned per-candidate paths.
 pub(crate) struct FfiDirect {
@@ -26,6 +28,25 @@ pub(crate) struct FfiDirect {
     pub(crate) inbound: VecDeque<(u32, Vec<u8>)>,
     /// Candidate addresses by path id.
     paths: Vec<String>,
+    /// Path-event lines (`path#N` replaced by the address) for the shell's
+    /// log, drained by [`ov_session_direct_take_event`].
+    events: VecDeque<String>,
+}
+
+impl FfiDirect {
+    /// Move the engine's path events into [`events`](Self::events).
+    pub(crate) fn collect_events(&mut self) {
+        for mut e in self.engine.take_events() {
+            // Longest ids first so `path#1` never eats `path#10`.
+            for (i, a) in self.paths.iter().enumerate().rev() {
+                e = e.replace(&format!("path#{i}"), a);
+            }
+            if self.events.len() == DIRECT_EVENTS_CAP {
+                self.events.pop_front();
+            }
+            self.events.push_back(e);
+        }
+    }
 }
 
 /// The engine's I/O: the relay transport + the shell's direct send sink.
@@ -67,6 +88,7 @@ pub(crate) fn init_direct(g: &mut Inner) {
         engine: ovtransport::direct::DirectEngine::new(session.role_is_server(), key),
         inbound: VecDeque::new(),
         paths: Vec::new(),
+        events: VecDeque::new(),
     });
 }
 
@@ -235,5 +257,78 @@ pub unsafe extern "C" fn ov_session_direct_path(s: *mut OvSession) -> i64 {
             .ok()
             .and_then(|g| g.direct.as_ref()?.engine.active_path())
             .map_or(-1, i64::from)
+    })
+}
+
+/// The local network changed (iOS: an `NWPathMonitor` update): on the relay
+/// the engine probes the host's candidates again right away (backoff
+/// reset); on the direct path it tells the host its possibly new address.
+/// Returns 0, -1 (null session), -2 (no direct engine).
+///
+/// # Safety
+/// `s` must be null or a live session.
+#[no_mangle]
+pub unsafe extern "C" fn ov_session_direct_network_changed(s: *mut OvSession) -> i32 {
+    ffi_guard!(OV_ERR_PANIC, {
+        // SAFETY: `s` is null or a live session (caller contract).
+        let Some(s) = (unsafe { s.as_ref() }) else {
+            return -1;
+        };
+        match lock(s) {
+            Ok(mut g) => {
+                let g = &mut *g;
+                let Some(dir) = g.direct.as_mut() else {
+                    return -2;
+                };
+                let mut io = FfiDirectIo {
+                    transport: &mut g.transport,
+                    sink: g.direct_send_sink,
+                };
+                let now = std::time::Instant::now();
+                dir.engine.network_changed(now, &mut io);
+                dir.engine.poll(now, &mut io, &mut |_| {});
+                0
+            }
+            Err(e) => e,
+        }
+    })
+}
+
+/// Take the oldest direct-path event line (promotion, fallback, probe
+/// result) into `out` as a NUL-terminated UTF-8 string, truncated to fit.
+/// Returns its length, 0 when there is none, -1 on bad arguments.
+///
+/// # Safety
+/// `s` must be null or a live session; `out` null or writable for `cap`
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ov_session_direct_take_event(
+    s: *mut OvSession,
+    out: *mut c_char,
+    cap: usize,
+) -> i32 {
+    ffi_guard!(OV_ERR_PANIC, {
+        // SAFETY: `s` is null or a live session (caller contract).
+        let Some(s) = (unsafe { s.as_ref() }) else {
+            return -1;
+        };
+        if out.is_null() || cap == 0 {
+            return -1;
+        }
+        let Ok(mut g) = lock(s) else { return -1 };
+        let Some(dir) = g.direct.as_mut() else {
+            return 0;
+        };
+        dir.collect_events();
+        let Some(e) = dir.events.pop_front() else {
+            return 0;
+        };
+        let mut end = e.len().min(cap - 1);
+        while !e.is_char_boundary(end) {
+            end -= 1;
+        }
+        // SAFETY: `out` is non-null and writable for `cap` bytes (caller
+        // contract) and `end + 1 <= cap`.
+        unsafe { copy_str(&e[..end], out, cap) }
     })
 }

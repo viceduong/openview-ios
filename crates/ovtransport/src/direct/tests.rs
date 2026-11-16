@@ -613,3 +613,78 @@ fn engine_replays_unacked_on_demotion() {
     assert_eq!(got, vec![b"r0".to_vec(), b"d1".to_vec(), b"d2".to_vec()]);
     assert_eq!(tx.stats().records_replayed, 2);
 }
+
+/// A direct path that is blocked at first (a VPN / carrier-NAT hiccup) is
+/// picked up by the viewer's continuing re-probes once it opens: the live
+/// session migrates from the relay within the backoff cap, and no record
+/// is lost, duplicated or reordered on the way.
+#[test]
+fn blocked_path_migrates_once_it_opens() {
+    let t0 = Instant::now();
+    let mut h = DirectEngine::new(true, [2; 32]);
+    let mut v = DirectEngine::new(false, [2; 32]);
+    h.arm();
+    v.arm();
+    v.start_probe(vec![0], t0);
+    let (mut hio, mut vio) = (MemIo::default(), MemIo::default());
+    let (mut hg, mut vg): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (Vec::new(), Vec::new());
+    let opens = Duration::from_secs(20);
+    let mut migrated = None;
+    let mut sent = 0u32;
+    let mut t = t0;
+    while t < t0 + Duration::from_secs(40) {
+        t += Duration::from_millis(10);
+        if t < t0 + Duration::from_secs(38) {
+            let r = sent.to_be_bytes();
+            v.send(&r, t, &mut vio).unwrap();
+            h.send(&r, t, &mut hio).unwrap();
+            sent += 1;
+        }
+        v.poll(t, &mut vio, &mut |r| vg.push(r.to_vec()));
+        h.poll(t, &mut hio, &mut |r| hg.push(r.to_vec()));
+        let open = t >= t0 + opens;
+        for d in std::mem::take(&mut vio.relay) {
+            h.on_primary(&d, t, &mut hio, &mut |r| hg.push(r.to_vec()));
+        }
+        for d in std::mem::take(&mut hio.relay) {
+            v.on_primary(&d, t, &mut vio, &mut |r| vg.push(r.to_vec()));
+        }
+        for d in std::mem::take(&mut vio.direct).into_iter().filter(|_| open) {
+            h.on_direct(0, &d, t, &mut hio, &mut |r| hg.push(r.to_vec()));
+        }
+        for d in std::mem::take(&mut hio.direct).into_iter().filter(|_| open) {
+            v.on_direct(0, &d, t, &mut vio, &mut |r| vg.push(r.to_vec()));
+        }
+        let direct = v.state() == DirectState::Direct && h.state() == DirectState::Direct;
+        assert!(open || !direct, "direct while blocked");
+        if direct && migrated.is_none() {
+            migrated = Some(t - t0);
+            assert!(v.stats().probe_rounds > 3, "kept probing while blocked");
+        }
+    }
+    let migrated = migrated.expect("never migrated");
+    assert!(
+        migrated <= opens + REPROBE_MAX + PROBE_INTERVAL * 2,
+        "migrated after {migrated:?}"
+    );
+    assert!(h.stats().records_direct_rx > 0 && v.stats().records_direct_rx > 0);
+    let want: Vec<Vec<u8>> = (0..sent).map(|i| i.to_be_bytes().to_vec()).collect();
+    assert!(hg == want, "host got {} of {sent} in order", hg.len());
+    assert!(vg == want, "viewer got {} of {sent} in order", vg.len());
+}
+
+/// A network change cuts the backoff short: the viewer probes again at once.
+#[test]
+fn network_change_reprobes_at_once() {
+    let t0 = Instant::now();
+    let mut v = DirectEngine::new(false, [2; 32]);
+    v.arm();
+    v.start_probe(vec![0], t0);
+    let mut io = MemIo::default();
+    v.poll(t0 + PROBE_ROUND, &mut io, &mut |_| {});
+    assert_eq!(v.state(), DirectState::Relay, "round failed, backing off");
+    let t = t0 + PROBE_ROUND + Duration::from_millis(1);
+    v.network_changed(t, &mut io);
+    assert_eq!(v.state(), DirectState::Probing);
+    assert_eq!(v.stats().probe_rounds, 2);
+}

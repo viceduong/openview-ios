@@ -1,0 +1,79 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please check
+        [Troubleshooting](https://github.com/viceduong/openview/blob/main/docs/TROUBLESHOOTING.md)
+        and the [known issues](https://github.com/viceduong/openview/blob/main/docs/KNOWN_ISSUES.md) first.
+
+        **Do not paste PINs, device IDs, public IP addresses or relay URLs you want to keep private.**
+        Security problems go to a [private advisory](https://github.com/viceduong/openview/security/advisories/new) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start OpenView.exe on PC A
+        2. Connect from the iOS app with ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - OpenView.exe (Windows app)
+        - ovhost (host)
+        - ovview (Windows viewer)
+        - ovrelay (relay)
+        - iOS app
+        - Installer / portable zip
+        - Documentation
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: OpenView version
+      description: Shown on the About page, or `ovhost.exe --version`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system(s)
+      description: Windows edition and build (`winver`), and the iOS version if relevant.
+      placeholder: "Windows 11 Pro 23H2 (22631); iOS 18.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: path
+    attributes:
+      label: Connection path
+      options:
+        - Not sure
+        - Relay on the host PC (LAN)
+        - Own relay on the internet (TCP)
+        - Relay behind a reverse proxy / tunnel (wss://)
+        - Direct LAN (iOS)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Settings > Troubleshooting > Open logs folder (`openview.log`, `ovhost.log`, `ovrelay.log`, `ovview-*.log`),
+        or stderr of the binary with `-v`. Remove anything private first.
+      render: text

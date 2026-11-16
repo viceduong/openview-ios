@@ -211,10 +211,6 @@ fn shared_constants_match() {
         header_define("OV_ERR_PANIC"),
         i64::from(crate::OV_ERR_PANIC)
     );
-    assert_eq!(
-        header_define("OV_CLASSIC_CAPS_MASK"),
-        i64::from(crate::OV_CLASSIC_CAPS_MASK)
-    );
     for (name, value) in [
         ("OV_ERR_AUTH_FAILED", crate::OV_ERR_AUTH_FAILED),
         ("OV_ERR_RATE_LIMITED", crate::OV_ERR_RATE_LIMITED),

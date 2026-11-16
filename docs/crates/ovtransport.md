@@ -356,8 +356,10 @@ Receiver behaviour:
 | REQ received | — | reply RESP with the same nonce and `t_us` (no state change) |
 | RESP (matching nonce and path, no link yet) | create link (unconfirmed), record `probe_rtt_us`, send COMMIT, `promote` | — |
 | COMMIT received | — | if the path is new: demote any existing link, create link (confirmed), `promote` |
-| Round older than `PROBE_ROUND` 4 s | event `"no candidate answered; staying on relay"`; re-probe after `REPROBE_AFTER` 10 s, doubling up to `REPROBE_MAX` 120 s | — |
-| Link idle ≥ `KEEPALIVE` 250 ms | send DACK; repeat COMMIT until the host has sent something (`confirmed`) | send DACK |
+| Round older than `PROBE_ROUND` 4 s | re-probe after `REPROBE_AFTER` 1 s, doubling up to `REPROBE_MAX` 10 s, for as long as the session is on the relay (only the first failure since the last promotion is logged; the success line counts the unanswered rounds) | — |
+| `network_changed()` (iOS `NWPathMonitor` → `ov_session_direct_network_changed`) | on the relay: new round now, backoff reset; on a link: REBIND now | — |
+| Link idle ≥ `KEEPALIVE` 250 ms | send DACK | send DACK |
+| Link unconfirmed (host has sent nothing on it) | repeat COMMIT every `KEEPALIVE` 250 ms | — |
 | Link silent ≥ `REBIND_AFTER` 1 s (confirmed) | send REBIND every `REBIND_INTERVAL` 500 ms | REBIND from a **new** source path: move the link there (NAT or VPN rebinding) |
 | Link silent ≥ `DEAD_AFTER` 3 s (`DEAD_AFTER_RELAYLESS` 15 s once the relay is gone) | demote; schedule re-probe | demote |
 | On direct, relay idle ≥ `PRIMARY_KEEPALIVE` 5 s | NOP marker on the relay | same |
@@ -588,7 +590,7 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `WATCH_POLL` | 200 ms | `relay/watch.rs` |
 | `MAX_INBOUND` / `OUT_CHUNK` / `MAX_HEAD` (WebSocket client) | 4 MiB / 64 KiB / 16 KiB | `relay/ws_client.rs` |
 | rudp `MAX_PAYLOAD`, `BURST`, `RELEASE_TIMEOUT`, `INIT_CWND`, `MIN_CWND`, `MAX_CWND`, `RCV_WINDOW`, `DUP_THRESH`, `INIT_RTO`, `MIN_RTO`, `MAX_RTO`, `ACK_EVERY` | 1200, 32, 300 ms, 32, 4, 8192, 16384, 3, 200 ms, 20 ms, 2 s, 16 | `rudp/mod.rs` |
-| `PROBE_INTERVAL`, `PROBE_ROUND`, `REPROBE_AFTER`, `REPROBE_MAX` | 100 ms, 4 s, 10 s, 120 s | `direct/mod.rs` |
+| `PROBE_INTERVAL`, `PROBE_ROUND`, `REPROBE_AFTER`, `REPROBE_MAX` | 100 ms, 4 s, 1 s, 10 s | `direct/mod.rs` |
 | `KEEPALIVE`, `DEAD_AFTER`, `DEAD_AFTER_RELAYLESS`, `PRIMARY_KEEPALIVE`, `REBIND_AFTER`, `REBIND_INTERVAL` | 250 ms, 3 s, 15 s, 5 s, 1 s, 500 ms | `direct/mod.rs` |
 | `DACK_INTERVAL`, `DACK_EVERY`, `REPLAY_LIMIT`, `PENDING_LIMIT` | 50 ms, 64, 64 MiB, 65 536 | `direct/mod.rs` |
 | `MAX_PATHS` / `GOVERNED_CWND_FLOOR` | 256 / 256 | `direct/carrier.rs` / `direct/link.rs` |
@@ -627,7 +629,7 @@ Used only on v2 direct links (media enabled). One `LinkCc` per link holds a `Gcc
 | `rudp/tests.rs` | lossless in-order with no retransmits; 5/10/30 % loss with reordering stays in order and exact; datagrams stay within the MTU budget; raw mode is byte-identical and switches on framed input; framed records wait for raw records sent before the switch; `WouldBlock` keeps packets queued |
 | `ws.rs` | RFC 6455 accept-key example, SHA-1 vectors, 7/16/64-bit length encodings, unmasking at any offset and split, deframer round trips for any split, bad frames rejected |
 | `relay/ws_client.rs` | upgrade-response validation, loopback pair connected, pump bridges a scripted server |
-| `direct/tests.rs` | probe round trip and tamper, marker vs record header, key asymmetry, unarmed pass-through, promote-then-demote keeps order both ways (direct socket killed mid-session), media frames survive 3 % and 1 % random loss (FEC, NACK, audio gaps, feedback, records alongside), adaptive FEC drops to the floor on a clean link and ramps back up when 3 % loss starts (no frame lost), NAT rebinding moves the link (relay gone), relay-less stall survives up to 15 s, media replay and forgery rejected, media over loopback sockets, foreign probe rejected, unacked records replayed on demotion |
+| `direct/tests.rs` | probe round trip and tamper, marker vs record header, key asymmetry, unarmed pass-through, promote-then-demote keeps order both ways (direct socket killed mid-session), media frames survive 3 % and 1 % random loss (FEC, NACK, audio gaps, feedback, records alongside), adaptive FEC drops to the floor on a clean link and ramps back up when 3 % loss starts (no frame lost), NAT rebinding moves the link (relay gone), relay-less stall survives up to 15 s, media replay and forgery rejected, media over loopback sockets, foreign probe rejected, unacked records replayed on demotion, a path blocked for 20 s is picked up by the re-probes once it opens (live migration, records in order), a network change re-probes at once |
 | `media/tests.rs` | directional, domain-separated keys; seal/open/tamper; replay window; FEC recovery in order; NACK on short RTT vs loss on long RTT; wholly lost frame detected from the next frame; paused stream is not a loss; audio gaps and late packets; malformed shards (including inconsistent k / m); incomplete frames bounded in memory; adaptive FEC decision table and controller (hold, instant ramp-up, determinism, frame interval vs RTT) |
 | `cc/tests.rs` | converges near a 20 Mbps capacity with a short queue; 1/3/5 % random loss does not collapse the rate; paced video bursts do not halve the estimate; idle Wi-Fi jitter does not collapse the estimate (a 300 KB burst after 60 s idle in < 400 ms); 25 % loss backs off; feedback round trip with holes; pacer spreading and lane priority |
 

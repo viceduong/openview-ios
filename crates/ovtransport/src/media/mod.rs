@@ -60,7 +60,6 @@
 //! so an off-path attacker cannot steer the congestion controller.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// First byte of a v2 datagram.
@@ -107,23 +106,6 @@ pub(crate) const LOSS_CLEAN: f64 = 0.002;
 /// How long the loss estimate must stay clean before parity drops to
 /// [`FEC_FLOOR`].
 pub(crate) const FEC_CLEAN_HOLD: Duration = Duration::from_secs(3);
-
-/// Adaptive video FEC on (default); off = [`fec_ratio`] for every frame
-/// (the fixed, loss-driven ratio from before the adaptive floor). Process
-/// wide; see [`set_adaptive_fec`].
-static ADAPTIVE_FEC: AtomicBool = AtomicBool::new(true);
-
-/// Diagnostics A/B switch: `false` gives every video frame [`fec_ratio`]
-/// (10 % on a clean link, rising with loss) instead of
-/// [`adaptive_fec_ratio`] (2 % floor on a settled clean link).
-pub fn set_adaptive_fec(on: bool) {
-    ADAPTIVE_FEC.store(on, Ordering::Relaxed);
-}
-
-/// Whether [`set_adaptive_fec`] left adaptive FEC on.
-pub fn adaptive_fec() -> bool {
-    ADAPTIVE_FEC.load(Ordering::Relaxed)
-}
 
 /// The FEC ratio for a measured loss rate (0..1): 10 % at no loss, rising
 /// with loss to 30 %.
@@ -212,11 +194,7 @@ impl FecController {
             let since = *self.clean_since.get_or_insert(now);
             Some(now.saturating_duration_since(since))
         };
-        self.last = if adaptive_fec() {
-            adaptive_fec_ratio(loss, clean_for, rtt, self.frame_interval(), keyframe)
-        } else {
-            fec_ratio(loss)
-        };
+        self.last = adaptive_fec_ratio(loss, clean_for, rtt, self.frame_interval(), keyframe);
         self.last
     }
 

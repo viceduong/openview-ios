@@ -174,6 +174,12 @@ int32_t ov_session_on_direct_datagram(OvSession *s, uint32_t path_id, const uint
 int32_t ov_session_direct_state(OvSession *s);        /* 0 relay, 1 probing, 2 direct, -1 null */
 int64_t ov_session_direct_deadline_ms(OvSession *s);  /* -1 = no timer pending */
 int64_t ov_session_direct_path(OvSession *s);         /* active path_id or -1 */
+// The local network changed: re-probe now (relay) / REBIND (direct).
+// 0, -1 null session, -2 no direct engine.
+int32_t ov_session_direct_network_changed(OvSession *s);
+// Oldest direct-path event line into `out` (NUL-terminated, truncated to
+// fit). Returns its length, 0 = none, -1 bad args.
+int32_t ov_session_direct_take_event(OvSession *s, char *out, size_t cap);
 // SESSION_OPTION payload (key 1 = hide wallpaper, 2 = disable animations;
 // value 0/1) for ov_session_send_record on channel 0. Returns the length
 // (3) or -1.
@@ -231,11 +237,6 @@ uint32_t ov_screen_peer_caps(const OvScreen *screen);
 // Advertise CAP_DIRECT (1 << 7) in our CAPS (before the first screen
 // command, alongside ov_session_set_direct_sinks).
 int32_t ov_screen_set_direct_capable(OvScreen *s, int32_t on);
-// Diagnostic: never advertise the CAPS bits in `mask` (before the first
-// screen command; 0 = none). CAP_HEVC | CAP_LTR | CAP_PALETTE | CAP_VIEWPORT
-// (OV_CLASSIC_CAPS_MASK) gives the 0.1.x (build 11.2) viewer cap set.
-#define OV_CLASSIC_CAPS_MASK 7864320u // 0x780000: bits 19..=22
-int32_t ov_screen_mask_caps(OvScreen *screen, uint32_t mask);
 // The rects the last delivered frame changed, as packed u16 quadruples
 // x, y, w, h (frame pixels) in `out` (room for max_rects). Returns the rect
 // count (may exceed max_rects), 0 before any frame, -1 on a null handle.

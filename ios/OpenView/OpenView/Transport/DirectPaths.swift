@@ -110,6 +110,22 @@ final class DirectPathSet {
         }
     }
 
+    /// The network changed: re-create every path socket except the active
+    /// one, so the next probes leave on the new route (the active path
+    /// keeps its socket; the engine's REBIND covers an address change).
+    func reopenIdle(activePathID: Int64) {
+        guard !closed else { return }
+        for (id, path) in paths where Int64(id) != activePathID {
+            guard let parsed = Self.parse(path.address),
+                  let nwPort = NWEndpoint.Port(rawValue: parsed.port) else { continue }
+            path.dead = true
+            path.pending.removeAll()
+            path.connection.stateUpdateHandler = nil
+            path.connection.cancel()
+            start(pathID: id, address: path.address, host: parsed.host, port: nwPort, reopens: 0)
+        }
+    }
+
     /// Put one datagram on path `pathID` (buffered until it is ready).
     func send(pathID: UInt32, _ data: Data) {
         guard !closed, let path = paths[pathID], !path.dead else { return }

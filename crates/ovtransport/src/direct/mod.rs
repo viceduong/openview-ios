@@ -10,7 +10,9 @@
 //! reliable-UDP link ([`crate::rudp::ReliableLink`]) on that path. The relay
 //! stays connected as the fallback (with a keepalive); a direct path that
 //! goes silent for `DEAD_AFTER` is dropped, unacknowledged records are
-//! replayed on the relay, and the viewer re-probes later.
+//! replayed on the relay. While on the relay the viewer keeps re-probing
+//! (backoff capped at [`REPROBE_MAX`]); the host accepts a COMMIT at any
+//! time and moves the live session over.
 //!
 //! # Ordering across paths (the record layer needs lossless, in-order)
 //!
@@ -118,10 +120,14 @@ pub(crate) const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// How long one probe round lasts before giving up (until the re-probe).
 pub(crate) const PROBE_ROUND: Duration = Duration::from_secs(4);
 /// First re-probe delay after a failed round or a demotion (doubles to
-/// [`REPROBE_MAX`]).
-pub(crate) const REPROBE_AFTER: Duration = Duration::from_secs(10);
-/// Longest re-probe delay.
-pub(crate) const REPROBE_MAX: Duration = Duration::from_secs(120);
+/// [`REPROBE_MAX`]). A viewer on the relay never stops probing: a path
+/// that failed once (a VPN / carrier NAT hiccup, a socket still coming
+/// up) usually works a few seconds later, and a round is a few hundred
+/// 45-byte datagrams.
+pub(crate) const REPROBE_AFTER: Duration = Duration::from_secs(1);
+/// Longest re-probe delay (the backoff caps here, forever while on the
+/// relay).
+pub(crate) const REPROBE_MAX: Duration = Duration::from_secs(10);
 /// Direct-link keepalive (DACK) interval when idle.
 pub(crate) const KEEPALIVE: Duration = Duration::from_millis(250);
 /// A direct path silent this long is dead: demote to the relay.

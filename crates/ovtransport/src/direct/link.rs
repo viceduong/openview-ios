@@ -20,7 +20,8 @@ pub(super) struct Link {
     pub(super) confirmed: bool,
     pub(super) last_dack: Instant,
     pub(super) dacked: u64,
-    /// Viewer: when the last REBIND went out.
+    /// Viewer: when the last unsolicited COMMIT (unconfirmed link) or
+    /// REBIND (silent link) went out.
     pub(super) last_rebind: Option<Instant>,
     /// v2 framing + congestion control (media enabled).
     pub(super) cc: Option<LinkCc>,

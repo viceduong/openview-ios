@@ -212,18 +212,6 @@ final class SessionController: ObservableObject {
         })
     var videoActive = false
     var videoGen = 0
-    /// This connection uses the 11.2 AVSampleBufferDisplayLayer video path
-    /// (Settings > Diagnostics, or no Metal compositor): its sample
-    /// builder and the generation whose END waits for the refresh frame.
-    var videoLegacy = false
-    let videoSamples = H264SampleBuilder()
-    var pendingHideGen: Int?
-    /// Pacing diagnostics (PerfStats.swift): network-side counters and
-    /// when the last 5 s summary went to the DiagLog (session queue ms;
-    /// nil = start a new window).
-    let netStats = NetStats()
-    var lastPerfLogMs: Int64?
-    static let perfLogMs: Int64 = 5_000
     /// Last host CAPS seen (CAP_INPUT2 picks the input commands).
     var lastPeerCaps: UInt32 = 0
     /// The desktop-effect wishes went out to this host.
@@ -246,6 +234,9 @@ final class SessionController: ObservableObject {
     /// Last direct state / path published (UI + log only on change).
     var lastDirectState: Int32 = -1
     var lastDirectPath: Int64 = -1
+    /// A probe round of this connection has ended (direct, or failed back
+    /// to the relay): later background re-probes keep showing "Relay".
+    var directProbeSettled = false
     /// Watchdog: when it was armed (first tick after the secure session came
     /// up), so a slow first frame never counts as silence.
     var watchdogArmedMs: Int64?
@@ -317,14 +308,6 @@ final class SessionController: ObservableObject {
         }
         input.viewportReporter.send = { [weak self] payload in
             self?.sendCommand(payload)
-        }
-        // Legacy video layer (11.2): the overlay's decoder failed (main):
-        // ask the host for an IDR from the session queue.
-        screenModel.legacyVideo.onFailure = { [weak self] in
-            self?.queue.async { [weak self] in
-                guard let self, !self.halted else { return }
-                self.screen.requestVideoIdr()
-            }
         }
         // Latency telemetry: every presented Metal drawable reports when
         // it was drawn and when it reached the screen.
@@ -451,7 +434,6 @@ final class SessionController: ObservableObject {
         hostSupportsDesktopFx = false
         // No picture of the previous attempt's motion period lands any more.
         screenModel.video.end()
-        screenModel.legacyVideo.hide(generation: screenModel.legacyVideo.generation)
         log("Connecting to \(req.displayName) via \(req.transport.detail)")
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
             self?.handshakeTimedOut(generation: gen)
@@ -608,6 +590,11 @@ final class SessionController: ObservableObject {
         })
         // Thermal state / Low Power Mode changes re-apply the requested host
         // frame rate.
+        observers.append(nc.addObserver(forName: NetworkPathWatcher.didChange,
+                                        object: nil, queue: nil) { [weak self] _ in
+            guard let self else { return }
+            self.queue.async { self.networkPathChanged() }
+        })
         observers.append(nc.addObserver(forName: PowerGovernor.didChange,
                                         object: nil, queue: .main) { [weak self] _ in
             self?.powerStateChanged()
@@ -801,10 +788,7 @@ final class SessionController: ObservableObject {
     /// the desktop-effect switches.
     func applyPeerCaps(input2: Bool, desktopFx: Bool, viewport: Bool) {
         input.input2 = input2
-        // Diagnostics: "Don't report viewport" (and "Classic caps", which is
-        // the 11.2 viewer: it never sent VIEWPORT) keep the reporter off.
-        input.viewportReporter.capable = viewport && !AppSettings.diagNoViewport
-            && !AppSettings.diagClassicCaps
+        input.viewportReporter.capable = viewport
         if hostSupportsDesktopFx != desktopFx {
             hostSupportsDesktopFx = desktopFx
         }

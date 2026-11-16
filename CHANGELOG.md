@@ -85,6 +85,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/USAGE.md`.
 
 ### Changed
+- Direct path: a viewer on the relay keeps re-probing the host's
+  candidates for the whole session (backoff 1 s doubling to 10 s, was a
+  single 4 s round then 10 s doubling to 120 s), so a path that failed at
+  connect (a VPN / carrier-NAT hiccup) still takes over the live session a
+  few seconds after it starts working. An unacknowledged COMMIT is repeated
+  every 250 ms even while the viewer is busy sending. iOS: a network change
+  (`NWPathMonitor`) re-creates the idle path sockets and re-probes at once
+  (`ov_session_direct_network_changed`); the engine's path events reach the
+  diagnostics log (`ov_session_direct_take_event`; previously they were
+  never drained on iOS). The iOS stats chip stays on "Relay" during those
+  background re-probes ("Probing…" only for the first round).
 - iOS: smooth two-finger scrolling. The pan streams high-resolution wheel
   deltas (12 units per point instead of a whole 120-unit notch per 10 pt),
   at most about 120 per second, and glides on after the lift with
@@ -104,12 +115,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ends video's decode stage at the VideoToolbox callback
   (`ov_screen_latency_video_decoded`) and its present stage at the Metal
   presented time of the drawable showing it. Without the Metal compositor
-  the 11.2 `AVSampleBufferDisplayLayer` overlay is used.
-- iOS: Settings > Diagnostics A/B switches against build 11.2 (legacy
-  video layer, no viewport reports, classic caps via the new
-  `ov_screen_mask_caps`), and a 5-second render / network pacing summary
-  in the diagnostic log. Owed control replies (PONG, recovery requests,
-  LTR acks) are all sent at once instead of one per pump.
+  the app does not advertise `CAP_H264` (lossless tiles only). The frame
+  texture is a render target only while video is composited, so a
+  tiles-only session's dirty-rect blits never pay for Metal's lossless
+  texture compression.
+- iOS: owed control replies (PONG, recovery requests, LTR acks) are all
+  sent at once instead of one per pump, so the host's RTT is not inflated.
 
 ## [0.1.0] - 2026-11-14
 

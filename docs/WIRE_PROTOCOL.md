@@ -283,9 +283,9 @@ Details: [ovtransport.md §5](crates/ovtransport.md).
 The direct path is armed once both peers advertise `CAP_DIRECT`.
 
 1. The host sends candidate addresses in the application command `DIRECT_CANDIDATES` (ovapp). The candidates are: LAN IPv4s plus loopback, the UPnP-mapped public address, the STUN reflexive address, and a global IPv6. The host's UDP port defaults to 4570.
-2. The viewer sends a probe REQ to every candidate every 100 ms, for up to 4 s per round. A failed round is retried after 10 s, with the delay doubling up to 120 s.
-3. The host answers RESP. The first RESP wins: the viewer sends COMMIT on that path and promotes.
-4. The host promotes when it receives COMMIT.
+2. The viewer sends a probe REQ to every candidate every 100 ms, for up to 4 s per round. While the session stays on the relay the viewer never gives up: a failed round is retried after 1 s, the delay doubling up to 10 s. A local network change (iOS) starts a round at once and resets the delay.
+3. The host answers RESP. The first RESP wins: the viewer sends COMMIT on that path and promotes. It repeats COMMIT every 250 ms until the host sends anything on the path.
+4. The host promotes when it receives COMMIT, at any point in the session: a late COMMIT moves the live session from the relay (the SYNC markers keep record order).
 5. Promotion means: send `SYNC_UP(next_idx)` on the relay, then send records over rudp on the UDP path.
 6. Liveness:
    - The link keepalive (DACK) goes out every 250 ms when idle.

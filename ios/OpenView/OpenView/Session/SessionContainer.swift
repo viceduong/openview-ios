@@ -300,7 +300,6 @@ private struct RemoteScreenView: View {
                                 uploads: model.uploads,
                                 frameSize: model.frameSize,
                                 video: model.video,
-                                legacyVideo: model.legacyVideo,
                                 cursorPos: model.cursorPos,
                                 cursorImage: model.cursorImage,
                                 cursorHotspot: model.cursorHotspot,

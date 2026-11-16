@@ -177,10 +177,6 @@ pub(crate) struct Cli {
     /// Disable link pacing (A/B benches).
     #[arg(long, hide = true)]
     pub(crate) no_pacing: bool,
-    /// Diagnostic kill-switches: comma-separated features to turn off
-    /// (hevc, ltr, viewport, palette, stable, boost, fec-adaptive, all).
-    #[arg(long, hide = true, value_name = "LIST", env = crate::disable::ENV)]
-    pub(crate) disable: Option<String>,
     /// Send this file to the viewer right after the handshake.
     #[arg(long, hide = true, value_name = "PATH")]
     pub(crate) send_file: Option<PathBuf>,

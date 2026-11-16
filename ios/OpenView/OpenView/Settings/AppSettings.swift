@@ -36,16 +36,6 @@ enum SettingsKey {
     /// Ask the host for HEVC video (experimental, default off; only when
     /// this device decodes HEVC in hardware).
     static let hevcVideo = "ov.hevcVideo"
-    // Diagnostics (A/B against 11.2; default off, apply on the next
-    // connection).
-    /// Use the 11.2 AVSampleBufferDisplayLayer H.264 overlay instead of
-    /// VTDecompressionSession + Metal compositing (and never HEVC).
-    static let diagLegacyVideo = "ov.diag.legacyVideo"
-    /// Never send VIEWPORT reports.
-    static let diagNoViewport = "ov.diag.noViewport"
-    /// Advertise the 11.2 viewer CAPS (no CAP_LTR / CAP_PALETTE /
-    /// CAP_VIEWPORT / CAP_HEVC).
-    static let diagClassicCaps = "ov.diag.classicCaps"
     /// "auto" or "landscape".
     static let orientation = "ov.orientation"
     static let showStats = "ov.showStats"
@@ -107,17 +97,6 @@ enum AppSettings {
     static var keepAwake: Bool { bool(SettingsKey.keepAwake, default: true) }
     static var playPCSound: Bool { bool(SettingsKey.playPCSound, default: true) }
     static var hevcVideo: Bool { bool(SettingsKey.hevcVideo, default: false) }
-    static var diagLegacyVideo: Bool { bool(SettingsKey.diagLegacyVideo, default: false) }
-    static var diagNoViewport: Bool { bool(SettingsKey.diagNoViewport, default: false) }
-    static var diagClassicCaps: Bool { bool(SettingsKey.diagClassicCaps, default: false) }
-    /// The diagnostics toggles that are on, for the session log.
-    static var diagSummary: String {
-        var on: [String] = []
-        if diagLegacyVideo { on.append("legacy video layer") }
-        if diagNoViewport { on.append("no viewport reports") }
-        if diagClassicCaps { on.append("classic caps") }
-        return on.isEmpty ? "none" : on.joined(separator: ", ")
-    }
     static var toolbarFade: Bool { bool(SettingsKey.toolbarFade, default: false) }
     static var pinBiometric: Bool { bool(SettingsKey.pinBiometric, default: false) }
     static var lockLandscape: Bool {

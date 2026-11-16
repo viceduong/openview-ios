@@ -76,6 +76,8 @@ pub(crate) fn pump_inner(g: &mut Inner) -> Result<(), i32> {
         }
         dir.engine
             .poll(now, &mut io, &mut |r| records.push(r.to_vec()));
+        // Bounded: a shell that never drains them leaks nothing.
+        dir.collect_events();
     }
     let Some(session) = g.session.as_mut() else {
         return Ok(());

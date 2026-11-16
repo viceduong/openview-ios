@@ -30,10 +30,6 @@ final class ScreenModel: ObservableObject {
     // regions (not published — thread safe: the VideoToolbox output fills
     // it, the Metal renderer takes the newest at each display refresh).
     let video = VideoFrameQueue()
-    // The 11.2 H.264 overlay (Settings > Diagnostics > "Legacy video
-    // layer", or no Metal compositor): an AVSampleBufferDisplayLayer the
-    // frame view hosts; samples are enqueued directly. Idle otherwise.
-    let legacyVideo = VideoOverlay()
 }
 
 /// Liveness state, observed only by the stats chip and the
@@ -57,10 +53,6 @@ struct PendingScreen {
     var frame: (image: CGImage?, size: CGSize)?
     var cursorPos: CGPoint?
     var cursorShape: (image: CGImage?, hotspot: CGSize, size: CGSize)?
-    /// Legacy video layer only: this frame is the lossless refresh after
-    /// VIDEO_END of that video generation — hide the overlay together with
-    /// showing it.
-    var hideVideoGen: Int?
 
-    var isEmpty: Bool { frame == nil && cursorPos == nil && cursorShape == nil && hideVideoGen == nil }
+    var isEmpty: Bool { frame == nil && cursorPos == nil && cursorShape == nil }
 }
