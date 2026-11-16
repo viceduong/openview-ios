@@ -103,6 +103,10 @@ pub(crate) fn apply(cli: &Cli) {
     }
     NO_MEDIA.store(cli.no_media, Ordering::Relaxed);
     NO_PACING.store(cli.no_pacing, Ordering::Relaxed);
+    crate::disable::init(cli.disable.as_deref());
+    if crate::disable::has(crate::disable::Feature::FecAdaptive) {
+        ovtransport::media::set_adaptive_fec(false);
+    }
     if cli.latency_probe {
         crate::probe::enable(cli.test_pattern.is_none());
     }

@@ -380,6 +380,11 @@ final class MetalScreenRenderer {
     private var textureCache: CVMetalTextureCache?
     /// The video picture of the running motion period (see `HeldVideo`).
     private var heldVideo: HeldVideo?
+    /// When a video picture was last composited (CACurrentMediaTime); the
+    /// render-target frame texture goes back to the plain tile texture
+    /// `videoIdleRevert` after that.
+    private var lastVideoAt: CFTimeInterval = 0
+    private static let videoIdleRevert: CFTimeInterval = 2
 
     /// nil when Metal (or the compiled shaders) is unavailable — the
     /// surface then keeps its CGImage layer.
@@ -421,8 +426,12 @@ final class MetalScreenRenderer {
                                                                 width: d.width,
                                                                 height: d.height,
                                                                 mipmapped: false)
-            // Render target too: decoded video is composited into it.
-            desc.usage = [.shaderRead, .renderTarget]
+            // Exactly the 11.2 tile texture (shader read only). A render
+            // target usage would let Metal losslessly compress it, and
+            // every dirty-rect blit would then pay a decompression; the
+            // video path upgrades it only while video is composited
+            // (`videoTarget`).
+            desc.usage = [.shaderRead]
             desc.storageMode = .private
             target = ctx.device.makeTexture(descriptor: desc)
             frameTexture = target
@@ -597,6 +606,13 @@ final class MetalScreenRenderer {
         if let h = heldVideo, !take.active || h.generation != take.generation {
             heldVideo = nil
         }
+        // Tiles only (no motion period, nothing held): nothing to do but,
+        // once video has been idle a while, hand the tile path its plain
+        // 11.2 texture back.
+        if heldVideo == nil, take.frame == nil || !take.active {
+            revertVideoTarget(cb)
+            return
+        }
         var fresh = false
         if let frame = take.frame, take.active {
             if let made = makeHeldVideo(frame, generation: take.generation) {
@@ -606,9 +622,11 @@ final class MetalScreenRenderer {
         }
         guard let held = heldVideo, fresh || uploadsLanded,
               let pipeline = ctx.yuvComposite,
-              let target = frameTexture,
-              Int(held.screenSize.width) == target.width,
-              Int(held.screenSize.height) == target.height else { return }
+              let current = frameTexture,
+              Int(held.screenSize.width) == current.width,
+              Int(held.screenSize.height) == current.height,
+              let target = videoTarget(cb) else { return }
+        lastVideoAt = CACurrentMediaTime()
         // Clip the rect to the framebuffer (the shader places the picture
         // by the unclipped rect).
         let x0 = max(0, Int(held.rect.minX.rounded(.down)))
@@ -637,6 +655,54 @@ final class MetalScreenRenderer {
         cb.addCompletedHandler { _ in
             withExtendedLifetime(keep) {}
         }
+    }
+
+    /// The frame texture as a render target for the video composite. The
+    /// plain tile texture is swapped (GPU copy, same command buffer, after
+    /// this redraw's blits) for one with `.renderTarget` usage and GPU
+    /// optimisation (lossless compression) off, so the dirty-rect blits
+    /// that keep landing on it cost what they cost on the tile texture.
+    private func videoTarget(_ cb: MTLCommandBuffer) -> MTLTexture? {
+        guard let tex = frameTexture else { return nil }
+        if tex.usage.contains(.renderTarget) { return tex }
+        guard let up = Self.frameTextureCopy(of: tex, renderTarget: true, cb: cb, device: ctx.device) else {
+            return nil
+        }
+        frameTexture = up
+        return up
+    }
+
+    /// Video idle for `videoIdleRevert`: back to the plain (11.2) tile
+    /// texture, contents copied on the GPU.
+    private func revertVideoTarget(_ cb: MTLCommandBuffer) {
+        guard let tex = frameTexture, tex.usage.contains(.renderTarget),
+              CACurrentMediaTime() - lastVideoAt >= Self.videoIdleRevert,
+              let plain = Self.frameTextureCopy(of: tex, renderTarget: false, cb: cb, device: ctx.device) else {
+            return
+        }
+        frameTexture = plain
+    }
+
+    /// A same-size frame texture (render-target capable or the plain tile
+    /// one) holding `tex`'s pixels, copied by a blit in `cb`.
+    private static func frameTextureCopy(of tex: MTLTexture, renderTarget: Bool,
+                                         cb: MTLCommandBuffer, device: MTLDevice) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                            width: tex.width,
+                                                            height: tex.height,
+                                                            mipmapped: false)
+        desc.storageMode = .private
+        if renderTarget {
+            desc.usage = [.shaderRead, .renderTarget]
+            desc.allowGPUOptimizedContents = false
+        } else {
+            desc.usage = [.shaderRead]
+        }
+        guard let copy = device.makeTexture(descriptor: desc),
+              let blit = cb.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: tex, to: copy)
+        blit.endEncoding()
+        return copy
     }
 
     /// Wrap a decoded NV12 picture's planes as textures and work out its

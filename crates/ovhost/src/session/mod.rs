@@ -206,6 +206,9 @@ fn serve<C: Carrier + 'static>(
     let session = hs.take_session().ok_or("no session after handshake")?;
     let standby = standby.map(|(relay, sid)| Standby::start(relay.clone(), sid));
     let mut term = TerminalSession::new(session, carrier);
+    // Diagnostic kill-switches: never advertise a disabled feature (the
+    // viewer then neither expects nor requests it).
+    term.set_local_caps(crate::disable::get().mask_caps(term.local_caps()));
     // Datagrams polled in the batch that completed the handshake.
     term.queue_inbound(backlog);
     // Offer a direct UDP path (the relay stays the fallback).

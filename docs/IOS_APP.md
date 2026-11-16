@@ -524,7 +524,12 @@ regions as H.264 or HEVC (`ov_video_packet.codec` 1 / 2).
    the frame texture, so video is scaled and sharpened exactly like tiles,
    in the same command buffer. The picture is held while its motion period
    runs and re-composited whenever uploads land (a full re-stage would
-   otherwise put pre-motion tiles back over it).
+   otherwise put pre-motion tiles back over it). The tile frame texture is
+   shader-read only (as in 0.1.x builds); only when a picture is first
+   composited is it swapped, by a GPU copy, for a render-target texture
+   with GPU optimisation (lossless compression) off, and it goes back to
+   the plain one 2 s after the last picture. A tiles-only session therefore
+   renders and presents exactly like the pre-video-decode builds.
 5. `OV_VIDEO_END` ends the motion period (`VideoFrameQueue.end`): pictures
    still in the decoder or the slot are refused. The last composited
    picture stays in the frame texture until the lossless refresh (the next

@@ -149,6 +149,7 @@ former `OV_*` / `OVHOST_*` environment variables, which are no longer read)
 | `--video-bpp <float>` | H.264 area-based bitrate budget (benchmarks) |
 | `--no-media` | A/B: disable the unreliable media channel |
 | `--no-pacing` | A/B: disable link pacing |
+| `--disable <list>` | Diagnostic kill-switches, also read from `OPENVIEW_DISABLE` (the flag wins). See [§2.12](#212-diagnostics-kill-switches) |
 | `--send-file <path>` | Send this file to the viewer straight after the handshake |
 | `--latency-probe` | Input-to-photon target: every press from the viewer flips a 64x64 magenta/green patch at the screen's top-left (drawn into `--test-pattern`, otherwise a small topmost window at the primary monitor's origin). See [§2.11](#211-benchmarks-where-the-latency-goes) |
 
@@ -500,6 +501,47 @@ waited for the idle governor's next 4 fps tick.
 `--duration 60 -v` for the `metrics:` line. Compare `total` p50/p95 and the
 stage the change targets; the probe's p50/p95/p99 is the user-visible
 number. Keep the HUD line in screenshots of before/after runs.
+
+### 2.12 Diagnostics: kill-switches
+
+To A/B test an optimisation against a viewer build that cannot be rebuilt
+(the iOS app), switch it off on the host. `ovhost` reads the environment
+variable `OPENVIEW_DISABLE` once at startup (or the hidden `--disable
+<list>`, which takes precedence): a comma-separated, case-insensitive list.
+
+| Name | What is switched off |
+|---|---|
+| `hevc` | HEVC video: the viewer is treated as lacking `CAP_HEVC` (H.264 only) |
+| `ltr` | LTR loss recovery: no `CAP_LTR`, loss recovery by IDR |
+| `viewport` | Viewport priority: no `CAP_VIEWPORT`, `VIEWPORT` commands ignored, nothing deferred |
+| `palette` | Palette bands: no `CAP_PALETTE` (plain zstd bands) |
+| `stable` | Stable encode surface during motion: the encoder is sized to the motion rect again (re-open + IDR per 128 px growth) |
+| `boost` | Input wake: input no longer pulls the next capture in or holds the full rate for 750 ms |
+| `fec-adaptive` | Adaptive video FEC: every frame gets the fixed loss-driven ratio (10 % on a clean link, + 4 x loss up to 30 %), no 2 % floor |
+| `all` | Everything above |
+
+The CAPS-negotiated ones (`hevc`, `ltr`, `viewport`, `palette`) are masked
+out of both the CAPS the host advertises (so the viewer neither sends
+`VIEWPORT` / `VIDEO_LTR_ACK` / `VIDEO_RECOVER` nor expects the feature) and
+the viewer's CAPS the host acts on. At startup the host logs one line,
+e.g. `INFO diagnostics: disabled features: hevc,stable`; an unknown name is
+ignored with a warning.
+
+```powershell
+# One-off, command line (scratch ports only - never 4569-4571 of a running OpenView)
+$env:OPENVIEW_DISABLE = "stable,viewport"
+ovhost --relay 127.0.0.1:14569 --direct-port 14570 --lan-port 14571 --screen
+
+# The GUI's host: OpenView.exe starts ovhost with its own environment, so set
+# it for the user, then quit OpenView.exe completely (tray -> Quit, or
+# `OpenView.exe --quit`) and start it again from the Start menu / Explorer
+setx OPENVIEW_DISABLE "stable,viewport"
+# ... and to go back to normal:
+reg delete HKCU\Environment /v OPENVIEW_DISABLE /f
+```
+
+Check the host log (`%LOCALAPPDATA%\OpenView\logs\ovhost.log` under the
+GUI) for the `disabled features` line before measuring.
 
 ---
 

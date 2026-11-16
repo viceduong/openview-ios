@@ -357,6 +357,10 @@ extension RemoteSurfaceView {
     /// Hand the current viewport to the (debounced) reporter; only the
     /// active surface reports.
     func reportViewport() {
+        // O(1): only records the latest rect. The reporter sends it later
+        // from its own main-queue timer (never from this call or the render
+        // path), at most every 100 ms, and only to a CAP_VIEWPORT host;
+        // the record is built there and handed to the session queue.
         guard input.activeSurface === self, let v = remoteViewport else { return }
         input.viewportReporter.update(v)
     }
